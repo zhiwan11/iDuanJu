@@ -31,8 +31,6 @@ import androidx.compose.material.icons.automirrored.filled.VolumeDown
 import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.*
-import androidx.compose.material.icons.rounded.ChevronRight
-import androidx.compose.material.icons.rounded.SkipNext
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -201,6 +199,15 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
         installVideoEnhance(player, if (enhanceFailed) null else enhanceEffect)
     }
     LaunchedEffect(enhanceLevel, sdrToHdr, isNativeHdr, enhanceFailed, textureView) { syncEnhance() }
+    DisposableEffect(textureView) {
+        val tv = textureView ?: return@DisposableEffect onDispose {}
+        val listener = android.view.View.OnLayoutChangeListener { _, l, t, r, b, ol, ot, or, ob ->
+            if ((r - l) != (or - ol) || (b - t) != (ob - ot)) syncEnhance()
+        }
+        tv.addOnLayoutChangeListener(listener)
+        if (tv.width > 0 && tv.height > 0) syncEnhance()
+        onDispose { tv.removeOnLayoutChangeListener(listener) }
+    }
     // Wide colour gamut for SDR→HDR / native HDR. Not COLOR_MODE_HDR: on a TextureView that would
     // dim the Compose overlays and break the getBitmap() ambient readback.
     // SDR→HDR additionally lifts the window backlight (+0.22 over the user's system brightness, clamped to
@@ -1071,9 +1078,8 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                         HudIcon(if (landscape) Icons.Filled.FullscreenExit else Icons.Filled.Fullscreen, null, false) { setLandscape(!landscape) }
                     }
                 }
-                // Playback actions only. 画面比例 / 氛围光晕 / AI 超分 / SDR→HDR / 定时 / 连播 / 音轨字幕 live solely in 更多设置 (top-right ⋯).
+                // Playback actions only. 画面比例 / 氛围光晕 / AI 超分 / SDR→HDR / 定时 / 连播 live solely in 更多设置 (top-right ⋯).
                 val speedLabel = if (speed == 1f) "1.0×" else "${speed}×".replace(".0×", "×")
-                val hasNextEp = epIndex >= 0 && epIndex + 1 < (curDetail?.episodes?.size ?: 0)
                 if (landscape) Row(Modifier.fillMaxWidth().padding(top = 6.dp),
                     verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     if (introSkippable) LandChip(Icons.Filled.SkipNext, "跳过片头", null, false, chromeOn) { player.seekTo(15000) }
@@ -1082,13 +1088,13 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                     LandChip(Icons.Filled.Speed, "倍速", speedLabel, panel == "speed" || speed != 1f, chromeOn) { togglePanel("speed") }
                     LandChip(Icons.Filled.HighQuality, "画质", quality ?: tags.res, panel == "quality", chromeOn) { togglePanel("quality") }
                     LandChip(Icons.Filled.Subtitles, "弹幕", if (dmOK) (if (danmaku) "开" else "关") else null, dmOK && danmaku, chromeOn && dmOK) { danmaku = !danmaku }
-                    LandChip(Icons.Rounded.SkipNext, "下一集", null, false, chromeOn && hasNextEp) { if (hasNextEp) selectEpisode(epIndex + 1) }
+                    LandChip(Icons.Filled.ClosedCaption, "音轨字幕", null, panel == "audio", chromeOn) { togglePanel("audio") }
                 } else Row(Modifier.fillMaxWidth().padding(top = 10.dp)) {
                     ActionBtn(Icons.Filled.GridView, "选集", null, panel == "episodes", false, chromeOn) { togglePanel("episodes") }
                     ActionBtn(Icons.Filled.Speed, "倍速", speedLabel, panel == "speed", speed != 1f, chromeOn) { togglePanel("speed") }
                     ActionBtn(Icons.Filled.HighQuality, "画质", quality ?: tags.res, panel == "quality", false, chromeOn) { togglePanel("quality") }
                     ActionBtn(Icons.Filled.Subtitles, "弹幕", if (dmOK) (if (danmaku) "开" else "关") else null, false, dmOK && danmaku, chromeOn) { if (dmOK) danmaku = !danmaku }
-                    ActionBtn(Icons.Rounded.SkipNext, "下一集", null, false, false, chromeOn && hasNextEp) { if (hasNextEp) selectEpisode(epIndex + 1) }
+                    ActionBtn(Icons.Filled.ClosedCaption, "音轨字幕", null, panel == "audio", false, chromeOn) { togglePanel("audio") }
                 }
             }
         }
@@ -1162,7 +1168,6 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                             sleepEndMs = sleepEndMs,
                             autoNext = autoNext,
                             showAutoNext = queue == null,
-                            audioLabel = tags.audio,
                             pc = pc,
                             onFillMode = { fill ->
                                 fillMode = fill
@@ -1193,7 +1198,6 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                                 }
                             },
                             onAutoNext = { autoNext = it },
-                            onAudioSubtitle = { panel = "audio" },
                         )
                     }
                     else -> {
@@ -1620,7 +1624,6 @@ private fun MoreSettingsPanel(
     sleepEndMs: Long,
     autoNext: Boolean,
     showAutoNext: Boolean,
-    audioLabel: String?,
     pc: IdjColors,
     onFillMode: (Boolean) -> Unit,
     onAmbientLevel: (Int) -> Unit,
@@ -1628,7 +1631,6 @@ private fun MoreSettingsPanel(
     onSdrToHdr: (Boolean) -> Unit,
     onSleep: (Int) -> Unit,
     onAutoNext: (Boolean) -> Unit,
-    onAudioSubtitle: () -> Unit,
 ) {
     val sleepSubtitle = when {
         sleepMode == -1 -> "定时：播完本集"
@@ -1711,25 +1713,6 @@ private fun MoreSettingsPanel(
             pc = pc,
             onSelect = onAutoNext,
         )
-    }
-
-    Spacer(Modifier.height(10.dp))
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
-            .background(Color.White.copy(0.06f))
-            .border(1.dp, Color.White.copy(0.10f), RoundedCornerShape(12.dp))
-            .pressClick(0.98f, label = "音轨字幕", onClick = onAudioSubtitle)
-            .padding(horizontal = 12.dp, vertical = 11.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Icon(Icons.Filled.ClosedCaption, null, tint = Color.White.copy(0.86f), modifier = Modifier.size(18.dp))
-        Spacer(Modifier.width(10.dp))
-        Text("音轨字幕", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
-        Text("${audioLabel ?: "默认音轨"} · 字幕关闭", color = Color.White.copy(0.55f), fontSize = 12.sp)
-        Spacer(Modifier.width(6.dp))
-        Icon(Icons.Rounded.ChevronRight, null, tint = Color.White.copy(0.5f), modifier = Modifier.size(16.dp))
     }
 }
 

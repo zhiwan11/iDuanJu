@@ -627,11 +627,14 @@ internal fun ReaderImage(
     val measured = modifier.onSizeChanged { boxSize = it }
     aiPage?.let { page ->
         LaunchedEffect(page) { sizeCb?.invoke(page.width, page.height) }
+        val aiFilter = remember(MangaReaderPrefs.invert, MangaReaderPrefs.grayscale) {
+            readerColorFilter(MangaReaderPrefs.invert, MangaReaderPrefs.grayscale, inkLevels = false)
+        }
         // Mipmapped + high filter quality: the big page is minified on screen without aliasing.
-        Image(page.asImageBitmap(), null, measured, alignment = alignment, contentScale = contentScale, colorFilter = filter, filterQuality = FilterQuality.High)
+        Image(page.asImageBitmap(), null, measured, alignment = alignment, contentScale = contentScale, colorFilter = aiFilter, filterQuality = FilterQuality.High)
         return
     }
-    val srModifier = if (srLevel == 0) measured else measured.mangaSuperRes(1, contentSize, fillWidth = webtoon)
+    val srModifier = if (srLevel == 0) measured else measured.mangaSuperRes(1, contentSize, fillWidth = webtoon, viewSize = boxSize)
     SubcomposeAsyncImage(
         req, null, srModifier,
         contentScale = contentScale,
@@ -765,9 +768,9 @@ private fun ImagePanel() {
         PanelTitle("漫画超分")
         PanelSegments(listOf(0, 1, 2), P.superResLevel, { when (it) { 1 -> "标准"; 2 -> "增强"; else -> "关闭" } }) { P.updateSuperResLevel(it) }
         Text(when (P.superResLevel) {
-            1 -> if (Build.VERSION.SDK_INT >= 33) "极速超分：按放大倍率自适应的 GPU 线稿锐化 + 墨色加深 / 气泡净白，无光晕零延迟" else "极速超分：墨色加深 / 气泡净白（Android 13+ 另含 GPU 线稿锐化）"
-            2 -> "AI 精修：Real-ESRGAN 原分辨率分块超分 + 反投影保真，绝不缩小原图；当前页优先，先以「标准」预览"
-            else -> "标准 = 极速 GPU 锐化 · 增强 = 离线 AI 神经网络精修"
+            1 -> if (Build.VERSION.SDK_INT >= 33) "极速超分：Anime4K DoG 去模糊 + 墨线加深 + 气泡净白，无光晕零延迟" else "极速超分：墨色加深 / 气泡净白（Android 13+ 另含 Anime4K GPU 锐化）"
+            2 -> "AI 精修：低清图 Real-ESRGAN 4× 神经网络重建，高清图 Anime4K 降噪去模糊 + 墨线加深，当前页优先"
+            else -> "标准 = 极速 Anime4K GPU 锐化 · 增强 = 离线 AI / Anime4K 精修"
         }, color = Color.White.copy(0.45f), fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp, start = 2.dp))
         PanelTitle("沉浸氛围")
         PanelSegments(MangaAtmosphere.entries, P.atmosphere, { it.label }) { P.updateAtmosphere(it) }
