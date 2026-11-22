@@ -226,9 +226,12 @@ val LocalReaderPageActive = compositionLocalOf { true }
  * 仿真翻页 additionally tracks the grabbed page point in *forward* reading space (spine at x = 0), normalised to
  * the page: [curlX] / [curlY] is where the lifted edge point is now (x = 1 flat at rest, x = −1 laid over the spine)
  * and [anchorY] is where that point sits on the free edge of the flat page (0 = top corner, 1 = bottom corner).
- * The anchor follows the live finger height through a continuous saturating curve ([cornerAnchor]), so holding a
- * curl and sliding top → middle → bottom smoothly rotates the fold through vertical with no zones or snapping.
- * A backward turn is the previous page's forward turn played in reverse.
+ * The fold's tilt is the anchor's offset from the finger height: its target follows a gentle S-curve
+ * ([cornerAnchor]) and is damped (τ ≈ 75 ms) while the grabbed point itself tracks the finger exactly, so holding a
+ * curl and sliding top → middle → bottom glides the fold through vertical with no whip or snapping.
+ * A backward turn is the previous page's forward turn played in reverse — and, exactly as in a forward turn, the
+ * finger holds the page's free corner (not the crease): the corner flies in from the spine over a short catch-up
+ * and then stays under the finger, with the paper back between finger and crest and the crest leading.
  * A new turn first commits any turn still in flight, so rapid taps never lose a page.
  */
 @Stable
@@ -255,12 +258,16 @@ class BookPagerState(initialPage: Int, private val count: () -> Int) {
     private var dragging by mutableStateOf(false)
     private var downX = 0f
     private var gainX = 1f
-    private var targetAnchor = 1f
+    /** Backward turn: virtual start of the grabbed corner (forward space) once it has caught up with the finger. */
+    private var backStart = 0f
+    /** Damped tilt: anchor − finger height (the fold's rotation), and where it is heading. */
+    private var tiltOff = 0f
+    private var targetOff = 0f
     /** Where the motion in flight will land (== currentPage when idle or snapping back). */
     private var goal = initialPage
     private var job: Job? = null
 
-    private fun rest() { curlX = 1f; curlY = 1f; anchorY = 1f; targetAnchor = 1f }
+    private fun rest() { curlX = 1f; curlY = 1f; anchorY = 1f; tiltOff = 0f; targetOff = 0f }
 
     private fun finishNow() {
         job?.cancel(); job = null
@@ -294,7 +301,7 @@ class BookPagerState(initialPage: Int, private val count: () -> Int) {
         turnDir = if (forward) 1 else -1
         // Like flipping a real book by its lower free corner: the corner lifts, sweeps over in a graceful arc and
         // lays the page flat over the spine. A backward turn plays the same arc in reverse.
-        anchorY = 1f; targetAnchor = 1f
+        anchorY = 1f; tiltOff = 0f; targetOff = 0f
         settle(scope, target, toEnd = true, tween(520, easing = FastOutSlowInEasing)) { s -> TapArc.at(if (forward) s else 1f - s) }
         return true
     }
@@ -310,12 +317,20 @@ class BookPagerState(initialPage: Int, private val count: () -> Int) {
         if (currentPage + dir !in 0 until pageCount) return false
         turnDir = dir; progress = 0f; dragging = true; dragStarts++
         downX = x
-        // forward: the free edge starts under the finger and reaches the spine together with it;
-        // backward: the turned-over page is pulled back so it lies flat when the finger reaches the free edge.
-        gainX = if (dir > 0) 1f / x.coerceIn(0.45f, 1f) else 2f / (1f - x).coerceIn(0.55f, 1f)
-        val a = cornerAnchor(y)
-        anchorY = a; targetAnchor = a
-        curlX = if (dir > 0) 1f else -1f; curlY = y
+        if (dir > 0) {
+            // forward: the free edge lifts at once and reaches the spine together with the finger
+            gainX = 1f / x.coerceIn(0.45f, 1f)
+        } else {
+            // backward: after the catch-up the turned page's free corner sits exactly under the finger (gain 1) and
+            // lies flat when the finger reaches the free edge; a grab far out on the page scales up a little.
+            backStart = minOf(x, 0.55f)
+            gainX = ((1f - backStart) / (1f - x).coerceAtLeast(1e-3f)).coerceAtMost(3f)
+        }
+        val off = cornerAnchor(y) - y
+        tiltOff = off; targetOff = off
+        curlY = y
+        anchorY = (y + off).coerceIn(0f, 1f)
+        curlX = if (dir > 0) 1f else -1f
         return true
     }
 
@@ -324,26 +339,40 @@ class BookPagerState(initialPage: Int, private val count: () -> Int) {
         val dx = x - downX
         progress = (dx * -turnDir).coerceIn(0f, 1f)
         curlY = y.coerceIn(-0.15f, 1.15f)
-        targetAnchor = cornerAnchor(y)
-        curlX = ((if (turnDir > 0) 1f else -1f) + dx * gainX).coerceIn(-1f, 1f)
+        targetOff = cornerAnchor(y) - curlY
+        anchorY = (curlY + tiltOff).coerceIn(0f, 1f)
+        curlX = if (turnDir > 0) (1f + dx * gainX).coerceIn(-1f, 1f) else backCorner(dx)
     }
 
-    /** Frame-rate independent exponential smoothing of the anchor so the fold axis rotates supplely. */
+    /**
+     * Backward turn: forward-space x of the previous page's free corner for finger travel [dx] toward the free edge.
+     * It starts laid over the spine (−1), sweeps in over the first [BACK_CATCH] of travel (always moving with the
+     * finger, never against it) and from then on holds the finger: `backStart + travel`, reaching 1 (flat) together
+     * with the finger at the free edge — the reverse of a forward turn, where the finger also holds the corner.
+     */
+    private fun backCorner(dx: Float): Float {
+        val e = (dx * gainX).coerceAtLeast(0f)
+        val c = smoothstep01((e / BACK_CATCH).coerceIn(0f, 1f))
+        return (backStart + e - (backStart + 1f) * (1f - c)).coerceIn(-1f, 1f)
+    }
+
+    /**
+     * Frame-rate independent exponential damping (τ ≈ 75 ms) of the fold's *tilt* (anchor − finger height). The
+     * grabbed point keeps tracking the finger exactly, so a vertical sweep translates the fold with the finger and
+     * only its rotation eases toward the target: no overshooting whip when crossing the middle of the page.
+     */
     internal fun stepAnchor(dtSeconds: Float) {
         if (!dragging) return
-        val diff = targetAnchor - anchorY
-        if (abs(diff) < 1e-4f) {
-            if (anchorY != targetAnchor) anchorY = targetAnchor
-            return
-        }
-        anchorY += diff * (1f - exp(-dtSeconds.coerceIn(0f, 0.05f) / 0.045f))
+        val diff = targetOff - tiltOff
+        tiltOff = if (abs(diff) < 1e-4f) targetOff else tiltOff + diff * (1f - exp(-dtSeconds.coerceIn(0f, 0.05f) / TILT_TAU))
+        val a = (curlY + tiltOff).coerceIn(0f, 1f)
+        if (a != anchorY) anchorY = a
     }
 
     /** [velocity] in page widths / s along the turn direction (positive = keep turning). */
     internal fun dragEnd(scope: CoroutineScope, velocity: Float) {
         if (!dragging) return
         dragging = false
-        targetAnchor = anchorY
         val complete = velocity > 0.9f || (velocity > -0.5f && progress > 0.3f)
         val x0 = curlX; val y0 = curlY; val a = anchorY
         // forward-equivalent destinations: −1 = page laid over the spine, 1 = page flat in place; the grabbed point
@@ -358,16 +387,21 @@ class BookPagerState(initialPage: Int, private val count: () -> Int) {
 
 private fun smoothstep01(t: Float) = t * t * (3f - 2f * t)
 
+/** Backward turn: finger travel (page widths) over which the turned page's corner flies in to meet the finger. */
+private const val BACK_CATCH = 0.16f
+/** Time constant (s) of the fold-tilt damping while dragging. */
+private const val TILT_TAU = 0.075f
+
 /**
- * Free-edge anchor height (0..1) for a finger at height [y] (0..1): a C¹ saturating curve — the top corner for
- * y ≲ 0.3, the bottom corner for y ≳ 0.7, and an odd-symmetric sine in between that passes 0.5 at the centre,
- * so a held curl sliding vertically rotates its fold continuously through vertical.
+ * Free-edge anchor height (0..1) for a finger at height [y] (0..1): a gentle C¹ S-curve — exactly the top corner for
+ * y ≤ 0.15, the bottom corner for y ≥ 0.85, and an odd quintic `z + z³/2 − z⁵/2` in between whose slope is lowest
+ * at the centre. The fold's tilt (anchor − y) therefore changes only ~0.4× as fast as the finger near y = 0.5
+ * (it was ~2.9× with the old 0.3..0.7 sine), so sweeping top → bottom rotates the fold gracefully through vertical.
  */
 private fun cornerAnchor(y: Float): Float {
-    val u = ((y - 0.5f) * 2f).coerceIn(-1f, 1f)
-    val a = (abs(u) * 2.5f).coerceAtMost(1f)
-    val v = sin(a * (PI / 2).toFloat())
-    return 0.5f + 0.5f * (if (u < 0f) -v else v)
+    val z = ((y - 0.5f) / 0.35f).coerceIn(-1f, 1f)
+    val z2 = z * z
+    return 0.5f + 0.5f * z * (1f + 0.5f * z2 - 0.5f * z2 * z2)
 }
 
 /** Tap / volume-key turn path of the bottom free corner: lifts, arcs across the page and lands over the spine. */

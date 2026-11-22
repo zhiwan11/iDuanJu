@@ -3,11 +3,8 @@ package app.iduanju.manga
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
-import ai.onnxruntime.providers.NNAPIFlags
 import android.content.Context
 import android.graphics.Bitmap
-import android.os.Build
-import android.os.SystemClock
 import android.util.Log
 import android.util.LruCache
 import androidx.compose.runtime.getValue
@@ -16,7 +13,6 @@ import androidx.compose.runtime.setValue
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
-import java.util.EnumSet
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -26,269 +22,246 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
-import kotlin.math.max
-import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
-/**
- * 漫画 AI 超分「增强」: the bundled Real-ESRGAN anime network (`realesr_anime_v3_x4.onnx`) run for real on real pages.
- *
- * - Pages up to ~1080×1600 (strips up to ~1.3 MP) go through the network; bigger pages are area-downscaled first so
- *   the 2× result stays ≤ ~2600 px on its long side (strips: on their width). Only absurdly large images, which
- *   would have to shrink below half size first, are skipped (the 标准 GPU pass keeps covering them).
- * - The model is pinned to a fixed `1×3×272×272` input (256 px tiles + 8 px context each side, edge-replicated at
- *   the page borders), which lets the NNAPI execution provider compile it once. On first use NNAPI (if present) and
- *   the 4-thread CPU kernels each run the first tile; NNAPI is kept only if its result matches the CPU's and it is
- *   actually faster, otherwise the CPU session is used for good.
- * - Output is the pure network output: packed as RGB planar NCHW float32 in [0, 1] (R plane, then G, then B), the
- *   ×4 result is box-averaged 2×2 down to ×2 (or kept ×4 for tiny scans). No levels, no line darkening, no tint —
- *   page colours and paper tone are exactly preserved.
- * - One page at a time; the page on screen goes first: a background prefetch yields between tiles as soon as a
- *   visible page is waiting ([Preempted]), and leaving composition cancels a job between tiles.
- */
-object MangaAiUpscaler {
-    private const val SCALE = 4
-    private const val TILE = 256
-    private const val PAD = 8
-    /** The model's fixed input side (see class doc). */
-    private const val IN = TILE + 2 * PAD
-    private const val OUT = IN * SCALE
+/** Offline native 2× line-art restoration. One inference at a time, with priority for the visible page. */
+internal object MangaAiUpscaler {
+    private const val SCALE = 2
+    private const val PAD = 18
+    private const val MAX_INPUT = 272
+    private const val CORE = MAX_INPUT - 2 * PAD
+    private const val OVERLAP = 24
+    private const val MAX_OUTPUT = CORE * SCALE
     private const val MAX_OUT_SIDE = 2600
     private const val MAX_BITMAP_SIDE = 8192
     private const val PAGE_MAX_WORK_PIXELS = 1080 * 1600
     private const val STRIP_MAX_WORK_PIXELS = 1_300_000
-    private const val TAG = "IDJ"
 
-    /** Thrown to a background (prefetch) job that gave way to the page on screen; simply retry later. */
     class Preempted : Exception("yielded to the visible page")
 
+    data class Key(val url: String, val headers: Map<String, String>, val crop: Boolean, val half: Int, val webtoon: Boolean)
+
     private val maxCacheBytes = (Runtime.getRuntime().maxMemory() / 5).coerceIn(48L shl 20, 192L shl 20).toInt()
-    private val cache = object : LruCache<String, Bitmap>(maxCacheBytes) {
-        override fun sizeOf(key: String, value: Bitmap) = value.byteCount
+    private val cache = object : LruCache<Key, Bitmap>(maxCacheBytes) {
+        override fun sizeOf(key: Key, value: Bitmap) = value.byteCount
     }
     private val inferenceLock = Mutex()
     private val foregroundWaiting = AtomicInteger(0)
-    /** True while a page is being processed (Compose-observable): preloaded neighbours wait until idle. */
     var busy by mutableStateOf(false)
         private set
+
     private val environment by lazy { OrtEnvironment.getEnvironment() }
-    /** Only touched under [inferenceLock]. */
     private var session: OrtSession? = null
-    private var model: ByteArray? = null
+    private val inputBuffer by lazy { floatBuffer(3 * MAX_INPUT * MAX_INPUT) }
+    private val outputBuffer by lazy { floatBuffer(3 * MAX_OUTPUT * MAX_OUTPUT) }
 
-    // Reused tile buffers (only touched under [inferenceLock]).
-    private val tileIn = FloatArray(3 * IN * IN)
-    private val tileOut by lazy { FloatArray(3 * OUT * OUT) }
-    private val inBuf by lazy { floatBuffer(3 * IN * IN) }
-    private val outBuf by lazy { floatBuffer(3 * OUT * OUT) }
+    fun getCached(key: Key): Bitmap? = cache.get(key)
 
-    fun getCached(key: String): Bitmap? = cache.get(key)
-
-    /** [workWidth]×[workHeight] is fed to the network; the ×4 output is box-averaged [box]×[box]. */
-    internal data class Plan(val workWidth: Int, val workHeight: Int, val box: Int) {
-        val outWidth get() = workWidth * SCALE / box
-        val outHeight get() = workHeight * SCALE / box
-    }
-
-    internal fun plan(srcWidth: Int, srcHeight: Int, fillWidth: Boolean): Plan? {
-        if (srcWidth < 16 || srcHeight < 16) return null
-        val pixels = srcWidth.toDouble() * srcHeight
+    private fun workSize(source: Bitmap, fillWidth: Boolean): Pair<Int, Int>? {
+        val width = source.width
+        val height = source.height
+        if (width < 16 || height < 16) return null
+        val longSide = maxOf(width, height)
+        val displaySide = if (fillWidth) width else longSide
         val maxWork = if (fillWidth) STRIP_MAX_WORK_PIXELS else PAGE_MAX_WORK_PIXELS
-        // the side whose on-screen size matters: the long side of a page, the width of a webtoon strip
-        val ref = if (fillWidth) srcWidth else max(srcWidth, srcHeight)
-        for (box in intArrayOf(1, 2)) {
-            val outFactor = SCALE.toDouble() / box
-            val scale = minOf(
-                1.0,
-                MAX_OUT_SIDE / (ref * outFactor),
-                MAX_BITMAP_SIDE / (max(srcWidth, srcHeight) * outFactor),
-                sqrt(maxWork / pixels),
-            )
-            // ×4 only for tiny scans that need no shrinking at all; otherwise ×2
-            if (box == 1 && scale < 1.0) continue
-            if (scale < 0.5) return null
-            val w = (srcWidth * scale).roundToInt().coerceAtLeast(8)
-            val h = (srcHeight * scale).roundToInt().coerceAtLeast(8)
-            return Plan(w, h, box)
-        }
-        return null
+        val scale = minOf(
+            1.0,
+            MAX_OUT_SIDE.toDouble() / (displaySide.toDouble() * SCALE),
+            MAX_BITMAP_SIDE.toDouble() / (longSide.toDouble() * SCALE),
+            sqrt(maxWork / (width.toDouble() * height)),
+        )
+        if (scale <= 0.5) return null
+        return (width * scale).roundToInt() to (height * scale).roundToInt()
     }
 
-    /**
-     * Real-ESRGAN enhancement of a software [source] bitmap; null if skipped / failed. A background job
-     * ([foreground] false) throws [Preempted] when it gives way to a visible page.
-     */
-    suspend fun upscale(
-        context: Context, key: String, source: Bitmap, fillWidth: Boolean, foreground: () -> Boolean,
-    ): Bitmap? {
+    suspend fun upscale(context: Context, key: Key, source: Bitmap, foreground: () -> Boolean): Bitmap? {
         getCached(key)?.let { return it }
-        val plan = plan(source.width, source.height, fillWidth) ?: return null
+        val (width, height) = workSize(source, key.webtoon) ?: return null
         return withContext(Dispatchers.Default) {
-            val fg = foreground()
-            if (fg) foregroundWaiting.incrementAndGet()
-            var counted = fg
+            var waiting = foreground()
+            if (waiting) foregroundWaiting.incrementAndGet()
             try {
                 inferenceLock.withLock {
-                    if (counted) { foregroundWaiting.decrementAndGet(); counted = false }
+                    if (waiting) {
+                        foregroundWaiting.decrementAndGet()
+                        waiting = false
+                    }
                     getCached(key) ?: try {
                         busy = true
-                        infer(context, source, plan) { !foreground() && foregroundWaiting.get() > 0 }
+                        infer(context, source, width, height) { !foreground() && foregroundWaiting.get() > 0 }
                             .also { cache.put(key, it) }
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Preempted) {
                         throw e
-                    } catch (e: Throwable) {
-                        Log.w(TAG, "manga AI upscale failed", e)
+                    } catch (e: Exception) {
+                        Log.w("IDJ", "Manga AI upscale failed", e)
+                        null
+                    } catch (e: OutOfMemoryError) {
+                        cache.evictAll()
+                        Log.w("IDJ", "Not enough memory for manga AI upscale", e)
+                        null
+                    } catch (e: LinkageError) {
+                        Log.w("IDJ", "Manga AI runtime unavailable", e)
                         null
                     } finally {
                         busy = false
                     }
                 }
             } finally {
-                if (counted) foregroundWaiting.decrementAndGet()
+                if (waiting) foregroundWaiting.decrementAndGet()
             }
         }
     }
 
-    private fun modelBytes(context: Context): ByteArray =
-        model ?: context.assets.open("models/realesr_anime_v3_x4.onnx").use { it.readBytes() }.also { model = it }
-
-    private fun createSession(context: Context, nnapi: Boolean): OrtSession = OrtSession.SessionOptions().use { options ->
+    private fun obtainSession(context: Context): OrtSession = session ?: OrtSession.SessionOptions().use { options ->
         options.setIntraOpNumThreads(Runtime.getRuntime().availableProcessors().coerceIn(1, 4))
         options.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-        if (nnapi) options.addNnapi(EnumSet.of(NNAPIFlags.USE_FP16, NNAPIFlags.CPU_DISABLED))
-        environment.createSession(modelBytes(context), options)
+        options.setMemoryPatternOptimization(false)
+        options.addConfigEntry("session.intra_op.allow_spinning", "0")
+        val model = context.assets.open("models/waifu2x_cunet_2x.onnx").use { it.readBytes() }
+        environment.createSession(model, options).also { session = it }
     }
 
-    /** Runs the network on the packed [tileIn] into [tileOut]. */
-    private fun runTile(s: OrtSession) {
-        inBuf.clear(); inBuf.put(tileIn); inBuf.flip()
-        outBuf.clear()
-        OnnxTensor.createTensor(environment, inBuf, longArrayOf(1, 3, IN.toLong(), IN.toLong())).use { input ->
-            OnnxTensor.createTensor(environment, outBuf, longArrayOf(1, 3, OUT.toLong(), OUT.toLong())).use { output ->
-                s.run(mapOf(s.inputNames.first() to input), mapOf(s.outputNames.first() to output)).close()
+    private data class Span(val start: Int, val length: Int)
+
+    /** Balanced tiles avoid a full run for a sliver. Four-pixel-aligned starts keep pooling phase consistent. */
+    private fun spans(length: Int): List<Span> {
+        val step = CORE - OVERLAP
+        val count = ((length - OVERLAP + step - 1) / step).coerceAtLeast(1)
+        if (count == 1) return listOf(Span(0, length))
+        val stride = 4 * ((length - OVERLAP + count * 4 - 1) / (count * 4))
+        return List(count) { index ->
+            val start = index * stride
+            Span(start, minOf(stride + OVERLAP, length - start))
+        }
+    }
+
+    private fun inputSide(length: Int) = ((length + 2 * PAD + 3) / 4 * 4).coerceAtLeast(64)
+
+    private fun runTile(ort: OrtSession, pixels: IntArray, width: Int, height: Int, xs: Span, ys: Span): Int {
+        val inWidth = inputSide(xs.length)
+        val inHeight = inputSide(ys.length)
+        val inPlane = inWidth * inHeight
+        val outWidth = (inWidth - 2 * PAD) * SCALE
+        val outHeight = (inHeight - 2 * PAD) * SCALE
+        inputBuffer.clear()
+        inputBuffer.limit(3 * inPlane)
+        outputBuffer.clear()
+        outputBuffer.limit(3 * outWidth * outHeight)
+        for (row in 0 until inHeight) {
+            val sy = (ys.start - PAD + row).coerceIn(0, height - 1) * width
+            for (col in 0 until inWidth) {
+                val pixel = pixels[sy + (xs.start - PAD + col).coerceIn(0, width - 1)]
+                val index = row * inWidth + col
+                inputBuffer.put(index, (pixel ushr 16 and 255) / 255f)
+                inputBuffer.put(inPlane + index, (pixel ushr 8 and 255) / 255f)
+                inputBuffer.put(2 * inPlane + index, (pixel and 255) / 255f)
             }
         }
-        outBuf.rewind(); outBuf.get(tileOut)
-    }
-
-    /**
-     * The session to use, picking NNAPI vs CPU on first use with the already packed first tile (whose CPU result is
-     * left in [tileOut]): NNAPI must reproduce the CPU output (mean |Δ| < 1 %) and beat it by ≥ 15 %.
-     */
-    private fun obtainSession(context: Context): OrtSession {
-        session?.let { runTile(it); return it }
-        val cpu = createSession(context, nnapi = false)
-        var t0 = SystemClock.elapsedRealtime()
-        runTile(cpu)
-        val cpuMs = SystemClock.elapsedRealtime() - t0
-        if (Build.VERSION.SDK_INT < 29) return cpu.also { session = it }
-        val reference = tileOut.copyOf()
-        val nn = runCatching { createSession(context, nnapi = true) }.getOrNull() ?: return cpu.also { session = it }
-        val chosen = runCatching {
-            runTile(nn) // warm-up: the first NNAPI run compiles the model for the accelerator
-            t0 = SystemClock.elapsedRealtime()
-            runTile(nn)
-            val nnMs = SystemClock.elapsedRealtime() - t0
-            var err = 0.0
-            var finite = true
-            for (i in reference.indices step 7) {
-                val v = tileOut[i]
-                if (v.isNaN() || v.isInfinite()) { finite = false; break }
-                err += abs(v - reference[i])
+        OnnxTensor.createTensor(environment, inputBuffer, longArrayOf(1, 3, inHeight.toLong(), inWidth.toLong())).use { input ->
+            OnnxTensor.createTensor(environment, outputBuffer, longArrayOf(1, 3, outHeight.toLong(), outWidth.toLong())).use { output ->
+                ort.run(mapOf("x" to input), mapOf("y" to output)).close()
             }
-            err /= (reference.size / 7).coerceAtLeast(1)
-            Log.i(TAG, "manga AI upscale: cpu ${cpuMs}ms, nnapi ${nnMs}ms, |Δ| ${"%.4f".format(err)}")
-            finite && err < 0.01 && nnMs < cpuMs * 0.85
-        }.getOrDefault(false)
-        if (chosen) { cpu.close(); session = nn; return nn }
-        nn.close()
-        System.arraycopy(reference, 0, tileOut, 0, reference.size)
-        session = cpu
-        return cpu
-    }
-
-    private fun resizeSoftware(source: Bitmap, width: Int, height: Int): Bitmap {
-        var current = if (source.config == Bitmap.Config.ARGB_8888) source else source.copy(Bitmap.Config.ARGB_8888, false)
-        if (current.width == width && current.height == height) return current
-        while (current.width / 2 >= width && current.height / 2 >= height) {
-            val next = Bitmap.createScaledBitmap(current, current.width / 2, current.height / 2, true)
-            if (current !== source) current.recycle()
-            current = next
         }
-        val last = Bitmap.createScaledBitmap(current, width, height, true)
-        if (current !== source && current !== last) current.recycle()
-        return last
+        return outWidth
     }
 
-    private suspend fun infer(context: Context, source: Bitmap, plan: Plan, shouldYield: () -> Boolean): Bitmap {
+    private suspend fun infer(context: Context, source: Bitmap, width: Int, height: Int, shouldYield: () -> Boolean): Bitmap {
         if (shouldYield()) throw Preempted()
-        val work = resizeSoftware(source, plan.workWidth, plan.workHeight)
-        val ww = work.width; val wh = work.height
-        val px = IntArray(ww * wh)
-        work.getPixels(px, 0, ww, 0, 0, ww, wh)
-        if (work !== source) work.recycle()
-
-        val k = plan.box
-        val out = Bitmap.createBitmap(plan.outWidth, plan.outHeight, Bitmap.Config.ARGB_8888)
-        val rowOut = IntArray((TILE * SCALE / k) * (TILE * SCALE / k))
-        val plane = IN * IN
-        val outPlane = OUT * OUT
-        val inv = 1f / 255f
-        val boxInv = 1f / (k * k)
-        var first = true
+        val work = Bitmap.createScaledBitmap(source, width, height, true)
+        val pixels = try {
+            IntArray(width * height).also { work.getPixels(it, 0, width, 0, 0, width, height) }
+        } finally {
+            if (work !== source) work.recycle()
+        }
+        val ort = obtainSession(context)
+        val columns = spans(width)
+        val rows = spans(height)
+        val outWidth = width * SCALE
+        val outHeight = height * SCALE
+        val out = Bitmap.createBitmap(outWidth, outHeight, Bitmap.Config.ARGB_8888)
         try {
-            for (top in 0 until wh step TILE) {
-                for (left in 0 until ww step TILE) {
+            // The network's global channel statistics vary between tiles. Feather its luma in a rolling band.
+            val band = FloatArray(outWidth * rows.maxOf { it.length * SCALE })
+            val packed = IntArray(band.size)
+            for ((rowIndex, ys) in rows.withIndex()) {
+                val yStart = ys.start * SCALE
+                val tileHeight = ys.length * SCALE
+                val flushHeight = (rows.getOrNull(rowIndex + 1)?.start?.times(SCALE) ?: outHeight) - yStart
+                for (xs in columns) {
                     currentCoroutineContext().ensureActive()
                     if (shouldYield()) throw Preempted()
-                    // pack the 272×272 context window as RGB planar NCHW in [0, 1], edge-replicated at the borders
-                    val x0 = left - PAD; val y0 = top - PAD
-                    for (yy in 0 until IN) {
-                        val sy = (y0 + yy).coerceIn(0, wh - 1) * ww
-                        val row = yy * IN
-                        for (xx in 0 until IN) {
-                            val p = px[sy + (x0 + xx).coerceIn(0, ww - 1)]
-                            val i = row + xx
-                            tileIn[i] = (p ushr 16 and 255) * inv
-                            tileIn[plane + i] = (p ushr 8 and 255) * inv
-                            tileIn[2 * plane + i] = (p and 255) * inv
+                    val tileStride = runTile(ort, pixels, width, height, xs, ys)
+                    val plane = tileStride * ((inputSide(ys.length) - 2 * PAD) * SCALE)
+                    val xStart = xs.start * SCALE
+                    val tileWidth = xs.length * SCALE
+                    for (y in 0 until tileHeight) {
+                        val weightY = weight(y, tileHeight, yStart, outHeight)
+                        for (x in 0 until tileWidth) {
+                            val offset = y * tileStride + x
+                            val luma = luma(outputBuffer[offset], outputBuffer[plane + offset], outputBuffer[2 * plane + offset])
+                            check(luma.isFinite()) { "Nonfinite manga AI output" }
+                            band[y * outWidth + xStart + x] += luma * weightY * weight(x, tileWidth, xStart, outWidth)
                         }
                     }
-                    if (first) { obtainSession(context); first = false } else runTile(session!!)
-
-                    // unpack the tile's core, box-averaging k×k (k = 1: pure ×4, k = 2: clean ×2)
-                    val coreW = (min(left + TILE, ww) - left) * SCALE
-                    val coreH = (min(top + TILE, wh) - top) * SCALE
-                    val fw = coreW / k; val fh = coreH / k
-                    val base = PAD * SCALE
-                    for (fy in 0 until fh) {
-                        for (fx in 0 until fw) {
-                            var r = 0f; var g = 0f; var b = 0f
-                            for (dy in 0 until k) {
-                                val o = (base + fy * k + dy) * OUT + base + fx * k
-                                for (dx in 0 until k) {
-                                    r += tileOut[o + dx]; g += tileOut[outPlane + o + dx]; b += tileOut[2 * outPlane + o + dx]
-                                }
-                            }
-                            rowOut[fy * fw + fx] = (0xff shl 24) or (channel(r * boxInv) shl 16) or (channel(g * boxInv) shl 8) or channel(b * boxInv)
-                        }
-                    }
-                    out.setPixels(rowOut, 0, fw, left * SCALE / k, top * SCALE / k, fw, fh)
                 }
+                currentCoroutineContext().ensureActive()
+                if (shouldYield()) throw Preempted()
+                for (y in 0 until flushHeight) {
+                    val sourceY = (yStart + y) / SCALE
+                    val otherY = neighbour(yStart + y, sourceY, height)
+                    for (x in 0 until outWidth) {
+                        val sourceX = x / SCALE
+                        val otherX = neighbour(x, sourceX, width)
+                        val index = y * outWidth + x
+                        packed[index] = restoreLuma(band[index], pixels[sourceY * width + sourceX],
+                            pixels[sourceY * width + otherX], pixels[otherY * width + sourceX], pixels[otherY * width + otherX])
+                    }
+                }
+                out.setPixels(packed, 0, outWidth, 0, yStart, outWidth, flushHeight)
+                val carry = (tileHeight - flushHeight) * outWidth
+                band.copyInto(band, 0, flushHeight * outWidth, tileHeight * outWidth)
+                band.fill(0f, carry)
             }
         } catch (e: Throwable) {
             out.recycle()
             throw e
         }
-        out.setHasMipMap(true)
         return out
     }
 
+    private fun weight(index: Int, length: Int, start: Int, full: Int): Float {
+        val overlap = OVERLAP * SCALE
+        return when {
+            start > 0 && index < overlap -> (index + 0.5f) / overlap
+            start + length < full && index >= length - overlap -> (length - index - 0.5f) / overlap
+            else -> 1f
+        }
+    }
+
+    private fun neighbour(out: Int, source: Int, limit: Int): Int =
+        (source + if (out % SCALE == 0) -1 else 1).coerceIn(0, limit - 1)
+
+    /** Native neural luma over bilinear source chroma; a common delta keeps channels from clipping independently. */
+    private fun restoreLuma(neural: Float, near: Int, across: Int, below: Int, diagonal: Int): Int {
+        val red = interpolate(16, near, across, below, diagonal)
+        val green = interpolate(8, near, across, below, diagonal)
+        val blue = interpolate(0, near, across, below, diagonal)
+        val alpha = interpolate(24, near, across, below, diagonal)
+        val change = neural * 255f - luma(red, green, blue)
+        val delta = if (abs(change) < 0.5f) 0f else change.coerceIn(-minOf(red, green, blue), 255f - maxOf(red, green, blue))
+        return (alpha.roundToInt() shl 24) or ((red + delta).roundToInt() shl 16) or
+            ((green + delta).roundToInt() shl 8) or (blue + delta).roundToInt()
+    }
+
+    private fun interpolate(shift: Int, near: Int, across: Int, below: Int, diagonal: Int): Float =
+        (9 * (near ushr shift and 255) + 3 * (across ushr shift and 255) +
+            3 * (below ushr shift and 255) + (diagonal ushr shift and 255)) / 16f
+
+    private fun luma(red: Float, green: Float, blue: Float) = 0.299f * red + 0.587f * green + 0.114f * blue
+
     private fun floatBuffer(floats: Int): FloatBuffer =
         ByteBuffer.allocateDirect(floats * Float.SIZE_BYTES).order(ByteOrder.nativeOrder()).asFloatBuffer()
-
-    private fun channel(value: Float): Int = (value * 255f + 0.5f).toInt().coerceIn(0, 255)
 }
