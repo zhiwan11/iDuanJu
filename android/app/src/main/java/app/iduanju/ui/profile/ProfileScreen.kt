@@ -4,9 +4,12 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -37,6 +40,9 @@ fun ProfileScreen(onOpenDetail: (String) -> Unit = {}) {
     val ctx = androidx.compose.ui.platform.LocalContext.current
     val scope = rememberCoroutineScope()
     var message by remember { mutableStateOf<String?>(null) }
+    var confirmLogout by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) { ia.hgWebAccount.refreshProfile() }
 
     Column(
         Modifier.fillMaxSize().background(c.bg).statusBarsPadding().verticalScroll(rememberScrollState())
@@ -69,6 +75,34 @@ fun ProfileScreen(onOpenDetail: (String) -> Unit = {}) {
             }
         }
         Column(Modifier.padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+            Group("红果账号") {
+                val hgProfile = ia.hgWebAccount.profile
+                if (hgProfile == null) {
+                    LinkRow("登录红果账号", ProfileIcons.key, sub = "扫码或手机验证码登录，看剧进度同步到红果", trailing = "去登录") { go("hongguo-login") }
+                } else {
+                    Row(
+                        Modifier.fillMaxWidth().clickable { confirmLogout = true }.padding(horizontal = 14.dp, vertical = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(
+                            Modifier.size(32.dp).clip(CircleShape).background(c.accentSoft),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            if (hgProfile.avatarUrl.isNotEmpty()) {
+                                coil.compose.AsyncImage(hgProfile.avatarUrl, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                            } else {
+                                Text(hgProfile.nickname.take(1), color = c.accent, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text("红果账号 · ${hgProfile.nickname}", color = c.text, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text("已登录 · 看剧进度自动同步到红果", color = c.secondary, fontSize = 12.sp, lineHeight = 16.sp)
+                        }
+                        Text("退出", color = c.secondary, fontSize = 14.sp, modifier = Modifier.padding(start = 8.dp))
+                    }
+                }
+            }
             Group {
                 LinkRow("观看历史", ProfileIcons.history, trailing = lib.history.size.takeIf { it > 0 }?.toString()) { go("library/history") }
                 RowDivider()
@@ -111,6 +145,22 @@ fun ProfileScreen(onOpenDetail: (String) -> Unit = {}) {
             Text(message ?: "所有数据由本机直连上游，观看记录和收藏只保存在本机。\ni短剧 $ver",
                 color = if (message != null) c.accent else c.secondary, fontSize = 12.sp, lineHeight = 18.sp)
         }
+    }
+
+    if (confirmLogout) {
+        AlertDialog(
+            onDismissRequest = { confirmLogout = false },
+            title = { Text("退出红果账号？") },
+            text = { Text("退出后将停止同步看剧进度到红果网页端，本地观看记录不受影响。") },
+            confirmButton = {
+                TextButton({
+                    ia.hgWebAccount.logout()
+                    confirmLogout = false
+                    message = "已退出红果账号"
+                }) { Text("退出", color = c.accentWarm) }
+            },
+            dismissButton = { TextButton({ confirmLogout = false }) { Text("取消") } },
+        )
     }
 }
 

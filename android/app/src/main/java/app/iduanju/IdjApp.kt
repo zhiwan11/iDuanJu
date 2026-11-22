@@ -11,6 +11,8 @@ class IdjApp : Application(), coil.ImageLoaderFactory {
         private set
     lateinit var hongguo: HongguoClient
         private set
+    lateinit var hgWebAccount: app.iduanju.data.HongguoWebAccount
+        private set
     lateinit var library: LibraryStore
         private set
     lateinit var cms: app.iduanju.data.CMSStore
@@ -44,6 +46,7 @@ class IdjApp : Application(), coil.ImageLoaderFactory {
             settings.playerDeviceOverride()?.let { it }
         }
         hongguo = HongguoClient(filesDir)
+        hgWebAccount = app.iduanju.data.HongguoWebAccount(this)
         app.iduanju.core.hls.HLSAdFilter.enabled = getSharedPreferences("idj", MODE_PRIVATE).getBoolean("stv.hls.adstrip", true)
         library = LibraryStore(this)
         cms = app.iduanju.data.CMSStore(this)

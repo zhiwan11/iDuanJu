@@ -178,6 +178,7 @@ fun RootScreen(initialRoute: String? = null) {
                 composable("category") { CategoryScreen(onOpenDetail = { nav.navigate("detail/$it") }) }
                 composable("library/{kind}") { e -> app.iduanju.ui.library.LibraryListScreen(e.arguments!!.getString("kind")!!, onBack = { nav.popBackStack() }, onOpenDetail = { nav.navigate("detail/$it") }) }
                 composable("profile") { ProfileScreen(onOpenDetail = { nav.navigate("detail/$it") }) }
+                composable("hongguo-login") { app.iduanju.ui.profile.HongguoLoginScreen(onBack = { nav.popBackStack() }) }
                 composable("sources") { app.iduanju.ui.profile.SourcesScreen(onBack = { nav.popBackStack() }) }
                 composable("plugins") { app.iduanju.ui.profile.PluginsScreen(onBack = { nav.popBackStack() }) }
                 composable("novel") { app.iduanju.novel.NovelScreen(onBack = { nav.popBackStack() }) }
