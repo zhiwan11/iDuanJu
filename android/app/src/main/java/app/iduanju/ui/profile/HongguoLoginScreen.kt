@@ -1,7 +1,9 @@
 package app.iduanju.ui.profile
 
 import android.annotation.SuppressLint
+import android.view.View
 import android.webkit.CookieManager
+import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -42,21 +44,61 @@ import app.iduanju.ui.theme.IdjThemeColors
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 
+private const val LOGIN_STYLE_CSS =
+    "* { -webkit-backdrop-filter: none !important; backdrop-filter: none !important; } " +
+        "[role=\"dialog\"], [class*=\"pc-login-dialog\"] { " +
+        "-webkit-backdrop-filter: none !important; backdrop-filter: none !important; " +
+        "max-height: calc(100% - 32px) !important; " +
+        "background: #222424 !important; opacity: 1 !important; visibility: visible !important; }"
+
 private const val AUTO_OPEN_LOGIN_JS = """
-setTimeout(function() {
+(function() {
   try {
-    var text = (document.body && document.body.innerText) || '';
-    if (text.indexOf('扫码登录') !== -1) return;
-    var els = document.querySelectorAll('button, a, div, span');
-    for (var i = 0; i < els.length; i++) {
-      var el = els[i];
-      if ((el.innerText || '').trim() === '登录') {
-        el.click();
-        break;
+    function ensureFixStyle() {
+      if (!document.getElementById('idj-login-fix')) {
+        var st = document.createElement('style');
+        st.id = 'idj-login-fix';
+        st.textContent = '$LOGIN_STYLE_CSS';
+        (document.head || document.documentElement).appendChild(st);
       }
     }
+    ensureFixStyle();
+    if (window.__idjLoginTimer) clearInterval(window.__idjLoginTimer);
+    var tries = 0;
+    window.__idjLoginTimer = setInterval(function() {
+      tries++;
+      try {
+        ensureFixStyle();
+        var dlg = document.querySelector('[role="dialog"], [class*="pc-login-dialog"]');
+        if (dlg && dlg.getBoundingClientRect().width > 0 && dlg.getBoundingClientRect().height > 0) {
+          clearInterval(window.__idjLoginTimer);
+          window.__idjLoginTimer = null;
+          return;
+        }
+        // Only click once every ~1s until dialog opens (React hydration may lag SSR).
+        if (tries % 2 === 1) {
+          var clicked = false;
+          var selectors = ['button', 'a, [role="button"]', 'span, div'];
+          for (var s = 0; s < selectors.length && !clicked; s++) {
+            var btns = document.querySelectorAll(selectors[s]);
+            for (var i = 0; i < btns.length; i++) {
+              var el = btns[i];
+              if ((el.innerText || '').trim() === '登录') {
+                el.click();
+                clicked = true;
+                break;
+              }
+            }
+          }
+        }
+      } catch (e) {}
+      if (tries >= 40) {
+        clearInterval(window.__idjLoginTimer);
+        window.__idjLoginTimer = null;
+      }
+    }, 500);
   } catch (e) {}
-}, 800);
+})();
 """
 
 @SuppressLint("SetJavaScriptEnabled")
@@ -137,12 +179,14 @@ fun HongguoLoginScreen(onBack: () -> Unit) {
             modifier = Modifier.fillMaxWidth().weight(1f),
             factory = { ctx ->
                 WebView(ctx).apply {
+                    // Software layer avoids emulator/GPU compositor dropouts on fixed backdrop-blur dialogs.
+                    setLayerType(View.LAYER_TYPE_SOFTWARE, null)
                     settings.apply {
                         javaScriptEnabled = true
                         domStorageEnabled = true
                         userAgentString = HongguoWebAccount.PC_USER_AGENT
                         useWideViewPort = true
-                        loadWithOverviewMode = true
+                        loadWithOverviewMode = false
                         setSupportZoom(true)
                         builtInZoomControls = true
                         displayZoomControls = false
@@ -151,7 +195,13 @@ fun HongguoLoginScreen(onBack: () -> Unit) {
                     val cm = CookieManager.getInstance()
                     cm.setAcceptCookie(true)
                     cm.setAcceptThirdPartyCookies(this, true)
+                    webChromeClient = WebChromeClient()
                     webViewClient = object : WebViewClient() {
+                        override fun onPageCommitVisible(view: WebView?, url: String?) {
+                            super.onPageCommitVisible(view, url)
+                            view?.evaluateJavascript(AUTO_OPEN_LOGIN_JS, null)
+                        }
+
                         override fun onPageFinished(view: WebView?, url: String?) {
                             super.onPageFinished(view, url)
                             view?.evaluateJavascript(AUTO_OPEN_LOGIN_JS, null)
