@@ -1,10 +1,8 @@
 package app.iduanju.ui.profile
 
 import androidx.compose.foundation.layout.*
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -24,25 +22,16 @@ fun SourcesScreen(onBack: () -> Unit) {
     val c = IdjThemeColors
     val ia = IdjApp.instance
     val go = LocalNavigate.current
-    val ctx = androidx.compose.ui.platform.LocalContext.current
-    var confirmAdult by remember { mutableStateOf(false) }
     var adStrip by remember { mutableStateOf(app.iduanju.core.hls.HLSAdFilter.enabled) }
     var prefetch by remember { mutableStateOf(ia.settings.prefetchEnabled) }
     var cacheMB by remember { mutableIntStateOf(ia.settings.playbackCacheMB) }
-    var message by remember { mutableStateOf<String?>(null) }
-    val adult = ia.cms.adultUnlocked
 
     SettingsPage("片源管理", onBack) {
         Group("内置") {
             BuiltinRow("红果短剧", ProfileIcons.play)
         }
-        Group("成人内容（默认隐藏）", footer = "开启后黄果、标记为成人的采集站 / 插件 / Telegram 频道 / 漫画插件才会出现在首页、搜索、频道与漫画；所有结果一律过滤未成年人与非自愿题材。") {
-            SwitchRow("显示成人片源", ProfileIcons.film, "黄果短剧、成人采集站 / 插件 / 频道 / 漫画 · 仅限年满 18 周岁", adult) {
-                if (it) confirmAdult = true else { ia.cms.adultUnlocked = false; message = "已隐藏成人片源" }
-            }
-        }
         Group("插件与采集站") {
-            LinkRow("插件管理", ProfileIcons.plugin, sub = "JS 插件、订阅、苹果 CMS 采集站；成人插件在这里解锁后才显示") { go("plugins") }
+            LinkRow("插件管理", ProfileIcons.plugin, sub = "JS 插件、订阅、苹果 CMS 采集站") { go("plugins") }
         }
         Group("播放") {
             SwitchRow("去广告", ProfileIcons.adblock, "去掉 HLS 片源里插播的广告片段（adjump、异域名短片段、重复片段）", adStrip) {
@@ -57,15 +46,7 @@ fun SourcesScreen(onBack: () -> Unit) {
                 onValueChangeFinished = { ia.settings.playbackCacheMB = cacheMB }, valueRange = 100f..2000f, steps = 18, modifier = Modifier.padding(horizontal = 14.dp))
         }
         DeviceOverrideGroup()
-        Note(message)
     }
-    if (confirmAdult) AlertDialog(
-        onDismissRequest = { confirmAdult = false },
-        title = { Text("显示成人片源？") },
-        text = { Text("仅限年满 18 周岁的用户。开启后黄果与标记为成人的片源会出现在首页、搜索、频道与漫画；可随时在这里关闭。") },
-        confirmButton = { TextButton({ ia.cms.adultUnlocked = true; confirmAdult = false; message = "已显示成人片源" }) { Text("我已年满 18 周岁") } },
-        dismissButton = { TextButton({ confirmAdult = false }) { Text("取消") } },
-    )
 }
 
 @Composable

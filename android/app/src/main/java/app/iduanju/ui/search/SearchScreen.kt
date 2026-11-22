@@ -70,10 +70,10 @@ fun SearchScreen(onOpenDetail: (String) -> Unit, initialQuery: String = "") {
     var verify by remember { mutableStateOf<app.iduanju.core.util.VerificationRequiredException?>(null) }
     // iOS SourceGate.searchSources: [红果, 黄果] + visible sites (黄果 only behind the adult gate on Android)
     val ia = IdjApp.instance
-    val sources: List<Pair<String, String>> = remember(ia.cms.adultUnlocked) {
-        listOf("hongguo" to "红果") + (if (ia.cms.adultUnlocked) listOf("huangguo" to "黄果") else emptyList()) +
+    val sources: List<Pair<String, String>> = remember {
+        listOf("hongguo" to "红果") +
             ia.cms.visibleSites.map { "cms:" + it.key to it.name } +
-            ia.plugins.visible(ia.cms.adultUnlocked).filter { it.type == "video" || it.type == "shortdrama" }.map { "plugin:" + it.id to it.name }
+            ia.plugins.visible(false).filter { it.type == "video" || it.type == "shortdrama" }.map { "plugin:" + it.id to it.name }
     }
     var source by remember { mutableStateOf("hongguo") }
     var pageNo by remember { mutableIntStateOf(1) }
@@ -95,7 +95,6 @@ fun SearchScreen(onOpenDetail: (String) -> Unit, initialQuery: String = "") {
                 val p = withContext(Dispatchers.IO) {
                     when {
                         src == "hongguo" -> ia.hongguo.search(q, cursor = if (reset) null else cursor)
-                        src == "huangguo" -> app.iduanju.core.hongguo.HGPage(ia.huangguo.search(q), false)
                         src.startsWith("cms:") -> ia.cms.site(src.removePrefix("cms:"))?.let { app.iduanju.core.cms.MacCMS.search(it, q, pageNo) } ?: app.iduanju.core.hongguo.HGPage(emptyList(), false)
                         else -> try { ia.plugins.video(src.removePrefix("plugin:"))?.search(q, pageNo) ?: app.iduanju.core.hongguo.HGPage(emptyList(), false) }
                                 catch (e: app.iduanju.core.plugin.PluginException) { throw Exception(e.friendly) }

@@ -51,7 +51,6 @@ fun TVBoxConfigScreen(
 ) {
     val c = IdjThemeColors
     val store = IdjApp.instance.tvbox
-    val adultUnlocked = IdjApp.instance.cms.adultUnlocked
     val scope = rememberCoroutineScope()
     val ctx = LocalContext.current
 
@@ -96,7 +95,7 @@ fun TVBoxConfigScreen(
     }
 
     val activeRepo = store.activeRepo
-    val visibleSites = activeRepo?.sites?.filter { !it.adult || adultUnlocked }.orEmpty()
+    val visibleSites = activeRepo?.sites?.filter { !it.adult }.orEmpty()
     val lives = activeRepo?.lives.orEmpty()
 
     Box(
@@ -589,7 +588,6 @@ private fun PasteTVBoxDialog(onDismiss: () -> Unit, onConfirm: (String) -> Unit)
 private fun ManualCMSSiteDialog(onDismiss: () -> Unit, onConfirm: (String, String, Boolean) -> Unit) {
     var name by remember { mutableStateOf("") }
     var api by remember { mutableStateOf("") }
-    var adult by remember { mutableStateOf(false) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("手动添加苹果 CMS 站点") },
@@ -597,13 +595,9 @@ private fun ManualCMSSiteDialog(onDismiss: () -> Unit, onConfirm: (String, Strin
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("站点名称（可选）") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                 OutlinedTextField(value = api, onValueChange = { api = it }, label = { Text("https://…/api.php/provide/vod/") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Checkbox(checked = adult, onCheckedChange = { adult = it })
-                    Text("成人内容（需在片源管理解锁后可见）", fontSize = 12.sp)
-                }
             }
         },
-        confirmButton = { TextButton(onClick = { onConfirm(name.trim(), api.trim(), adult) }, enabled = api.trim().startsWith("https://")) { Text("添加") } },
+        confirmButton = { TextButton(onClick = { onConfirm(name.trim(), api.trim(), false) }, enabled = api.trim().startsWith("https://")) { Text("添加") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
     )
 }

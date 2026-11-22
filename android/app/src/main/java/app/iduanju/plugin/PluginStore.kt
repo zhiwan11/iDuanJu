@@ -37,6 +37,7 @@ class PluginStore(private val ctx: Context,
     /** Validates + test-loads in a fresh engine before saving (a broken plugin never gets installed). */
     fun install(text: String, origin: String = "manual"): Installed {
         val b = PluginBundle.parse(text)
+        if (b.manifest.adult) throw PluginException("E_INSTALL", "不支持安装成人插件")
         val dir = File(root, b.manifest.id)
         val probe = PluginInstance(b, PluginHost(b.manifest, dir, log = { log(b.manifest.id, it) }), ::QuickJSEngine)
         probe.close()
@@ -57,7 +58,7 @@ class PluginStore(private val ctx: Context,
 
     fun setEnabled(id: String, on: Boolean) { val i = plugins.indexOfFirst { it.id == id }; if (i >= 0) { plugins[i] = plugins[i].copy(enabled = on); save() } }
 
-    fun visible(adultUnlocked: Boolean) = plugins.filter { it.enabled && (!it.adult || adultUnlocked) }
+    fun visible(adultUnlocked: Boolean) = plugins.filter { it.enabled && !it.adult }
 
     /** Loaded video/shortdrama provider (lazily creates the QuickJS instance on the caller's IO thread). */
     fun video(id: String): PluginVideo = synchronized(live) {
@@ -152,8 +153,8 @@ class PluginStore(private val ctx: Context,
         return install(M3UImport.bundle(channels, title, M3UImport.importId(url ?: text), author = "M3U 导入"), origin)
     }
 
-    /** iOS bundles adult comic plugins under 推荐插件 (never auto-installed). */
-    fun bundled(): List<String> = runCatching { ctx.assets.list("plugins")?.filter { it.endsWith(".idjplugin") }?.sorted() ?: emptyList() }.getOrDefault(emptyList())
+    /** Bundled adult comic plugins removed. */
+    fun bundled(): List<String> = emptyList()
     fun bundledText(name: String): String = ctx.assets.open("plugins/$name").use { it.readBytes().toString(Charsets.UTF_8) }
     /** (file, manifest) for 推荐插件; unparsable files are skipped. */
     fun bundledManifests(): List<Pair<String, PluginManifest>> = bundled().mapNotNull { f -> runCatching { f to PluginBundle.parse(bundledText(f)).manifest }.getOrNull() }

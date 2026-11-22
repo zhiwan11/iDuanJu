@@ -27,7 +27,7 @@ class TGStore(ctx: Context) {
     private fun save() = sp.edit().putString(KEY, JSONArray(channels.map { it.toJSON() }).toString()).apply()
 
     fun channel(name: String) = channels.firstOrNull { it.id == name.lowercase() }
-    fun visible(adult: Boolean) = channels.filter { adult || !it.isAdult }
+    fun visible(adult: Boolean) = channels.filter { !it.isAdult }
     fun add(raw: String, adult: Boolean = false): TGChannel? {
         val u = TGChannel.normalize(raw) ?: return null
         channel(u)?.let { return it }

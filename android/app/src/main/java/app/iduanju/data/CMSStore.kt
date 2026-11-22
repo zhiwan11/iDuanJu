@@ -13,29 +13,28 @@ class CMSStore(ctx: Context) {
     val sites = mutableStateListOf<CMSSite>()
 
     init {
+        sp.edit().remove("gate.adult").apply()
         try { val a = JSONArray(sp.getString(KEY, "[]")); for (i in 0 until a.length()) sites.add(CMSSite.fromJSON(a.getJSONObject(i))) } catch (_: Exception) {}
     }
 
     private fun save() { sp.edit().putString(KEY, JSONArray(sites.map { it.toJSON() }).toString()).apply() }
 
     fun site(key: String): CMSSite? = sites.firstOrNull { it.key == key }
-    val visibleSites: List<CMSSite> get() = sites.filter { it.enabled && (!it.adult || adultUnlocked) }
-    private val adultState = androidx.compose.runtime.mutableStateOf(sp.getBoolean("gate.adult", false))
-    /** Compose state so home / search / 频道 / 漫画 re-filter as soon as the gate changes in 我的. */
+    val visibleSites: List<CMSSite> get() = sites.filter { it.enabled && !it.adult }
     var adultUnlocked: Boolean
-        get() = adultState.value
-        set(v) { adultState.value = v; sp.edit().putBoolean("gate.adult", v).apply() }
+        get() = false
+        set(_) { sp.edit().remove("gate.adult").apply() }
 
     /** Validates by fetching the class list (blocking; call off the main thread), then saves. */
     fun add(name: String, apiRaw: String, adult: Boolean, origin: String = "manual"): CMSSite {
         val api = MacCMS.normalize(apiRaw)
         val cats = MacCMS.fetchCategories(api)
-        return saveValidated(name, api, adult, origin, cats)
+        return saveValidated(name, api, false, origin, cats)
     }
 
     fun saveValidated(name: String, api: String, adult: Boolean, origin: String, cats: List<CMSCategory>): CMSSite {
         val host = runCatching { java.net.URI(api).host }.getOrNull() ?: "采集站"
-        var s = CMSSite(CMSSite.key(api), name.ifBlank { host }, api, adult, true, cats, origin)
+        var s = CMSSite(CMSSite.key(api), name.ifBlank { host }, api, false, true, cats, origin)
         val i = sites.indexOfFirst { it.key == s.key }
         if (i >= 0) { s = s.copy(enabled = sites[i].enabled); sites[i] = s } else sites.add(s)
         save(); return s

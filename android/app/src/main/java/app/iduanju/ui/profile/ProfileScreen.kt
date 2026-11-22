@@ -37,7 +37,6 @@ fun ProfileScreen(onOpenDetail: (String) -> Unit = {}) {
     val ctx = androidx.compose.ui.platform.LocalContext.current
     val scope = rememberCoroutineScope()
     var message by remember { mutableStateOf<String?>(null) }
-    val adult = ia.cms.adultUnlocked
 
     Column(
         Modifier.fillMaxSize().background(c.bg).statusBarsPadding().verticalScroll(rememberScrollState())
@@ -78,7 +77,7 @@ fun ProfileScreen(onOpenDetail: (String) -> Unit = {}) {
                 LinkRow("我的收藏", ProfileIcons.heart, trailing = "${lib.favorites.size}") { go("library/favorites") }
             }
             Group {
-                LinkRow("Telegram 频道", ProfileIcons.telegram, trailing = "${ia.tg.visible(adult).size} 个") { go("home/channels") }
+                LinkRow("Telegram 频道", ProfileIcons.telegram, trailing = "${ia.tg.visible(false).size} 个") { go("home/channels") }
                 RowDivider()
                 LinkRow("漫画", ProfileIcons.manga, trailing = ia.manga.favorites.size.takeIf { it > 0 }?.let { "收藏 $it" }) { go("home/manga") }
                 RowDivider()
@@ -87,9 +86,9 @@ fun ProfileScreen(onOpenDetail: (String) -> Unit = {}) {
                 LinkRow("下载管理", ProfileIcons.download, trailing = "暂未支持") { message = "Android 版暂不支持离线下载" }
             }
             Group {
-                LinkRow("片源管理", ProfileIcons.sources, trailing = if (adult) "已解锁成人片源" else "红果 · 黄果") { go("sources") }
+                LinkRow("片源管理", ProfileIcons.sources, trailing = "红果") { go("sources") }
                 RowDivider()
-                val n = ia.plugins.plugins.count { !it.adult || adult } + ia.cms.sites.count { !it.adult || adult }
+                val n = ia.plugins.plugins.count { !it.adult } + ia.cms.sites.count { !it.adult }
                 LinkRow("插件", ProfileIcons.plugin, trailing = n.takeIf { it > 0 }?.let { "$it 个" }) { go("plugins") }
                 RowDivider()
                 LinkRow("开源许可", ProfileIcons.license) { go("licenses") }
@@ -101,8 +100,6 @@ fun ProfileScreen(onOpenDetail: (String) -> Unit = {}) {
             }
             Group {
                 ActRow("重置红果设备注册", ProfileIcons.reset, scope, { message = it }) { withContext(Dispatchers.IO) { ia.hongguo.resetDevice() }; "已重置红果设备" }
-                RowDivider()
-                ActRow("重置黄果访客会话", ProfileIcons.key, scope, { message = it }) { withContext(Dispatchers.IO) { ia.huangguo.resetSession() }; "已清除黄果会话" }
                 RowDivider()
                 ActRow("清空封面缓存", ProfileIcons.photos, scope, { message = it }) {
                     coil.Coil.imageLoader(ctx).let { l -> l.memoryCache?.clear(); withContext(Dispatchers.IO) { l.diskCache?.clear() } }; "封面缓存已清空"

@@ -276,7 +276,6 @@ private fun PostCard(p: TGPost, ch: TGChannel?, open: (String) -> Unit, onMedia:
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(name, color = c.accent, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                if (ch?.isAdult == true) Text("18+", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 6.dp).clip(CircleShape).background(Color.Red.copy(0.7f)).padding(horizontal = 4.dp))
             }
             if (p.forwardedFrom.isNotEmpty()) Text("转发自 ${p.forwardedFrom}", color = c.secondary, fontSize = 12.sp)
             if (p.text.isNotEmpty()) {

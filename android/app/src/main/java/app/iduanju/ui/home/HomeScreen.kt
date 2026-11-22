@@ -132,8 +132,8 @@ fun HomeScreen(onOpenDetail: (String) -> Unit, onSearch: () -> Unit = {}, onPlay
     val c = IdjThemeColors
     // iOS HomeSource.all: [红果, 黄果, AI剧] + visible sites (采集站 / plugins) + [频道, 漫画]
     val sites = IdjApp.instance.cms.visibleSites.filterNot { it.origin.equals("TVBox", ignoreCase = true) || it.origin.startsWith("TVBox") }
-    val plugins = IdjApp.instance.plugins.visible(IdjApp.instance.cms.adultUnlocked).filter { it.type == "video" || it.type == "shortdrama" }
-    val pages: List<Any> = listOf<Any>(HomeSource.hongguo) + (if (IdjApp.instance.cms.adultUnlocked) listOf<Any>(HomeSource.huangguo) else emptyList()) + listOf<Any>(HomeSource.ai) + sites + plugins + listOf(HomeSource.channels, HomeSource.manga, HomeSource.novel)
+    val plugins = IdjApp.instance.plugins.visible(false).filter { it.type == "video" || it.type == "shortdrama" }
+    val pages: List<Any> = listOf<Any>(HomeSource.hongguo, HomeSource.ai) + sites + plugins + listOf(HomeSource.channels, HomeSource.manga, HomeSource.novel)
     val labels = pages.map { when (it) { is HomeSource -> it.label; is app.iduanju.core.cms.CMSSite -> it.name; else -> (it as app.iduanju.plugin.PluginStore.Installed).name } }
     val pager = rememberPagerState { pages.size }
     LaunchedEffect(HomeJump.label, pages.size) {
@@ -203,24 +203,7 @@ fun HomeScreen(onOpenDetail: (String) -> Unit, onSearch: () -> Unit = {}, onPlay
                     return@HorizontalPager
                 }
                 if (s == HomeSource.channels) { app.iduanju.tg.ChannelFeedPage(onPlay); return@HorizontalPager }
-                if (s == HomeSource.ai && app.iduanju.IdjApp.instance.cms.adultUnlocked) {
-                    // iOS AI剧: 红果 AI剧 | 黄果 AI 站 (the latter only behind the adult gate)
-                    val sel = HomeSubSel.map[s.label] ?: 0
-                    Column(Modifier.fillMaxSize()) {
-                        Row(Modifier.padding(horizontal = 16.dp).padding(top = 4.dp, bottom = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            listOf("红果 AI剧", "黄果 AI 站").forEachIndexed { i, t ->
-                                val on = i == sel
-                                Box(Modifier.height(30.dp).clip(RoundedCornerShape(50)).background(if (on) c.text else c.text.copy(0.1f)).clickable { HomeSubSel.map[s.label] = i }.padding(horizontal = 12.dp), contentAlignment = Alignment.Center) {
-                                    Text(t, color = if (on) c.bg else c.text.copy(0.8f), fontSize = 13.sp, fontWeight = if (on) FontWeight.SemiBold else FontWeight.Normal)
-                                }
-                            }
-                        }
-                        Box(Modifier.weight(1f)) {
-                            if (sel == 1) app.iduanju.huangguo.HuangguoFeedPage(onOpenDetail, aiOnly = true)
-                            else FeedPage(s, onOpenDetail)
-                        }
-                    }
-                } else if (s.subs().isEmpty()) {
+                if (s.subs().isEmpty()) {
                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         Text("「${s.label}」Android 版尚未移植", color = c.secondary, fontSize = 14.sp)
                     }
@@ -273,7 +256,7 @@ private fun ChannelSheet(pages: List<Any>, labels: List<String>, current: Int, o
                 val subs: List<String> = when (p) {
                     is HomeSource -> when (p) {
                         HomeSource.huangguo -> listOf("视频站", "App 源")
-                        HomeSource.ai -> p.subs().map { it.subLabel } + if (app.iduanju.IdjApp.instance.cms.adultUnlocked) listOf("黄果 AI 站") else emptyList()
+                        HomeSource.ai -> p.subs().map { it.subLabel }
                         HomeSource.channels, HomeSource.manga -> emptyList()
                         else -> p.subs().map { it.subLabel }
                     }

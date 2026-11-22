@@ -5,7 +5,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Checkbox
 import androidx.compose.material3.Icon
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
@@ -43,7 +42,6 @@ fun PluginsScreen(onBack: () -> Unit) {
     val ia = IdjApp.instance
     val store = ia.plugins
     val cms = ia.cms
-    val adult = cms.adultUnlocked
     val scope = rememberCoroutineScope()
     val ctx = androidx.compose.ui.platform.LocalContext.current
     var message by remember { mutableStateOf<String?>(null) }
@@ -90,7 +88,7 @@ fun PluginsScreen(onBack: () -> Unit) {
     }
 
     SettingsPage("插件", onBack) {
-        val installed = store.plugins.filter { !it.adult || adult }
+        val installed = store.plugins.filter { !it.adult }
         Group("已安装（${installed.size}）") {
             if (installed.isEmpty()) Text("还没有插件。可以从下面的网址 / 文件 / 订阅添加，或安装内置推荐。", color = c.secondary, fontSize = 14.sp, modifier = Modifier.padding(14.dp))
             installed.forEachIndexed { i, p ->
@@ -101,7 +99,7 @@ fun PluginsScreen(onBack: () -> Unit) {
                     Column(Modifier.weight(1f)) {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             Text(p.name, color = c.text, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
-                            Tag(typeLabel(p.type)); if (p.adult) Tag("18+")
+                            Tag(typeLabel(p.type))
                         }
                         Text("v${p.version} · ${originLabel(p.origin)} · ${if (p.enabled) "已启用" else "已停用"}", color = c.secondary, fontSize = 12.sp)
                     }
@@ -134,17 +132,17 @@ fun PluginsScreen(onBack: () -> Unit) {
                         }
                         TextAction("删除") { removing = "sub:${s.url}" to (s.name.ifEmpty { s.url }) }
                     }
-                    s.plugins.filter { it.adult != true || adult }.forEach { e ->
+                    s.plugins.filter { it.adult != true }.forEach { e ->
                         val inst = store.plugins.firstOrNull { it.id == e.id }
                         val newer = inst != null && e.version != null && PluginManifest.compare(e.version!!, inst.version) > 0
-                        EntryRow(e.name, listOfNotNull(if (e.adult != false) "18+" else null), when { inst == null -> "安装"; newer -> "更新"; else -> null }) {
+                        EntryRow(e.name, emptyList(), when { inst == null -> "安装"; newer -> "更新"; else -> null }) {
                             run { describe(store.interpret(e.manifest, "订阅：" + s.url)) }
                         }
                     }
-                    s.cms.filter { it.adult != true || adult }.forEach { e ->
+                    s.cms.filter { it.adult != true }.forEach { e ->
                         val added = cms.sites.any { st -> runCatching { app.iduanju.core.cms.MacCMS.normalize(e.api) == st.api }.getOrDefault(false) }
                         EntryRow("采集站 · " + e.name, emptyList(), if (added) null else "添加") {
-                            run { val st = cms.add(e.name, e.api, e.adult ?: false, "订阅：" + s.url); "已添加采集站 ${st.name}" }
+                            run { val st = cms.add(e.name, e.api, false, "订阅：" + s.url); "已添加采集站 ${st.name}" }
                         }
                     }
                 }
@@ -153,35 +151,33 @@ fun PluginsScreen(onBack: () -> Unit) {
             LinkRow("添加订阅地址", ProfileIcons.add) { dialog = "sub" }
         }
         val bundled = remember { store.bundledManifests() }
-        val visibleBundled = bundled.filter { !it.second.adult || adult }
-        if (bundled.isNotEmpty()) Group("推荐插件（App 内置）",
-            footer = if (visibleBundled.isEmpty()) "App 内置了 ${bundled.size} 个漫画插件（成人内容），在「片源管理」打开成人内容后显示。" else null) {
+        val visibleBundled = bundled.filter { !it.second.adult }
+        if (visibleBundled.isNotEmpty()) Group("推荐插件（App 内置）") {
             visibleBundled.forEachIndexed { i, (file, m) ->
                 if (i > 0) RowDivider()
                 val inst = store.plugins.firstOrNull { it.id == m.id }
                 val newer = inst != null && PluginManifest.compare(m.version, inst.version) > 0
-                EntryRow(m.name, listOfNotNull(m.type?.label, if (m.adult) "18+" else null), when { inst == null -> "安装"; newer -> "更新"; else -> null },
+                EntryRow(m.name, listOfNotNull(m.type?.label), when { inst == null -> "安装"; newer -> "更新"; else -> null },
                     sub = m.description, padded = true) {
                     run { val r = store.install(store.bundledText(file), "内置"); "已安装「${r.name}」${r.version}" }
                 }
             }
         }
         Group("采集站（苹果 CMS）", footer = "采集站使用内置的苹果 CMS v10 适配器（?ac=list / ?ac=detail），只播放直链 m3u8 / mp4 线路，仅 https；未成年相关内容一律过滤。") {
-            cms.sites.filter { !it.adult || adult }.forEachIndexed { i, s ->
+            cms.sites.filter { !it.adult }.forEachIndexed { i, s ->
                 if (i > 0) RowDivider()
                 Row(Modifier.fillMaxWidth().clickable { removing = "cms:${s.key}" to s.name }.padding(horizontal = 14.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                     Icon(ProfileIcons.server, null, tint = c.text, modifier = Modifier.size(22.dp)); Spacer(Modifier.width(14.dp))
                     Column(Modifier.weight(1f)) {
                         Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                             Text(s.name, color = c.text, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
-                            if (s.adult) Tag("18+")
                         }
                         Text("${runCatching { java.net.URI(s.api).host }.getOrNull() ?: ""} · ${s.categories.size} 个分类", color = c.secondary, fontSize = 12.sp)
                     }
                     Switch(s.enabled, { cms.setEnabled(s.key, it) }, colors = SwitchDefaults.colors(checkedTrackColor = c.accent))
                 }
             }
-            if (cms.sites.any { !it.adult || adult }) RowDivider()
+            if (cms.sites.any { !it.adult }) RowDivider()
             LinkRow("添加采集站", ProfileIcons.server) { dialog = "cms" }
         }
         Note(message, error)
@@ -265,17 +261,15 @@ private fun PasteDialog(onDismiss: () -> Unit, onDone: (String) -> Unit) {
 private fun CMSDialog(onDismiss: () -> Unit, onDone: (String, String, Boolean) -> Unit) {
     var name by remember { mutableStateOf("") }
     var api by remember { mutableStateOf("") }
-    var adult by remember { mutableStateOf(false) }
     AlertDialog(
         onDismissRequest = onDismiss, title = { Text("添加采集站") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(name, { name = it }, label = { Text("名称（可空）") }, singleLine = true, modifier = Modifier.fillMaxWidth())
                 OutlinedTextField(api, { api = it }, label = { Text("采集接口 https://…/api.php/provide/vod/") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                Row(verticalAlignment = Alignment.CenterVertically) { Checkbox(adult, { adult = it }); Text("成人站（解锁成人内容后才显示）", fontSize = 13.sp) }
             }
         },
-        confirmButton = { TextButton({ onDone(name.trim(), api.trim(), adult) }, enabled = api.trim().startsWith("https://")) { Text("添加") } },
+        confirmButton = { TextButton({ onDone(name.trim(), api.trim(), false) }, enabled = api.trim().startsWith("https://")) { Text("添加") } },
         dismissButton = { TextButton(onDismiss) { Text("取消") } },
     )
 }

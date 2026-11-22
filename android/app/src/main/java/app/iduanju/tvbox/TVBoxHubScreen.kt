@@ -67,7 +67,6 @@ fun TVBoxHubScreen(
 ) {
     val c = IdjThemeColors
     val store = IdjApp.instance.tvbox
-    val adultUnlocked = IdjApp.instance.cms.adultUnlocked
     val activeRepo = store.activeRepo
 
     var mode by remember { mutableIntStateOf(0) } // 0 = 点播, 1 = 直播
@@ -75,8 +74,8 @@ fun TVBoxHubScreen(
     var selectedLiveId by remember { mutableStateOf<String?>(null) }
     var showPickerSheet by remember { mutableStateOf(false) }
 
-    val sites = remember(activeRepo, adultUnlocked) {
-        activeRepo?.sites?.filter { it.enabled && (!it.adult || adultUnlocked) }.orEmpty()
+    val sites = remember(activeRepo) {
+        activeRepo?.sites?.filter { it.enabled && !it.adult }.orEmpty()
     }
     val lives = remember(activeRepo) {
         activeRepo?.lives?.filter { it.enabled }.orEmpty()
