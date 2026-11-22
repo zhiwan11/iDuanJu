@@ -114,7 +114,7 @@ private fun ViewToggle(list: Boolean, onToggle: () -> Unit) {
     }
 }
 
-/** Grid cell with an optional 可达式 progress ribbon on the cover. */
+/** Grid cell with an optional reading-progress ribbon on the cover. */
 @Composable
 private fun MangaGridCell(m: MangaItem, headers: Map<String, String>, badge: String?, sub: String, onClick: () -> Unit) {
     val c = IdjThemeColors
@@ -149,7 +149,7 @@ private fun MangaListRow(m: MangaItem, headers: Map<String, String>, badge: Stri
     }
 }
 
-/** 「漫画」 home page: 发现 (sources, search, categories, grid / list) and 可达式 书架 (继续阅读 CTA, 收藏 / 历史 with progress badges). */
+/** 「漫画」 home page: 发现 (sources, search, categories, grid / list) and 书架 (继续阅读 CTA, 收藏 / 历史 with progress badges). */
 @Composable
 fun MangaHomePage(onOpen: (String) -> Unit) {
     val c = IdjThemeColors
@@ -249,7 +249,7 @@ private fun MangaDiscover(onOpen: (String) -> Unit) {
     }
 }
 
-/** 可达式书架：prominent 继续阅读 card, then 收藏 / 历史 in grid or list with 「读至第 X 话」 badges. */
+/** 书架：prominent 继续阅读 card, then 收藏 / 历史 in grid or list with 「读至第 X 话」 badges. */
 @Composable
 private fun MangaShelf(onOpen: (String) -> Unit) {
     val c = IdjThemeColors
@@ -304,7 +304,7 @@ private fun MangaShelf(onOpen: (String) -> Unit) {
     }
 }
 
-/** 可达式详情：blurred hero, meta + 读至第 X 话, 收藏, expandable desc, 正序/倒序 + grid/list chapter selector, sticky 继续阅读 CTA. */
+/** 漫画详情：blurred hero, meta + 读至第 X 话, 收藏, expandable desc, 正序/倒序 + grid/list chapter selector, sticky 继续阅读 CTA. */
 @Composable
 fun MangaDetailScreen(id: String, onBack: () -> Unit, onRead: (String, Int, Int) -> Unit) {
     val c = IdjThemeColors

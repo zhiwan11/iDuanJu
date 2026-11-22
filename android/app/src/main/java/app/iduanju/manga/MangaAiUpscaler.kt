@@ -29,7 +29,7 @@ import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 /**
- * 漫画 AI 超分「增强」: hybrid neural + Keda Anime4K restoration pipeline.
+ * 漫画 AI 超分「增强」: hybrid neural + Anime4K restoration pipeline.
  *
  * Why the previous implementation looked invisible / hung on real devices:
  * 1. It ran 4× Real-ESRGAN ONNX on CPU up to 1280×1920 (~48 tiles = 20–78 s per page), so users flipped pages
@@ -41,7 +41,7 @@ import kotlin.math.sqrt
  * - **Low-res scans** (≤ 576×864, at most 6 tiles of 288×288): run full native-res 4× Real-ESRGAN ONNX in ~0.8–2.2 s
  *   with a gentle 20% anchor (preserving 80% of neural detail), followed by Anime4K Line Darken + clean levels.
  * - **Medium & HD pages** (everything larger, including 600×900, 1200×1800, and webtoon strips): run a fast
- *   multi-stage CPU Keda Anime4K Restore (2×/1.5× edge-directed upscale for medium scans, native-res for HD) in
+ *   multi-stage CPU Anime4K Restore (2×/1.5× edge-directed upscale for medium scans, native-res for HD) in
  *   ~80–200 ms: Edge-Preserving Bilateral Denoise → Anime4K DoG Deblur → Anime4K Darken HQ → Sobel Edge Thinning &
  *   clean paper/ink levels.
  */
@@ -94,7 +94,7 @@ object MangaAiUpscaler {
             return Plan.Neural(srcWidth, srcHeight, box)
         }
 
-        // Medium scans: 1.5×–2× Anime4K Edge-Directed Upscale + 4-stage Keda Restore
+        // Medium scans: 1.5×–2× Anime4K Edge-Directed Upscale + 4-stage Anime4K Restore
         if (pixels <= 950_000.0 && min(srcWidth, srcHeight) <= 840 && max(srcWidth, srcHeight) <= 1260) {
             val target = if (pixels <= 600_000.0) 2.0 else 1.5
             val cap = min(target, sqrt(4_200_000.0 / pixels))
@@ -103,7 +103,7 @@ object MangaAiUpscaler {
             return Plan.Restore(ow, oh)
         }
 
-        // High-res pages & webtoon strips: native-res 4-stage Keda Restore (never below screen size)
+        // High-res pages & webtoon strips: native-res 4-stage Anime4K Restore (never below screen size)
         val fit = when {
             viewWidth <= 0 -> 1.0
             fillWidth || viewHeight <= 0 -> viewWidth.toDouble() / srcWidth
@@ -117,7 +117,7 @@ object MangaAiUpscaler {
         return Plan.Restore(w, h)
     }
 
-    /** Hybrid AI / Keda Anime4K enhancement for a software [source] bitmap; null if skipped / failed. */
+    /** Hybrid AI / Anime4K enhancement for a software [source] bitmap; null if skipped / failed. */
     suspend fun upscale(context: Context, key: String, source: Bitmap, viewWidth: Int, viewHeight: Int, fillWidth: Boolean): Bitmap? {
         getCached(key)?.let { return it }
         val plan = plan(source.width, source.height, viewWidth, viewHeight, fillWidth) ?: return null
@@ -286,7 +286,7 @@ object MangaAiUpscaler {
                     }
                 }
             }
-            // Finish neural output with Keda Line Darken + clean paper/ink levels
+            // Finish neural output with Anime4K Line Darken + clean paper/ink levels
             currentCoroutineContext().ensureActive()
             applyDarkenAndLevels(outPixels, outWidth, outHeight, grey, darkenStrength = 0.70f)
             return Bitmap.createBitmap(outPixels, outWidth, outHeight, Bitmap.Config.ARGB_8888).apply { setHasMipMap(true) }
@@ -296,7 +296,7 @@ object MangaAiUpscaler {
     }
 
     /**
-     * 4-stage Keda Anime4K Restore in ~80–200 ms:
+     * 4-stage Anime4K Restore in ~80–200 ms:
      * 1. Edge-preserving bilateral denoise (cleans JPEG compression artifacts without touching lines)
      * 2. Anime4K DoG Deblur (5×5 separable Gaussian + 0.55 power curve + 3×3 minmax clamp)
      * 3. Anime4K Darken HQ (separable Gaussian difference + smoothed negative line map)

@@ -106,7 +106,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
     var danmaku by remember { mutableStateOf(true) }
     var quality by remember { mutableStateOf<String?>(null) }
     var fillMode by remember { mutableStateOf(PlayerPrefs.getFillMode(ctx)) }
-    /** 氛围模式 level: 0 关闭 · 1 柔和 · 2 平衡 · 3 鲜艳 · 4 极致 (Infuse-style). */
+    /** 氛围模式 level: 0 关闭 · 1 柔和 · 2 平衡 · 3 鲜艳 · 4 极致. */
     var ambientLevel by remember { mutableIntStateOf(PlayerPrefs.getAmbientLevel(ctx).coerceIn(0, 4)) }
     var enhanceLevel by remember { mutableIntStateOf(PlayerPrefs.getEnhanceLevel(ctx)) }
     var sdrToHdr by remember { mutableStateOf(PlayerPrefs.getSdrToHdr(ctx)) }
@@ -399,7 +399,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
         }
     }
 
-    // ── Bilibili-style 3-zone vertical gestures: left = 亮度, right = 音量, centre = 抖音式 follow-finger 上/下一集 ──
+    // ── 3-zone vertical gestures: left = 亮度, right = 音量, centre = follow-finger 上/下一集 ──
     val gestureScope = rememberCoroutineScope()
     val audioManager = remember { ctx.getSystemService(android.content.Context.AUDIO_SERVICE) as android.media.AudioManager }
     /** Vertical offset of the video while the centre zone is dragged (px); the adjacent-episode preview rides along. */
@@ -687,7 +687,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
         if (ambientLevel > 0) ambientRender[0] = ambientLevel
         val ambientVisible = ambientLevel > 0 && !fillMode && !inPip && !hdrAmbientLocked
         val containerH = constraints.maxHeight.toFloat()
-        // 抖音式 follow-finger: the whole picture (glow + video + edge bleed) rides the centre-zone drag; the offset is
+        // Follow-finger episode swipe: the whole picture (glow + video + edge bleed) rides the centre-zone drag; the offset is
         // read in the layer block only, so dragging redraws without recomposing the player.
         Box(Modifier.fillMaxSize().graphicsLayer { translationY = episodeDragY }) {
         AmbientGlowLayer(
@@ -923,7 +923,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
             GestureHudPill(hudKind, hudValue)
         }
 
-        // ── Chrome: SenPlayer-style floating glass HUD ─────────────────────────────────────────────────
+        // ── Chrome: floating glass HUD ─────────────────────────────────────────────────────────────────
         // Top bar (back · title / episode · tech badges · action cluster), centre transport, a lock on the left edge
         // and a floating glass console (scrubber + feature pills). Proportions scale for phone, phone landscape and
         // tablet. The compact title + 2 dp edge progress stay visible when the HUD is hidden. The centre transport
@@ -1287,7 +1287,7 @@ data class TechTags(val res: String? = null, val range: String? = null, val code
 }
 
 /**
- * SenPlayer-style technical status badges: neutral glass pills for resolution / codec / high frame rate and accent
+ * Technical status badges: neutral glass pills for resolution / codec / high frame rate and accent
  * pills for the active GPU stages (AI 超分, SDR→HDR) or a native HDR range. Tapping opens the enhancement panel.
  */
 @Composable
@@ -1581,7 +1581,7 @@ private fun GestureHudPill(kind: GestureHudKind, value: Float) {
     }
 }
 
-/** 抖音式 adjacent-episode card that slides in with the centre-zone drag: blurred cover backdrop, poster, prompt. */
+/** Adjacent-episode card that slides in with the centre-zone drag: blurred cover backdrop, poster, prompt. */
 @Composable
 private fun EpisodeSwitchPreview(cover: String, ep: app.iduanju.core.hongguo.HGEpisode, next: Boolean, armed: Boolean, modifier: Modifier) {
     Box(modifier.background(Color.Black)) {
@@ -1759,7 +1759,7 @@ private fun <T> MoreOptionRow(
     }
 }
 
-/** Per-level 氛围模式 tuning (Infuse 8.5 柔和 / 平衡 / 鲜艳 / 极致). */
+/** Per-level 氛围模式 tuning (柔和 / 平衡 / 鲜艳 / 极致). */
 private class AmbientSpec(
     val alpha: Float,
     val blur: androidx.compose.ui.unit.Dp,

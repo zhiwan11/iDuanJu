@@ -28,8 +28,8 @@ enum class MangaAtmosphere(val label: String) {
 }
 
 /**
- * 沉浸氛围 环境音效 + 翻页音效. 雨天 / 列车 / 烟火 loop Keda Reader 2.4.3's original recordings (res/raw/keda_*.mp3);
- * 雪夜 has no recording and is synthesised as soft filtered wind. The page flip is Keda's page-flip.wav via SoundPool.
+ * 沉浸氛围 环境音效 + 翻页音效. 雨天 / 列车 / 烟火 loop bundled ambient recordings (res/raw/ambient_*.mp3);
+ * 雪夜 has no recording and is synthesised as soft filtered wind. The page flip uses res/raw/page_flip.wav via SoundPool.
  * Nothing plays until [attachContext]; [release] ends the playback loop for good.
  */
 class MangaAmbientAudioPlayer {
@@ -66,7 +66,7 @@ class MangaAmbientAudioPlayer {
         if (soundPool != null) return
         soundPool = SoundPool.Builder().setMaxStreams(2).setAudioAttributes(audioAttributes()).build().also { pool ->
             pool.setOnLoadCompleteListener { _, sampleId, status -> if (status == 0) pageFlipId = sampleId }
-            pool.load(app, R.raw.keda_page_flip, 1)
+            pool.load(app, R.raw.page_flip, 1)
         }
     }
 
@@ -95,9 +95,9 @@ class MangaAmbientAudioPlayer {
     /** Loops the scene's recording, following volume changes, until the session ends. False if it cannot play. */
     private suspend fun playRecording(request: Request): Boolean {
         val resource = when (request.scene) {
-            MangaAtmosphere.RAIN -> R.raw.keda_rain
-            MangaAtmosphere.TRAIN -> R.raw.keda_train
-            MangaAtmosphere.FIREWORK -> R.raw.keda_firework
+            MangaAtmosphere.RAIN -> R.raw.ambient_rain
+            MangaAtmosphere.TRAIN -> R.raw.ambient_train
+            MangaAtmosphere.FIREWORK -> R.raw.ambient_firework
             else -> return false
         }
         val player = MediaPlayer.create(request.context, resource) ?: return false

@@ -128,7 +128,7 @@ private fun tapAction(layout: MangaTapLayout, x: Float, y: Float, w: Float, h: F
 }
 
 /**
- * 可达阅读器 2.4.3 style reader: 条漫 / 左翻页 / 右翻页(日漫) / 双页 modes, pinch + double-tap zoom, 九宫格 tap zones,
+ * Full-featured manga reader: 条漫 / 左翻页 / 右翻页(日漫) / 双页 modes, pinch + double-tap zoom, 九宫格 tap zones,
  * 音量键翻页, 自动阅读, floating HUD with page scrubber + preview, and 目录 / 画面 / 翻页 / 设置 console tabs.
  */
 @Composable
@@ -260,7 +260,7 @@ fun MangaReaderScreen(id: String, startIndex: Int, startPage: Int, onBack: () ->
         ambientAudio.attachContext(ctx)
         onDispose { ambientAudio.release() }
     }
-    /** 可达 page-flip.wav on every paged turn when 翻页音效 or the 沉浸氛围 环境音效 is on. */
+    /** Plays page_flip.wav on every paged turn when 翻页音效 or the 沉浸氛围 环境音效 is on. */
     fun pageFlipSound() {
         if (P.pageFlipSound || (P.atmosphere != MangaAtmosphere.OFF && P.atmosphereSound)) ambientAudio.playPageFlip()
     }
@@ -781,7 +781,7 @@ private fun ImagePanel() {
     }
 }
 
-/** 可达「图片背景」: a value row with a check-marked popup (跟随系统 / 白色 / 黑色 / 沉浸式 / 纹理); 纹理 adds 样式 + 透明度. */
+/** 「图片背景」: a value row with a check-marked popup (跟随系统 / 白色 / 黑色 / 沉浸式 / 纹理); 纹理 adds 样式 + 透明度. */
 @Composable
 private fun PageBackgroundRow() {
     val P = MangaReaderPrefs
@@ -841,7 +841,7 @@ private fun TurnPanel(mode: MangaReadMode, autoRead: Boolean, setMode: (MangaRea
             PanelSegments(MangaPageAnim.entries, P.pageAnim, { it.label }, setPageAnim)
         }
         PanelSwitch("翻页动画", P.turnAnim, "关闭后点击 / 音量键直接换页") { P.updateTurnAnim(it) }
-        if (mode.paged) PanelSwitch("翻页音效", P.pageFlipSound, "可达阅读器原声纸张翻页声") { P.updatePageFlipSound(it) }
+        if (mode.paged) PanelSwitch("翻页音效", P.pageFlipSound, "真实纸张翻页音效") { P.updatePageFlipSound(it) }
         PanelTitle("自动阅读")
         PanelSwitch(if (autoRead) "自动阅读中" else "开始自动阅读", autoRead, if (mode == MangaReadMode.WEBTOON) "匀速向下滚动" else "定时翻页，呼出菜单时暂停") { setAuto(it) }
         val sec = 12f - 10f * P.autoSpeed
@@ -849,7 +849,7 @@ private fun TurnPanel(mode: MangaReadMode, autoRead: Boolean, setMode: (MangaRea
     }
 }
 
-/** Keda 九宫格 diagram of what each tap region does. */
+/** 3×3 九宫格 diagram of what each tap region does. */
 @Composable
 private fun TapZonePreview(layout: MangaTapLayout, swap: Boolean) {
     Column(Modifier.fillMaxWidth().padding(vertical = 6.dp), horizontalAlignment = Alignment.CenterHorizontally) {

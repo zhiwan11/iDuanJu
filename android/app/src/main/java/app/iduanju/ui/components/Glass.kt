@@ -46,7 +46,7 @@ private val PillShape = RoundedCornerShape(percent = 50)
 private val RailShape = RoundedCornerShape(28.dp)
 
 /**
- * Shared search input state bridging the Yamby-style morphing bottom Liquid Glass search dock
+ * Shared search input state bridging the morphing bottom Liquid Glass search dock
  * and [app.iduanju.ui.search.SearchScreen].
  */
 @Stable

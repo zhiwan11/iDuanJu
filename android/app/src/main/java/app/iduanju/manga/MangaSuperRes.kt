@@ -15,7 +15,7 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntSize
 
 /**
- * 漫画超分「标准」: instant API 33+ two-pass AGSL RenderEffect chained directly from Keda Reader's Anime4K pipeline
+ * 漫画超分「标准」: instant API 33+ two-pass AGSL RenderEffect implementing an Anime4K restoration pipeline
  * (`Anime4K_Deblur_DoG` + `Anime4K_Upscale_Original` edge push, followed by `Anime4K_Darken` + paper/ink levels).
  *
  * Why the previous single-pass shader looked like a no-op:

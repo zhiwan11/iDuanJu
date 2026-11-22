@@ -8,7 +8,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import app.iduanju.IdjApp
 
-/** 可达阅读器 2.4.3 阅读模式：条漫(卷纸) / 左翻页 / 右翻页(日漫) / 双页(跨页). */
+/** 阅读模式：条漫(卷纸) / 左翻页 / 右翻页(日漫) / 双页(跨页). */
 enum class MangaReadMode(val key: String, val label: String, val short: String) {
     WEBTOON("webtoon", "条漫模式", "条漫"),
     LTR("ltr", "左翻页", "左翻"),
@@ -18,7 +18,7 @@ enum class MangaReadMode(val key: String, val label: String, val short: String) 
     companion object { fun of(k: String?) = entries.firstOrNull { it.key == k } }
 }
 
-/** 可达式九宫格点击区域布局。 */
+/** 九宫格点击区域布局。 */
 enum class MangaTapLayout(val key: String, val label: String) {
     LR("lr", "左右"),
     L_SHAPE("l", "L 形"),
@@ -26,7 +26,7 @@ enum class MangaTapLayout(val key: String, val label: String) {
     companion object { fun of(k: String?) = entries.firstOrNull { it.key == k } ?: LR }
 }
 
-/** 可达阅读器 翻页效果 for the horizontal paged modes (左翻 / 日漫 / 双页). */
+/** 翻页效果 for the horizontal paged modes (左翻 / 日漫 / 双页). */
 enum class MangaPageAnim(val label: String) {
     CURL("仿真翻页"),
     COVER("覆盖"),
@@ -35,7 +35,7 @@ enum class MangaPageAnim(val label: String) {
     companion object { fun of(k: String?) = entries.firstOrNull { it.name == k } ?: CURL }
 }
 
-/** 可达阅读器「图片背景」: what fills the margins around a fitted page (and, for 纹理, the paper the page is printed on). */
+/** 「图片背景」: what fills the margins around a fitted page (and, for 纹理, the paper the page is printed on). */
 enum class MangaPageBg(val label: String) {
     SYSTEM("跟随系统"),
     WHITE("白色"),
@@ -45,7 +45,7 @@ enum class MangaPageBg(val label: String) {
     companion object { fun of(k: String?) = entries.firstOrNull { it.name == k } ?: BLACK }
 }
 
-/** 纹理 paper styles (可达 纹理设置 · 样式). */
+/** 纹理 paper styles (纹理设置 · 样式). */
 enum class MangaPaperStyle(val label: String, val tint: Long) {
     CLASSIC("经典", 0xFFF1EADB),
     WARM("暖黄", 0xFFEBDDBF),
@@ -96,7 +96,7 @@ object MangaReaderPrefs {
     var pageAnim by mutableStateOf(MangaPageAnim.of(s("pageAnimFx")))
     /** 自动阅读速度 0..1：条漫 = 滚动速度，翻页 = 翻页间隔。 */
     var autoSpeed by mutableFloatStateOf(f("autoSpeed", 0.35f))
-    /** 翻页音效 (可达阅读器 page-flip.wav); also plays whenever 沉浸氛围 环境音效 is on. */
+    /** 翻页音效 (page_flip.wav); also plays whenever 沉浸氛围 环境音效 is on. */
     var pageFlipSound by mutableStateOf(b("flipSound", false))
 
     // 阅读设置

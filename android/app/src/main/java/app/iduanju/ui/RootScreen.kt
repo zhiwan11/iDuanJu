@@ -337,7 +337,7 @@ private val DockPillShape = RoundedCornerShape(percent = 50)
 
 /**
  * Floating bottom Liquid Glass dock with horizontal finger-slide tab scrubbing,
- * sliding glass indicator pill, haptic ticks on slot boundaries, and Yamby search morph.
+ * sliding glass indicator pill, haptic ticks on slot boundaries, and morphing search dock.
  */
 @Composable
 private fun SwipeableGlassTabBar(

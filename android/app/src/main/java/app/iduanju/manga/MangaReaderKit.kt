@@ -79,7 +79,7 @@ import kotlin.math.pow
 import kotlin.math.sin
 import kotlin.random.Random
 
-/** Pinch (1x..4x) / pan / double-tap zoom shared by the 条漫 list and the paged modes (可达阅读器 双击 2.2x / 1x). */
+/** Pinch (1x..4x) / pan / double-tap zoom shared by the 条漫 list and the paged modes (双击 2.2x / 1x). */
 @Stable
 class ReaderZoomState {
     var scale by mutableFloatStateOf(1f)
@@ -160,7 +160,7 @@ fun readerColorFilter(invert: Boolean, gray: Boolean, inkLevels: Boolean = false
 
 /** 自动裁白边：trims uniform white (or black) margins. In 条漫 mode only the sides are trimmed so panel gutters survive. */
 class AutoCropTransformation(private val sidesOnly: Boolean) : Transformation {
-    override val cacheKey = "keda.autocrop.v1.$sidesOnly"
+    override val cacheKey = "manga.autocrop.v1.$sidesOnly"
     override suspend fun transform(input: Bitmap, size: Size): Bitmap {
         val w = input.width; val h = input.height
         if (w < 48 || h < 48) return input
@@ -186,7 +186,7 @@ class AutoCropTransformation(private val sidesOnly: Boolean) : Transformation {
 
 /** 宽页切分：returns the left or right half of a landscape spread. */
 class HalfCropTransformation(private val right: Boolean) : Transformation {
-    override val cacheKey = "keda.half.$right"
+    override val cacheKey = "manga.half.$right"
     override suspend fun transform(input: Bitmap, size: Size): Bitmap {
         if (input.width <= input.height) return input
         val half = input.width / 2
@@ -374,7 +374,7 @@ fun rememberBookPagerState(initialPage: Int, pageCount: () -> Int): BookPagerSta
 private enum class BookRole { HIDDEN, UNDER, TOP }
 
 /**
- * 可达阅读器-style paged viewer with physical page turns for 左翻 / 日漫 / 双页.
+ * Book-style paged viewer with physical page turns for 左翻 / 日漫 / 双页.
  *
  * Pages current−1..current+1 stay composed under stable keys (so the revealed page never reloads when a turn
  * commits). During a turn the revealed page sits crisp underneath, and the turning page is
@@ -505,7 +505,7 @@ private fun ContentDrawScope.drawCurlPage(ux: Float, uy: Float, corner: Int, mir
     val fx = w; val fy = h
     var ax = ux * w
     // never exactly level with the hinge corner (the fold would be vertical at infinity): a middle grab rolls the
-    // page with a gentle tilt, like Keda's centre drag
+    // page with a gentle tilt on centre-edge drag
     var ay = if (corner == 0) h * 0.985f else (uy * h).coerceAtMost(h * 0.992f)
     if (w < 2f || h < 2f || fx - ax < 1f || ux <= -0.999f) {
         if (ux > -0.999f) drawContent() // flat (or fully turned away: draw nothing)
@@ -663,7 +663,7 @@ private fun DrawScope.drawCoverShadow(t: Float, mirror: Boolean) {
 // ── 沉浸氛围：雨天窗景 / 列车车窗 / 新年烟火 / 雪夜 ──
 
 /**
- * Keda-style immersive reading atmosphere drawn over the pages (below the HUD). Draw-only: no pointer handlers, so
+ * Immersive reading atmosphere drawn over the pages (below the HUD). Draw-only: no pointer handlers, so
  * every touch reaches the reader. A 60 fps [withFrameNanos] clock is read inside the draw scope only, so the
  * animation redraws one canvas without recomposing anything. Particles are fixed seeded tables (no per-frame
  * allocation of particle state).
