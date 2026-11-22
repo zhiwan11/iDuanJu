@@ -10,6 +10,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -114,14 +115,16 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
     val activity = ctx as? android.app.Activity
     val metrics = app.iduanju.ui.components.LocalLayoutMetrics.current
     val landscape = metrics.isLandscape
+    var forcedLandscape by remember { mutableStateOf(false) }
     fun setLandscape(on: Boolean) {
+        forcedLandscape = on
         activity?.requestedOrientation = when {
             on -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
             metrics.isTablet -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
             else -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         }
     }
-    androidx.activity.compose.BackHandler(enabled = landscape) { setLandscape(false) }
+    androidx.activity.compose.BackHandler(enabled = landscape && forcedLandscape) { setLandscape(false) }
     LaunchedEffect(landscape) {
         val w = activity?.window ?: return@LaunchedEffect
         val ic = androidx.core.view.WindowCompat.getInsetsController(w, w.decorView)
@@ -148,17 +151,26 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
     fun syncEnhance() {
         enhanceEffect.level = if (enhanceFailed) 0 else enhanceLevel
         enhanceEffect.sdrToHdr = !enhanceFailed && sdrToHdr && !isNativeHdr
+        syncWindowAndFallback(activity, textureView, enhanceEffect, isNativeHdr)
     }
     LaunchedEffect(player, enhanceFailed) {
         installVideoEnhance(player, if (enhanceFailed) null else enhanceEffect)
     }
-    LaunchedEffect(enhanceLevel, sdrToHdr, isNativeHdr, enhanceFailed) { syncEnhance() }
+    LaunchedEffect(enhanceLevel, sdrToHdr, isNativeHdr, enhanceFailed, textureView) { syncEnhance() }
     // Wide colour gamut for SDR→HDR / native HDR. Not COLOR_MODE_HDR: on a TextureView that would
     // dim the Compose overlays and break the getBitmap() ambient readback.
+    // SDR→HDR additionally lifts the window backlight (+0.22 over the user's system brightness, clamped to
+    // 0.45..1.0) so the shader's inverse tone mapping reads as a real luminance gain; reset when turned off / left.
     LaunchedEffect(sdrToHdr, isNativeHdr, enhanceFailed) {
-        activity?.window?.colorMode =
+        val w = activity?.window ?: return@LaunchedEffect
+        w.colorMode =
             if ((sdrToHdr && !enhanceFailed) || isNativeHdr) android.content.pm.ActivityInfo.COLOR_MODE_WIDE_COLOR_GAMUT
             else android.content.pm.ActivityInfo.COLOR_MODE_DEFAULT
+        val boost = sdrToHdr && !enhanceFailed && !isNativeHdr
+        val lp = w.attributes
+        lp.screenBrightness = if (boost) (systemBrightness(ctx) + 0.22f).coerceIn(0.45f, 1.0f)
+            else android.view.WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+        w.attributes = lp
     }
 
     DisposableEffect(player) {
@@ -374,8 +386,14 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
     LaunchedEffect(seekHint) { if (seekHint != null) { delay(700); seekHint = null } }
     DisposableEffect(Unit) {
         onDispose {
+            clearWindowAndFallback(enhanceEffect)
             activity?.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
             activity?.window?.colorMode = android.content.pm.ActivityInfo.COLOR_MODE_DEFAULT
+            activity?.window?.let { w ->
+                val lp = w.attributes
+                lp.screenBrightness = android.view.WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+                w.attributes = lp
+            }
             if (landscape) {
                 activity?.window?.let { w -> androidx.core.view.WindowCompat.getInsetsController(w, w.decorView).show(androidx.core.view.WindowInsetsCompat.Type.systemBars()) }
             }
@@ -437,6 +455,33 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
             .setAspectRatio(safeRational)
             .setActions(actions)
             .build()
+    }
+
+    /** Last non-zero AI 超分 level, restored when the console pill toggles it back on. */
+    var lastEnhance by remember { mutableIntStateOf(enhanceLevel.takeIf { it > 0 } ?: 1) }
+    fun applyEnhance(lvl: Int) {
+        if (lvl > 0 && enhanceFailed) { seekHint = "当前设备不支持 GPU 画质增强"; return }
+        enhanceLevel = lvl
+        if (lvl > 0) lastEnhance = lvl
+        PlayerPrefs.setEnhanceLevel(ctx, lvl)
+        syncEnhance()
+        seekHint = when (lvl) {
+            1 -> "AI 超分辨率：标准"
+            2 -> "AI 超分辨率：强效"
+            else -> "AI 超分辨率：已关闭"
+        }
+    }
+    fun applySdrToHdr(on: Boolean) {
+        when {
+            isNativeHdr -> seekHint = "当前片源已是原生 ${tags.range}"
+            on && enhanceFailed -> seekHint = "当前设备不支持 GPU 画质增强"
+            else -> {
+                sdrToHdr = on
+                PlayerPrefs.setSdrToHdr(ctx, on)
+                syncEnhance()
+                seekHint = if (on) "SDR 转 HDR：已开启" else "SDR 转 HDR：已关闭"
+            }
+        }
     }
 
     fun enterPip() {
@@ -535,7 +580,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
         val epNow = detail?.episodes?.getOrNull(epIndex)
         if (!inPip && danmaku && epNow != null && seriesId.all { it.isDigit() }) {
             val topInset = with(androidx.compose.ui.platform.LocalDensity.current) { androidx.compose.foundation.layout.WindowInsets.statusBars.getTop(this).toDp() }
-            DanmakuOverlay(player, seriesId, epNow.vid, laneTop = topInset + 44.dp + 34.dp, bottomLimit = 220.dp) { android.util.Log.i("IDJ", "danmaku: $it") }
+            DanmakuOverlay(player, seriesId, epNow.vid, laneTop = topInset + (if (metrics.isTablet) 64.dp else 44.dp) + 34.dp, bottomLimit = 220.dp) { android.util.Log.i("IDJ", "danmaku: $it") }
         }
         // gesture layer: tap = chrome, double-tap sides = ±10s, long-press = 2x, vertical swipe = prev/next episode,
         // horizontal drag = scrub.
@@ -609,145 +654,218 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                 modifier = Modifier.align(Alignment.Center).offset(y = (-90).dp).clip(RoundedCornerShape(12.dp)).background(Color.Black.copy(0.55f)).padding(horizontal = 16.dp, vertical = 8.dp))
         }
 
-        // ── Chrome (redesign 14–17) ─────────────────────────────────────────────────────────────────────
-        // Compact title + 2dp edge progress stay visible; full controls are independent overlays. The centre transport
+        // ── Chrome: SenPlayer-style floating glass HUD ─────────────────────────────────────────────────
+        // Top bar (back · title / episode · tech badges · action cluster), centre transport, a lock on the left edge
+        // and a floating glass console (scrubber + feature pills). Proportions scale for phone, phone landscape and
+        // tablet. The compact title + 2 dp edge progress stay visible when the HUD is hidden. The centre transport
         // only appears once the current episode is actually playable, so switching episodes never flashes it.
         val pc = IdjDarkColors
         val chromeA by androidx.compose.animation.core.animateFloatAsState(if (!inPip && (showChrome || panel != null)) 1f else 0f, DS.panel(), label = "chrome")
         val ready = status.isEmpty() && error == null && dur > 0
-        Box(Modifier.fillMaxWidth().height(if(landscape)72.dp else 110.dp).graphicsLayer { alpha = chromeA }
-            .background(Brush.verticalGradient(listOf(Color.Black.copy(0.45f), Color.Black.copy(0.16f), Color.Transparent))))
-        Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(if(landscape)100.dp else 150.dp).graphicsLayer { alpha = chromeA }
-            .background(Brush.verticalGradient(0f to Color.Transparent, 0.42f to Color.Black.copy(0.16f), 1f to Color.Black.copy(0.45f))))
-        Column(Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = if(landscape)64.dp else 16.dp).padding(top = if(landscape)14.dp else 6.dp).graphicsLayer { alpha = chromeA }) {
-            Row(Modifier.height(44.dp), verticalAlignment = Alignment.CenterVertically) {
-                CircleBtn(Icons.AutoMirrored.Filled.ArrowBackIos, "返回", showChrome && !locked, onBack)
-                if(landscape) {
-                    Spacer(Modifier.width(14.dp))
+        val tablet = metrics.isTablet
+        /** Landscape phones and every tablet get the floating console layout; portrait phones keep the short-drama layout. */
+        val wideHud = landscape || tablet
+        val btnSize = if (tablet) 48.dp else 42.dp
+        val btnIcon = if (tablet) 22.dp else 20.dp
+        val hudPad = when {
+            tablet && landscape -> 32.dp
+            landscape -> 52.dp
+            tablet -> 24.dp
+            else -> 14.dp
+        }
+        val dmOK = seriesId.all { it.isDigit() }
+        val nativeRange = if (isNativeHdr) tags.range else null
+        val enhanceOn = enhanceLevel > 0 && !enhanceFailed
+        val hdrOn = sdrToHdr && !enhanceFailed && !isNativeHdr
+        val padSplitCapable = !inPip && tablet && landscape && metrics.widthDp >= 840 && isPortraitMedia && detail != null
+        val chromeOn = showChrome && !locked
+        fun togglePanel(p: String) { panel = if (panel == p) null else p }
+        val curDetail = detail
+        val episodeLabel = when {
+            curDetail == null -> ""
+            queue != null -> "第 ${epIndex + 1} 章 · ${curDetail.episodes.getOrNull(epIndex)?.title.orEmpty()}"
+            else -> "第 ${curDetail.episodes.getOrNull(epIndex)?.ep ?: startEp} 集 / 共 ${maxOf(curDetail.totalEps, curDetail.episodes.size)} 集"
+        }
+        Box(Modifier.fillMaxWidth().height(if (wideHud) 120.dp else 110.dp).graphicsLayer { alpha = if (locked) 0f else chromeA }
+            .background(Brush.verticalGradient(listOf(Color.Black.copy(0.55f), Color.Black.copy(0.18f), Color.Transparent))))
+        Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(if (wideHud) 170.dp else 200.dp).graphicsLayer { alpha = if (locked) 0f else chromeA }
+            .background(Brush.verticalGradient(0f to Color.Transparent, 0.45f to Color.Black.copy(0.18f), 1f to Color.Black.copy(0.58f))))
+
+        // Top bar
+        if (!inPip && !locked) Column(Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = hudPad)
+            .padding(top = if (landscape) 12.dp else 6.dp).graphicsLayer { alpha = chromeA }) {
+            Row(Modifier.fillMaxWidth().heightIn(min = btnSize), verticalAlignment = Alignment.CenterVertically) {
+                CircleBtn(Icons.AutoMirrored.Filled.ArrowBackIos, "返回", chromeOn, btnSize, btnIcon, onClick = onBack)
+                if (wideHud) {
+                    Spacer(Modifier.width(12.dp))
                     Column(Modifier.weight(1f)) {
-                        Text(detail?.title.orEmpty(),color=Color.White,fontSize=16.sp,fontWeight=FontWeight.Bold,maxLines=1,overflow=androidx.compose.ui.text.style.TextOverflow.Ellipsis)
-                        Text(if (queue != null) "第 ${epIndex + 1} 章 · ${detail?.episodes?.getOrNull(epIndex)?.title.orEmpty()}" else "第 ${detail?.episodes?.getOrNull(epIndex)?.ep ?: 1} 集 / 共 ${detail?.episodes?.size ?: 0} 集",maxLines=1,overflow=androidx.compose.ui.text.style.TextOverflow.Ellipsis,color=Color.White.copy(0.7f),fontSize=12.sp)
+                        Text(curDetail?.title.orEmpty(), color = Color.White, fontSize = if (tablet) 17.sp else 16.sp, fontWeight = FontWeight.Bold,
+                            maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                            style = androidx.compose.ui.text.TextStyle(shadow = androidx.compose.ui.graphics.Shadow(Color.Black.copy(0.6f), blurRadius = 6f)))
+                        Row(Modifier.padding(top = 3.dp), verticalAlignment = Alignment.CenterVertically) {
+                            if (episodeLabel.isNotEmpty()) {
+                                Text(episodeLabel, color = Color.White.copy(0.72f), fontSize = 12.sp, maxLines = 1,
+                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                                Spacer(Modifier.width(8.dp))
+                            }
+                            StatusBadges(tags, enhanceOn, hdrOn, nativeRange, chromeOn) { togglePanel("more") }
+                        }
                     }
-                    TechLine(tags, Modifier.padding(end = 14.dp), enhanceLevel, sdrToHdr)
-                    if (queue == null) LandChip(Icons.Filled.Repeat,"连播",if(autoNext)"开" else "关",autoNext,showChrome&&!locked){autoNext=!autoNext}
-                    Spacer(Modifier.width(10.dp))
-                    CircleBtn(if(locked)Icons.Filled.Lock else Icons.Filled.LockOpen,if(locked)"解锁" else "锁屏",showChrome){locked=!locked}
-                    Spacer(Modifier.width(10.dp))
-                    CircleBtn(Icons.Filled.MoreHoriz, "更多", showChrome && !locked) { panel = if (panel == "more") null else "more" }
-                    Spacer(Modifier.width(10.dp))
-                    CircleBtn(Icons.Filled.FullscreenExit,"退出横屏",showChrome&&!locked){setLandscape(false)}
-                } else {
-                    Spacer(Modifier.weight(1f))
-                    CircleBtn(Icons.Filled.PictureInPictureAlt, "画中画", showChrome) { enterPip() }
-                    Spacer(Modifier.width(10.dp))
-                    val fav = lib.isFavorite(seriesId)
-                    if (queue == null) CircleBtn(if (fav) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder, "收藏", showChrome) {
-                        detail?.let { lib.toggleFavorite(seriesId, it.title, it.cover) }
+                    Spacer(Modifier.width(12.dp))
+                } else Spacer(Modifier.weight(1f))
+                Row(horizontalArrangement = Arrangement.spacedBy(if (tablet) 10.dp else 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    if (wideHud) EnhancePill(enhanceOn, hdrOn, nativeRange, btnSize, chromeOn) { togglePanel("more") }
+                    CircleBtn(Icons.Filled.PictureInPictureAlt, "画中画", chromeOn, btnSize, btnIcon) { enterPip() }
+                    if (queue == null) {
+                        val fav = lib.isFavorite(seriesId)
+                        CircleBtn(if (fav) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder, "收藏", chromeOn, btnSize, btnIcon,
+                            tint = if (fav) pc.accent else Color.White) {
+                            curDetail?.let { lib.toggleFavorite(seriesId, it.title, it.cover) }
+                        }
                     }
-                    Spacer(Modifier.width(10.dp))
-                    CircleBtn(Icons.Filled.MoreHoriz, "更多", showChrome) { panel = if (panel == "more") null else "more" }
+                    if (padSplitCapable) CircleBtn(Icons.Filled.GridView, if (padDrawerOpen) "收起选集" else "展开选集", chromeOn, btnSize, btnIcon,
+                        tint = if (padDrawerOpen) pc.accent else Color.White) { padDrawerOpen = !padDrawerOpen }
+                    CircleBtn(Icons.Filled.MoreHoriz, "更多", chromeOn, btnSize, btnIcon) { togglePanel("more") }
                 }
             }
-            if (!landscape) TechLine(tags, Modifier.fillMaxWidth().padding(top = 6.dp), enhanceLevel, sdrToHdr)
+            if (!wideHud) Box(Modifier.fillMaxWidth().padding(top = 8.dp), contentAlignment = Alignment.Center) {
+                StatusBadges(tags, enhanceOn, hdrOn, nativeRange, chromeOn) { togglePanel("more") }
+            }
         }
+
+        // Lock on the left edge (landscape / tablet); while locked it is the only control (kept even if the device
+        // rotated to phone portrait while locked, so it can always be undone).
+        if (!inPip && (wideHud || locked) && panel == null) Box(Modifier.align(Alignment.CenterStart).padding(start = hudPad).graphicsLayer { alpha = chromeA }) {
+            CircleBtn(if (locked) Icons.Filled.Lock else Icons.Filled.LockOpen, if (locked) "解锁" else "锁屏", showChrome, btnSize, btnIcon,
+                tint = if (locked) pc.accent else Color.White) {
+                locked = !locked
+                showChrome = true
+                seekHint = if (locked) "已锁定屏幕" else "已解锁"
+            }
+        }
+
+        // Centre transport: −10 s · play / pause · +10 s
+        val mainSize = when { tablet -> 76.dp; landscape -> 64.dp; else -> 68.dp }
+        val sideSize = if (tablet) 48.dp else 44.dp
         androidx.compose.animation.AnimatedVisibility(!inPip && showChrome && ready && !centerSuppressed && !locked && panel == null, Modifier.align(Alignment.Center),
             enter = fadeIn(DS.panel()) + androidx.compose.animation.scaleIn(DS.panel(), initialScale = 0.92f),
             exit = fadeOut(DS.panel()) + androidx.compose.animation.scaleOut(DS.panel(), targetScale = 0.92f)) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(if(landscape)72.dp else 44.dp)) {
-                Icon(Icons.Filled.Replay10, "后退10秒", tint = Color.White, modifier = Modifier.size(36.dp).pressClick(0.9f) { player.seekTo((player.currentPosition - 10_000).coerceAtLeast(0)) })
-                Box(Modifier.size(68.dp).glassSurface(CircleShape, dark = true, shadowRadius = 10.dp, fallbackAlpha = 0.46f)
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(if (tablet) 84.dp else 52.dp)) {
+                CircleBtn(Icons.Filled.Replay10, "后退10秒", true, sideSize, sideSize * 0.52f) { player.seekTo((player.currentPosition - 10_000).coerceAtLeast(0)); seekHint = "-10s" }
+                Box(Modifier.size(mainSize).glassSurface(CircleShape, dark = true, shadowRadius = 12.dp, fallbackAlpha = 0.46f)
                     .pressClick(0.92f, label = if (playing) "暂停" else "播放") { if (player.isPlaying) player.pause() else player.play() },
                     contentAlignment = Alignment.Center) {
                     androidx.compose.animation.Crossfade(playing, label = "pp") { p ->
-                        Icon(if (p) Icons.Filled.Pause else Icons.Filled.PlayArrow, null, tint = Color.White, modifier = Modifier.size(32.dp))
+                        Icon(if (p) Icons.Filled.Pause else Icons.Filled.PlayArrow, null, tint = Color.White, modifier = Modifier.size(mainSize * 0.46f))
                     }
                 }
-                Icon(Icons.Filled.Forward10, "前进10秒", tint = Color.White, modifier = Modifier.size(36.dp).pressClick(0.9f) { player.seekTo(player.currentPosition + 10_000) })
+                CircleBtn(Icons.Filled.Forward10, "前进10秒", true, sideSize, sideSize * 0.52f) { player.seekTo(player.currentPosition + 10_000); seekHint = "+10s" }
             }
         }
-        // Expanded bottom controls overlay the video; never reserve space in its viewport.
-        if (showChrome || panel != null) Column(Modifier.align(Alignment.BottomStart).fillMaxWidth().navigationBarsPadding().graphicsLayer { alpha = chromeA }
-            .padding(horizontal = if (landscape) 64.dp else 20.dp).padding(bottom = if (landscape) 24.dp else 4.dp)) {
-            val d = detail
-            if (d != null && !landscape) {
-                Row(Modifier.graphicsLayer { alpha = chromeA }.heightIn(min = 28.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text(d.source, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
+
+        // Bottom console: overlays the video, never reserves space in its viewport.
+        if (!inPip && !locked && (showChrome || panel != null)) Column(Modifier.align(Alignment.BottomCenter).navigationBarsPadding()
+            .padding(horizontal = hudPad).padding(bottom = if (wideHud) 16.dp else 6.dp)
+            .then(if (wideHud) Modifier.widthIn(max = 860.dp) else Modifier).fillMaxWidth()
+            .graphicsLayer { alpha = chromeA }) {
+            if (curDetail != null && !wideHud) {
+                Row(Modifier.heightIn(min = 28.dp).padding(horizontal = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(curDetail.source, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
                         modifier = Modifier.clip(RoundedCornerShape(6.dp)).background(Color.White.copy(0.16f)).padding(horizontal = 7.dp, vertical = 2.dp))
                     Spacer(Modifier.width(8.dp))
-                    val seasonTag = remember(d.relatedSeries) {
-                        val ss = d.relatedSeries
+                    val seasonTag = remember(curDetail.relatedSeries) {
+                        val ss = curDetail.relatedSeries
                         val nums = ss.map { app.iduanju.core.hongguo.SeasonParser.seasonNo(it.title) }
                         if (ss.size > 1 && nums.toSet().size == ss.size)
-                            "第 " + app.iduanju.core.hongguo.SeasonParser.seasonNo(ss.firstOrNull { it.seriesId == d.seriesId }?.title ?: d.title) + " 季" else null
+                            "第 " + app.iduanju.core.hongguo.SeasonParser.seasonNo(ss.firstOrNull { it.seriesId == curDetail.seriesId }?.title ?: curDetail.title) + " 季" else null
                     }
                     seasonTag?.let { Text("$it · ", color = Color.White.copy(0.72f), fontSize = 13.sp) }
-                    Text(if (queue != null) "第 ${epIndex + 1} 章" else "第 ${d.episodes.getOrNull(epIndex)?.ep ?: startEp} 集", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                    Text(if (queue != null) " · ${d.episodes.getOrNull(epIndex)?.title.orEmpty()}" else " / 共 ${maxOf(d.totalEps, d.episodes.size)} 集", maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, color = Color.White.copy(0.72f), fontSize = 13.sp)
+                    Text(episodeLabel, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                 }
-                Spacer(Modifier.height(8.dp))
-                Text(d.title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 21.sp, lineHeight = 27.sp, maxLines = 1,
-                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                Spacer(Modifier.height(6.dp))
+                Text(curDetail.title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 21.sp, lineHeight = 27.sp, maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, modifier = Modifier.padding(horizontal = 6.dp),
                     style = androidx.compose.ui.text.TextStyle(shadow = androidx.compose.ui.graphics.Shadow(Color.Black.copy(0.7f), blurRadius = 6f)))
+                Spacer(Modifier.height(8.dp))
             }
-            Spacer(Modifier.height(10.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                val tStyle = androidx.compose.ui.text.TextStyle(color = Color.White.copy(0.8f), fontSize = 12.sp, fontWeight = FontWeight.Medium,
-                    fontFeatureSettings = "tnum", shadow = androidx.compose.ui.graphics.Shadow(Color.Black.copy(0.6f), blurRadius = 4f))
-                Text(fmt(pos), style = tStyle)
-                Spacer(Modifier.width(10.dp))
-                Box(Modifier.weight(1f)) { ProgressBar(pos, dur, buffered) { if(!locked){player.seekTo(it); showChrome = true} } }
-                Spacer(Modifier.width(10.dp))
-                Text(if (dur > 0) "−" + fmt(dur - pos) else "−0:00", style = tStyle)
-                if (!landscape) {
+            Column(Modifier.fillMaxWidth()
+                .then(if (wideHud) Modifier.glassSurface(RoundedCornerShape(26.dp), dark = true, base = Color(0xFF15171C), shadowRadius = 16.dp, fallbackAlpha = 0.44f)
+                    .padding(horizontal = 16.dp, vertical = 10.dp) else Modifier.padding(horizontal = 6.dp))
+                // swallow taps on the console background so they never toggle the HUD underneath
+                .pointerInput(Unit) { detectTapGestures { } }) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    val tStyle = androidx.compose.ui.text.TextStyle(color = Color.White.copy(0.86f), fontSize = if (tablet) 13.sp else 12.sp, fontWeight = FontWeight.Medium,
+                        fontFeatureSettings = "tnum", shadow = androidx.compose.ui.graphics.Shadow(Color.Black.copy(0.6f), blurRadius = 4f))
+                    Text(fmt(pos), style = tStyle)
                     Spacer(Modifier.width(10.dp))
-                    Icon(Icons.Filled.Fullscreen, "横屏全屏", tint = Color.White,
-                        modifier = Modifier.size(24.dp).pressClick(0.9f) { setLandscape(true) })
+                    Box(Modifier.weight(1f)) { ProgressBar(pos, dur, buffered, thick = tablet) { if (!locked) { player.seekTo(it); showChrome = true } } }
+                    Spacer(Modifier.width(10.dp))
+                    Text(if (dur > 0) "−" + fmt(dur - pos) else "−0:00", style = tStyle)
+                    Spacer(Modifier.width(if (tablet) 12.dp else 8.dp))
+                    HudIcon(Icons.Filled.AspectRatio, if (fillMode) "铺满" else "适应", fillMode) {
+                        val fill = !fillMode
+                        fillMode = fill
+                        PlayerPrefs.setFillMode(ctx, fill)
+                        seekHint = if (fill) "画面：铺满裁剪" else "画面：完整适应"
+                    }
+                    // A tablet held in landscape has nothing to exit; only offer the toggle where it can act.
+                    if (!(tablet && landscape && !forcedLandscape)) {
+                        Spacer(Modifier.width(4.dp))
+                        HudIcon(if (landscape) Icons.Filled.FullscreenExit else Icons.Filled.Fullscreen, null, false) { setLandscape(!landscape) }
+                    }
+                }
+                Row(Modifier.fillMaxWidth().padding(top = if (wideHud) 6.dp else 8.dp).horizontalScroll(rememberScrollState()),
+                    verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    val ph = if (tablet) 36.dp else 32.dp
+                    if (pos < 15000 && dur > 45000) HudPill(Icons.Filled.SkipNext, "跳过片头", null, false, ph) { player.seekTo(15000) }
+                    HudPill(Icons.Filled.GridView, "选集", null, panel == "episodes", ph) { togglePanel("episodes") }
+                    HudPill(Icons.Filled.Speed, "倍速", if (speed == 1f) "1.0×" else "${speed}×", panel == "speed" || speed != 1f, ph) { togglePanel("speed") }
+                    HudPill(Icons.Filled.AutoAwesome, "AI超分", if (enhanceOn) (if (enhanceLevel >= 2) "强效" else "标准") else "关", enhanceOn, ph) {
+                        applyEnhance(if (enhanceOn) 0 else lastEnhance)
+                    }
+                    HudPill(Icons.Filled.HdrOn, if (nativeRange != null) "HDR" else "SDR→HDR",
+                        nativeRange ?: if (hdrOn) "开" else "关", hdrOn || nativeRange != null, ph) { applySdrToHdr(!sdrToHdr) }
+                    HudPill(Icons.Filled.HighQuality, "画质", quality ?: tags.res, panel == "quality", ph) { togglePanel("quality") }
+                    if (dmOK) HudPill(Icons.Filled.Subtitles, "弹幕", if (danmaku) "开" else "关", danmaku, ph) { danmaku = !danmaku }
+                    HudPill(Icons.Filled.ClosedCaption, "音轨字幕", null, panel == "audio", ph) { togglePanel("audio") }
                 }
             }
-            if(landscape) Row(Modifier.fillMaxWidth().padding(top=6.dp).graphicsLayer{alpha=if(locked)0f else chromeA},verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(8.dp)) {
-                if(pos<15000&&dur>45000) LandChip(Icons.Filled.PlayArrow,"跳过片头",null,false,showChrome&&!locked){player.seekTo(15000)}
-                Spacer(Modifier.weight(1f))
-                LandChip(Icons.Filled.GridView,"选集",null,panel=="episodes",showChrome&&!locked){panel=if(panel=="episodes")null else "episodes"}
-                LandChip(Icons.Filled.Speed,"倍速",if(speed==1f)"1.0×" else "${speed}×",panel=="speed",showChrome&&!locked){panel=if(panel=="speed")null else "speed"}
-                LandChip(Icons.Filled.HighQuality,"画质",quality?:tags.res,panel=="quality",showChrome&&!locked){panel=if(panel=="quality")null else "quality"}
-                LandChip(Icons.Filled.Subtitles,"弹幕",if(seriesId.all{it.isDigit()}) (if(danmaku)"开" else "关") else null,danmaku&&seriesId.all{it.isDigit()},showChrome&&!locked&&seriesId.all{it.isDigit()}){danmaku=!danmaku}
-                LandChip(Icons.Filled.ClosedCaption,"音轨字幕",null,panel=="audio",showChrome&&!locked){panel=if(panel=="audio")null else "audio"}
-            } else Row(Modifier.fillMaxWidth().padding(top = 10.dp).graphicsLayer { alpha = chromeA }.padding(horizontal = if (landscape) 120.dp else 0.dp)) {
-                val dmOK = seriesId.all { it.isDigit() }
-                val on = showChrome
-                ActionBtn(Icons.Filled.GridView, "选集", null, panel == "episodes", false, on) { panel = if (panel == "episodes") null else "episodes" }
-                ActionBtn(Icons.Filled.Speed, "倍速", if (speed == 1f) "1.0×" else "${speed}×".replace(".0×", "×"), panel == "speed", speed != 1f, on) { panel = if (panel == "speed") null else "speed" }
-                ActionBtn(Icons.Filled.HighQuality, "画质", quality ?: tags.res, panel == "quality", false, on) { panel = if (panel == "quality") null else "quality" }
-                ActionBtn(Icons.Filled.Subtitles, "弹幕", if (dmOK) (if (danmaku) "开" else "关") else null, false, dmOK && danmaku, on) { if (dmOK) danmaku = !danmaku }
-                ActionBtn(Icons.Filled.ClosedCaption, "音轨字幕", null, panel == "audio", false, on) { panel = if (panel == "audio") null else "audio" }
-            }
-
         }
         // Always-on title + edge progress are overlays, not a layout inset or a scrubber row.
         if (!inPip && !showChrome && panel == null) {
-            Text(detail?.title.orEmpty(), color = Color.White.copy(0.85f), fontSize = 12.sp,
+            Text(curDetail?.title.orEmpty(), color = Color.White.copy(0.85f), fontSize = 12.sp,
                 fontWeight = FontWeight.Medium, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                 style = androidx.compose.ui.text.TextStyle(shadow = androidx.compose.ui.graphics.Shadow(Color.Black.copy(0.7f), blurRadius = 4f)),
-                modifier = Modifier.align(Alignment.TopStart).statusBarsPadding().padding(horizontal = if (landscape) 28.dp else 16.dp, vertical = 10.dp))
+                modifier = Modifier.align(Alignment.TopStart).statusBarsPadding().padding(horizontal = if (wideHud) hudPad else 16.dp, vertical = 10.dp))
             Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(2.dp).background(Color.White.copy(0.18f))) {
                 Box(Modifier.fillMaxWidth(if (dur > 0) (pos.toFloat() / dur).coerceIn(0f, 1f) else 0f).fillMaxHeight().background(Color.White.copy(0.6f)))
             }
         }
-        // panels: one style for 选集 / 倍速 / 画质 / 音轨字幕 / 更多, sitting just above the action row
-        if (!inPip && panel != null) Box(Modifier.fillMaxSize().pointerInput(Unit) { detectTapGestures { panel = null } })
-        androidx.compose.animation.AnimatedVisibility(!inPip && panel != null, Modifier.align(Alignment.BottomCenter).navigationBarsPadding()
-            .padding(horizontal = 12.dp).padding(bottom = if (landscape) 16.dp else 78.dp),
-            enter = fadeIn(DS.panel()) + androidx.compose.animation.slideInVertically(DS.panel()) { it / 6 },
-            exit = fadeOut(DS.panel()) + androidx.compose.animation.slideOutVertically(DS.panel()) { it / 6 }) {
+        // Settings sheet: one style for 选集 / 倍速 / 画质 / 音轨字幕 / 更多. Tablets get a centred floating glass modal
+        // over a light scrim; phones keep the sheet just above the console.
+        val centeredSheet = tablet
+        if (!inPip && panel != null) Box(Modifier.fillMaxSize().then(if (centeredSheet) Modifier.background(Color.Black.copy(0.30f)) else Modifier)
+            .pointerInput(Unit) { detectTapGestures { panel = null } })
+        androidx.compose.animation.AnimatedVisibility(!inPip && panel != null,
+            if (centeredSheet) Modifier.align(Alignment.Center).navigationBarsPadding().padding(24.dp)
+            else Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(horizontal = 12.dp).padding(bottom = if (landscape) 16.dp else 78.dp),
+            enter = if (centeredSheet) fadeIn(DS.panel()) + androidx.compose.animation.scaleIn(DS.panel(), initialScale = 0.94f)
+                else fadeIn(DS.panel()) + androidx.compose.animation.slideInVertically(DS.panel()) { it / 6 },
+            exit = if (centeredSheet) fadeOut(DS.panel()) + androidx.compose.animation.scaleOut(DS.panel(), targetScale = 0.94f)
+                else fadeOut(DS.panel()) + androidx.compose.animation.slideOutVertically(DS.panel()) { it / 6 }) {
             val last = remember { arrayOfNulls<String>(1) }
             if (panel != null) last[0] = panel
             val shown = last[0]
-            Column(Modifier.fillMaxWidth().widthIn(max = 520.dp)
-                .glassSurface(RoundedCornerShape(24.dp), dark = true, base = Color(0xFF1C1E24), shadowRadius = 20.dp, fallbackAlpha = 0.92f)
+            val sheetShape = RoundedCornerShape(if (centeredSheet) 28.dp else 24.dp)
+            Column(Modifier.widthIn(max = if (centeredSheet) 540.dp else 520.dp).fillMaxWidth()
+                .heightIn(max = (metrics.heightDp * if (centeredSheet) 0.80f else 0.74f).dp)
+                .glassSurface(sheetShape, dark = true, base = Color(0xFF1C1E24), shadowRadius = 20.dp, fallbackAlpha = 0.92f)
                 .pointerInput(Unit) { detectTapGestures { } }
-                .padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 14.dp)) {
+                .verticalScroll(rememberScrollState())
+                .padding(start = if (centeredSheet) 20.dp else 16.dp, end = if (centeredSheet) 20.dp else 16.dp,
+                    top = if (centeredSheet) 20.dp else 16.dp, bottom = if (centeredSheet) 18.dp else 14.dp)) {
                 when (shown) {
-                    "episodes" -> detail?.let { d -> EpisodesPanel(d, epIndex, pc, onPick = { selectEpisode(it); panel = null },
+                    "episodes" -> curDetail?.let { d -> EpisodesPanel(d, epIndex, pc, onPick = { selectEpisode(it); panel = null },
                         onSeason = { id -> panel = null; onSwitchSeries(id) }) }
                     "speed" -> {
                         PanelTitle("倍速", "长按画面临时 2× · 自动记住偏好")
@@ -767,7 +885,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                         val q = quality ?: tags.res ?: "自动"
                         PanelRow(q, player.videoFormat?.let { "${it.width}×${it.height}" } ?: "", true, pc) { panel = null }
                         Text("播放源", color = Color.White.copy(0.55f), fontSize = 12.sp, modifier = Modifier.padding(start = 2.dp, top = 14.dp, bottom = 8.dp))
-                        PanelRow(detail?.source ?: "当前片源", "当前", true, pc) { panel = null }
+                        PanelRow(curDetail?.source ?: "当前片源", "当前", true, pc) { panel = null }
                     }
                     "more" -> {
                         MoreSettingsPanel(
@@ -775,7 +893,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                             ambientMode = ambientMode,
                             enhanceLevel = enhanceLevel,
                             sdrToHdr = sdrToHdr,
-                            nativeHdrRange = if (isNativeHdr) tags.range else null,
+                            nativeHdrRange = nativeRange,
                             sleepMode = sleepMode,
                             sleepEndMs = sleepEndMs,
                             autoNext = autoNext,
@@ -797,24 +915,8 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                                     }
                                 }
                             },
-                            onEnhance = { lvl ->
-                                enhanceLevel = lvl
-                                PlayerPrefs.setEnhanceLevel(ctx, lvl)
-                                seekHint = when (lvl) {
-                                    1 -> "AI 超分辨率：标准"
-                                    2 -> "AI 超分辨率：强效"
-                                    else -> "AI 超分辨率：已关闭"
-                                }
-                            },
-                            onSdrToHdr = { on ->
-                                if (isNativeHdr) {
-                                    seekHint = "当前片源已是原生 ${tags.range}"
-                                } else {
-                                    sdrToHdr = on
-                                    PlayerPrefs.setSdrToHdr(ctx, on)
-                                    seekHint = if (on) "SDR 转 HDR：已开启" else "SDR 转 HDR：已关闭"
-                                }
-                            },
+                            onEnhance = { lvl -> applyEnhance(lvl) },
+                            onSdrToHdr = { on -> applySdrToHdr(on) },
                             onSleep = { mode ->
                                 sleepMode = mode
                                 sleepEndMs = if (mode > 0) System.currentTimeMillis() + mode * 60_000L else 0L
@@ -835,20 +937,6 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                         PanelRow("关闭", "当前视频没有可选字幕", true, pc) { panel = null }
                     }
                 }
-            }
-        }
-        // Tablet portrait-video split toggle chip (top-end when drawer is collapsed)
-        if (metrics.isTablet && landscape && metrics.widthDp >= 840 && isPortraitMedia && detail != null && !padDrawerOpen && showChrome) {
-            Box(
-                Modifier
-                    .align(Alignment.TopEnd)
-                    .statusBarsPadding()
-                    .padding(top = 14.dp, end = 16.dp)
-                    .glassSurface(RoundedCornerShape(50), dark = true, shadowRadius = 8.dp, fallbackAlpha = 0.60f)
-                    .clickable { padDrawerOpen = true }
-                    .padding(horizontal = 14.dp, vertical = 8.dp),
-            ) {
-                Text("展开选集", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
             }
         }
     }
@@ -927,62 +1015,104 @@ data class TechTags(val res: String? = null, val range: String? = null, val code
     }
 }
 
-/** spec `.tech`: one small centred line instead of a row of badges. */
+/**
+ * SenPlayer-style technical status badges: neutral glass pills for resolution / codec / high frame rate and accent
+ * pills for the active GPU stages (AI 超分, SDR→HDR) or a native HDR range. Tapping opens the enhancement panel.
+ */
 @Composable
-private fun TechLine(t: TechTags, modifier: Modifier = Modifier, enhanceLevel: Int = 0, sdrToHdr: Boolean = false) {
-    val sdr = t.range == "SDR"
-    // On SDR content the active GPU stages are shown in accent: "SDR→HDR" replaces "SDR", "AI超分" is appended.
-    val hdrOn = sdrToHdr && sdr
-    val parts = listOfNotNull(t.res, if (hdrOn) null else t.range, t.codec, t.audio, t.fps?.let { "$it fps" })
-    val active = listOfNotNull(if (hdrOn) "SDR→HDR" else null, if (enhanceLevel > 0 && (t.range == null || sdr)) "AI超分" else null)
-    if (parts.isEmpty() && active.isEmpty()) return
-    val accent = IdjDarkColors.accent
-    Text(androidx.compose.ui.text.buildAnnotatedString {
-        parts.forEachIndexed { i, p -> if (i > 0) append(" · "); append(p) }
-        active.forEach { a ->
-            if (length > 0) append(" · ")
-            pushStyle(androidx.compose.ui.text.SpanStyle(color = accent, fontWeight = FontWeight.SemiBold)); append(a); pop()
+private fun StatusBadges(t: TechTags, enhanceOn: Boolean, hdrOn: Boolean, nativeRange: String?, enabled: Boolean, onClick: () -> Unit) {
+    val items = buildList {
+        t.res?.let { add(it to false) }
+        t.codec?.let { add(it to false) }
+        t.fps?.takeIf { it >= 48 }?.let { add("${it}FPS" to false) }
+        when {
+            nativeRange != null -> add(nativeRange to true)
+            hdrOn -> add("SDR→HDR" to true)
         }
-    }, modifier = modifier, color = Color.White.copy(0.55f), fontSize = 11.sp, fontWeight = FontWeight.Medium,
-        letterSpacing = 0.3.sp, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
-}
-
-@Composable
-private fun CircleBtn(icon: ImageVector, label: String, enabled: Boolean = true, onClick: () -> Unit) {
-    // spec `.pbtn`: 40 dp dark glass. Drawn over the video (inside the root layer), so no backdrop sampling:
-    // LIQUID = sheer fill + specular rim, FROSTED = denser frosted fill + hairline.
-    app.iduanju.ui.components.GlassIconButton(icon, label, dark = true, fallbackAlpha = 0.42f, enabled = enabled, onClick = onClick)
-}
-
-@Composable
-private fun LandChip(icon:ImageVector,title:String,value:String?,on:Boolean,enabled:Boolean,onClick:()->Unit){
-    val pc=IdjDarkColors
-    Row(Modifier.height(34.dp).graphicsLayer { alpha = if(enabled)1f else 0.45f }
-        .then(if (on) Modifier.clip(CircleShape).background(pc.accentSoft).border(1.dp, pc.accentLine, CircleShape)
-              else Modifier.glassSurface(CircleShape, dark = true, shadowRadius = 0.dp, fallbackAlpha = 0.46f))
-        .pressClick(enabled=enabled,onClick=onClick).padding(horizontal=13.dp),
-        verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(6.dp)){
-        Icon(icon,null,tint=if(on)pc.accent else Color.White,modifier=Modifier.size(17.dp))
-        Text(title+(value?.let{" $it"}?:""),color=if(on)pc.accent else Color.White.copy(0.8f),fontSize=13.sp,maxLines=1,softWrap=false)
+        if (enhanceOn && nativeRange == null) add("AI 超分" to true)
+    }
+    if (items.isEmpty()) return
+    val pc = IdjDarkColors
+    Row(Modifier.clip(RoundedCornerShape(7.dp)).pressClick(0.96f, enabled = enabled, label = "画质增强", onClick = onClick),
+        horizontalArrangement = Arrangement.spacedBy(5.dp), verticalAlignment = Alignment.CenterVertically) {
+        items.forEach { (label, accent) ->
+            Box(Modifier.height(19.dp).clip(RoundedCornerShape(6.dp))
+                .background(if (accent) pc.accent.copy(0.22f) else Color.White.copy(0.14f))
+                .border(0.6.dp, if (accent) pc.accent.copy(0.62f) else Color.White.copy(0.14f), RoundedCornerShape(6.dp))
+                .padding(horizontal = 6.dp), contentAlignment = Alignment.Center) {
+                Text(label, color = if (accent) pc.accent else Color.White.copy(0.9f), fontSize = 10.sp, lineHeight = 12.sp,
+                    fontWeight = FontWeight.SemiBold, letterSpacing = 0.2.sp, maxLines = 1, softWrap = false)
+            }
+        }
     }
 }
 
-/** spec `.pact`: 23 dp icon over an 11 sp caption that carries the current value. */
+/** Top-bar quick pill: shows the active enhancement (AI超分 / HDR / native range); tap opens the 更多设置 panel. */
 @Composable
-private fun RowScope.ActionBtn(icon: ImageVector, title: String, value: String?, active: Boolean, accent: Boolean, enabled: Boolean, onClick: () -> Unit) {
+private fun EnhancePill(enhanceOn: Boolean, hdrOn: Boolean, nativeRange: String?, height: androidx.compose.ui.unit.Dp, enabled: Boolean, onClick: () -> Unit) {
     val pc = IdjDarkColors
-    val bg by androidx.compose.animation.animateColorAsState(if (active) Color.White.copy(0.15f) else Color.Transparent, DS.select(), label = "pact")
-    Column(Modifier.weight(1f).clip(RoundedCornerShape(14.dp)).background(bg).pressClick(enabled = enabled, label = title, onClick = onClick)
-        .padding(top = 7.dp, bottom = 6.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-        Icon(icon, title, tint = if (accent) pc.accent else Color.White, modifier = Modifier.size(23.dp))
-        Spacer(Modifier.height(4.dp))
+    val active = enhanceOn || hdrOn || nativeRange != null
+    val label = when {
+        enhanceOn && hdrOn -> "AI超分 · HDR"
+        enhanceOn -> "AI超分"
+        hdrOn -> "HDR"
+        nativeRange != null -> nativeRange
+        else -> "画质增强"
+    }
+    Row(Modifier.height(height)
+        .then(if (active) Modifier.clip(CircleShape).background(pc.accentSoft).border(1.dp, pc.accentLine, CircleShape)
+            else Modifier.glassSurface(CircleShape, dark = true, shadowRadius = 8.dp, fallbackAlpha = 0.42f))
+        .pressClick(0.94f, enabled = enabled, label = "画质增强", onClick = onClick).padding(horizontal = 14.dp),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        Icon(Icons.Filled.AutoAwesome, null, tint = if (active) pc.accent else Color.White, modifier = Modifier.size(18.dp))
+        Text(label, color = if (active) pc.accent else Color.White.copy(0.9f), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, softWrap = false)
+    }
+}
+
+@Composable
+private fun CircleBtn(
+    icon: ImageVector,
+    label: String,
+    enabled: Boolean = true,
+    size: androidx.compose.ui.unit.Dp = 42.dp,
+    iconSize: androidx.compose.ui.unit.Dp = 20.dp,
+    tint: Color = Color.White,
+    onClick: () -> Unit,
+) {
+    // Dark glass circle drawn over the video (inside the root layer), so no backdrop sampling:
+    // LIQUID = sheer fill + specular rim, FROSTED = denser frosted fill + hairline.
+    app.iduanju.ui.components.GlassIconButton(icon, label, size = size, iconSize = iconSize, dark = true, tint = tint,
+        fallbackAlpha = 0.42f, enabled = enabled, onClick = onClick)
+}
+
+/** SenPlayer console pill: icon + title + value; accent capsule when on. */
+@Composable
+private fun HudPill(icon: ImageVector, title: String, value: String?, on: Boolean, height: androidx.compose.ui.unit.Dp, onClick: () -> Unit) {
+    val pc = IdjDarkColors
+    Row(Modifier.height(height)
+        .then(if (on) Modifier.clip(CircleShape).background(pc.accentSoft).border(1.dp, pc.accentLine, CircleShape)
+            else Modifier.clip(CircleShape).background(Color.White.copy(0.10f)).border(0.6.dp, Color.White.copy(0.12f), CircleShape))
+        .pressClick(0.95f, label = title, onClick = onClick).padding(horizontal = 13.dp),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        Icon(icon, null, tint = if (on) pc.accent else Color.White, modifier = Modifier.size(17.dp))
         Text(androidx.compose.ui.text.buildAnnotatedString {
             append(title)
             if (value != null) {
                 append(" ")
-                pushStyle(androidx.compose.ui.text.SpanStyle(fontWeight = FontWeight.SemiBold, color = if (accent) pc.accent else Color.White)); append(value); pop()
+                pushStyle(androidx.compose.ui.text.SpanStyle(fontWeight = FontWeight.SemiBold, color = if (on) pc.accent else Color.White)); append(value); pop()
             }
-        }, color = Color.White.copy(0.72f), fontSize = 11.sp, lineHeight = 14.sp, maxLines = 1, softWrap = false)
+        }, color = if (on) pc.accent else Color.White.copy(0.82f), fontSize = 13.sp, maxLines = 1, softWrap = false)
+    }
+}
+
+/** Small scrubber-row toggle (画面比例 / 横竖屏): icon with an optional caption. */
+@Composable
+private fun HudIcon(icon: ImageVector, label: String?, on: Boolean, onClick: () -> Unit) {
+    val pc = IdjDarkColors
+    Row(Modifier.height(32.dp).clip(CircleShape).pressClick(0.9f, label = label ?: "横竖屏", onClick = onClick).padding(horizontal = 7.dp),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        Icon(icon, label, tint = if (on) pc.accent else Color.White, modifier = Modifier.size(21.dp))
+        if (label != null) Text(label, color = if (on) pc.accent else Color.White.copy(0.86f), fontSize = 12.sp, fontWeight = FontWeight.Medium, maxLines = 1, softWrap = false)
     }
 }
 
@@ -1027,7 +1157,7 @@ private fun EpisodesPanel(d: HGSeriesDetail, epIndex: Int, pc: IdjColors, onPick
     }
     val slice = d.episodes.withIndex().toList().drop(range * 30).take(30)
     androidx.compose.animation.AnimatedContent(slice, label = "eps", transitionSpec = { fadeIn(DS.select()) togetherWith fadeOut(DS.select()) }) { sl ->
-        LazyVerticalGrid(GridCells.Fixed(app.iduanju.ui.components.LocalLayoutMetrics.current.episodeCols), Modifier.heightIn(max = 300.dp).padding(top = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        LazyVerticalGrid(GridCells.Adaptive(52.dp), Modifier.heightIn(max = 300.dp).padding(top = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             items(sl.size) { k ->
                 val (i, ep) = sl[k]
                 val on = i == epIndex
@@ -1044,13 +1174,15 @@ private fun EpisodesPanel(d: HGSeriesDetail, epIndex: Int, pc: IdjColors, onPick
 
 /** spec `.ptrack`: 4 dp track, buffered white 30 %, 14 dp round knob; grows while dragging. Tap/drag to seek. */
 @Composable
-private fun ProgressBar(pos: Long, dur: Long, buffered: Long, onSeek: (Long) -> Unit) {
+private fun ProgressBar(pos: Long, dur: Long, buffered: Long, thick: Boolean = false, onSeek: (Long) -> Unit) {
     var drag by remember { mutableStateOf<Float?>(null) }
     val frac = drag ?: if (dur > 0) pos.toFloat() / dur else 0f
     val buf = if (dur > 0) buffered.toFloat() / dur else 0f
-    val h by androidx.compose.animation.core.animateDpAsState(if (drag != null) 8.dp else 4.dp, DS.press(), label = "trk")
-    val knob by androidx.compose.animation.core.animateDpAsState(if (drag != null) 20.dp else 14.dp, DS.press(), label = "knob")
-    BoxWithConstraints(Modifier.fillMaxWidth().height(28.dp)
+    val h by androidx.compose.animation.core.animateDpAsState(
+        when { drag != null && thick -> 10.dp; drag != null -> 8.dp; thick -> 6.dp; else -> 4.dp }, DS.press(), label = "trk")
+    val knob by androidx.compose.animation.core.animateDpAsState(
+        when { drag != null -> if (thick) 22.dp else 20.dp; else -> if (thick) 16.dp else 14.dp }, DS.press(), label = "knob")
+    BoxWithConstraints(Modifier.fillMaxWidth().height(if (thick) 32.dp else 28.dp)
         .pointerInput(dur) { detectTapGestures { o -> if (dur > 0) onSeek((o.x / size.width * dur).toLong()) } }
         .pointerInput(dur) {
             detectHorizontalDragGestures(onDragEnd = { drag?.let { if (dur > 0) onSeek((it * dur).toLong()) }; drag = null }) { ch, _ ->
@@ -1061,6 +1193,8 @@ private fun ProgressBar(pos: Long, dur: Long, buffered: Long, onSeek: (Long) -> 
         Box(Modifier.fillMaxWidth().height(h).clip(RoundedCornerShape(50)).background(Color.White.copy(0.24f)))
         Box(Modifier.width(w * buf.coerceIn(0f, 1f)).height(h).clip(RoundedCornerShape(50)).background(Color.White.copy(0.30f)))
         Box(Modifier.width(w * frac.coerceIn(0f, 1f)).height(h).clip(RoundedCornerShape(50)).background(Color.White))
+        // glowing thumb while dragging
+        if (drag != null) Box(Modifier.offset(x = (w * frac.coerceIn(0f, 1f)) - knob).size(knob * 2).clip(CircleShape).background(Color.White.copy(0.18f)))
         Box(Modifier.offset(x = (w * frac.coerceIn(0f, 1f)) - knob / 2).size(knob)
             .shadow(3.dp, CircleShape).clip(CircleShape).background(Color.White))
     }
@@ -1078,6 +1212,15 @@ internal fun keepScreenOn(activity: android.app.Activity?, on: Boolean) {
     if (on) w.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     else w.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     android.util.Log.i("IDJ", "keepScreenOn=$on")
+}
+
+/** The user's system brightness as 0..1 (handles OEM ranges above 255 via the framework's configured maximum). */
+private fun systemBrightness(ctx: android.content.Context): Float {
+    val raw = runCatching { android.provider.Settings.System.getInt(ctx.contentResolver, android.provider.Settings.System.SCREEN_BRIGHTNESS) }.getOrDefault(128)
+    val res = android.content.res.Resources.getSystem()
+    val id = res.getIdentifier("config_screenBrightnessSettingMaximum", "integer", "android")
+    val max = (if (id != 0) runCatching { res.getInteger(id) }.getOrDefault(255) else 255).coerceAtLeast(1)
+    return (raw.toFloat() / maxOf(max, raw).toFloat()).coerceIn(0f, 1f)
 }
 
 private const val ACTION_PIP_PLAY_PAUSE = "app.iduanju.action.PIP_PLAY_PAUSE"

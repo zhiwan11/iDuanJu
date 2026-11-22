@@ -331,8 +331,10 @@ private fun DetailBody(
     }
     ranges.getOrNull(g)?.let { r ->
         androidx.compose.animation.AnimatedContent(r, label = "eps", transitionSpec = { fadeIn() togetherWith fadeOut() }) { rr ->
+            // 6 per row on phones, 8 on tablet portrait, 10 in the tablet-landscape two-pane body.
+            val epCols = when (LocalLayoutMetrics.current.tier) { SizeTier.Compact -> 6; SizeTier.Medium -> 8; SizeTier.Expanded -> 10 }
             Column(Modifier.padding(horizontal = 20.dp).padding(top = 12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                rr.chunked(6).forEach { row ->
+                rr.chunked(epCols).forEach { row ->
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         row.forEach { i ->
                             val ep = d.episodes[i]
@@ -344,7 +346,7 @@ private fun DetailBody(
                                 if (cur) Box(Modifier.align(Alignment.TopEnd).padding(6.dp).size(5.dp).clip(CircleShape).background(c.accent))
                             }
                         }
-                        repeat(6 - row.size) { Spacer(Modifier.weight(1f)) }
+                        repeat(epCols - row.size) { Spacer(Modifier.weight(1f)) }
                     }
                 }
             }

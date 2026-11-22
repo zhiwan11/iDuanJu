@@ -73,12 +73,35 @@ fun RootScreen(initialRoute: String? = null) {
             "找剧" to { on -> Icon(Icons.Filled.GridView, null, Modifier.size(20.dp), tint = if (on) IdjThemeColors.text else IdjThemeColors.secondary) },
             "我的" to { on -> Icon(Icons.Filled.Person, null, Modifier.size(20.dp), tint = if (on) IdjThemeColors.text else IdjThemeColors.secondary) },
         )
-        val onSelectTab: (Int) -> Unit = {
-            tab = it
-            nav.navigate(listOf("home", "tvbox", "category", "profile")[it]) {
-                popUpTo(nav.graph.startDestinationId) { saveState = true }
-                launchSingleTop = true
-                restoreState = true
+        val tabRoutes = listOf("home", "tvbox", "category", "profile")
+        /**
+         * "home" is the graph's start destination. A non-inclusive `popUpTo(home) { saveState = true }` maps the
+         * popped stack (e.g. [search]) onto home's own id, so `navigate("home") { restoreState = true }` restored
+         * the search page right back and 首页 looked dead. Home is therefore reached by popping back to it (or by
+         * rebuilding the graph from it), never through restoreState; transient search routes are dropped first so
+         * they are never saved into another tab's state.
+         */
+        val goHome: () -> Unit = {
+            if (nav.currentBackStackEntry?.destination?.route != "home" && !nav.popBackStack("home", inclusive = false)) {
+                nav.navigate("home") {
+                    popUpTo(nav.graph.id) { inclusive = true }
+                    launchSingleTop = true
+                }
+            }
+        }
+        val onSelectTab: (Int) -> Unit = { i ->
+            tab = i
+            val target = tabRoutes[i]
+            val cur = nav.currentBackStackEntry?.destination?.route
+            if (target == "home") {
+                goHome()
+            } else if (cur != target) {
+                if (cur == "search" || cur?.startsWith("actorSearch/") == true) nav.popBackStack()
+                nav.navigate(target) {
+                    popUpTo(nav.graph.startDestinationId) { saveState = true }
+                    launchSingleTop = true
+                    restoreState = true
+                }
             }
         }
         val onSelectSearch: () -> Unit = {
@@ -97,7 +120,7 @@ fun RootScreen(initialRoute: String? = null) {
             if (r.startsWith("home/")) {
                 app.iduanju.ui.home.HomeJump.label = mapOf("channels" to "频道", "manga" to "漫画")[r.removePrefix("home/")]
                 tab = 0
-                nav.navigate("home") { popUpTo(nav.graph.startDestinationId) { saveState = true }; launchSingleTop = true; restoreState = true }
+                goHome()
             } else nav.navigate(r)
         }
         androidx.compose.runtime.CompositionLocalProvider(

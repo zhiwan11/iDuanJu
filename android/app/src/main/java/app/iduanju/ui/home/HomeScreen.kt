@@ -26,7 +26,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.FilterList
 import androidx.compose.material.icons.filled.KeyboardArrowDown
-import androidx.compose.material.icons.filled.KeyboardArrowRight
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.*
@@ -354,11 +354,12 @@ private fun FeedPage(source: HomeSource, onOpen: (String) -> Unit) {
             if (source == HomeSource.hongguo && cw.isNotEmpty()) ContinueRow(cw, onOpen)
             val heroIds = heroPicks.map { it.seriesId }.toSet()
             val go = app.iduanju.ui.LocalNavigate.current
+            val shelfCount = LocalLayoutMetrics.current.shelfItemCount
             boards.forEachIndexed { n, b ->
                 LaunchedEffect(b.id) { BoardCache.load(b) }
                 val items = BoardCache.items[b.id]
                 val rest = if (n == 0) items?.filter { it.seriesId !in heroIds } else items
-                HomeSection(b.title, if (BoardCache.failed.containsKey(b.id) && items == null) "加载失败，下拉重试" else null, rest?.take(12), onOpen) { go("board/${b.genre.name}/${b.sub.name}") }
+                HomeSection(b.title, if (BoardCache.failed.containsKey(b.id) && items == null) "加载失败，下拉重试" else null, rest?.take(shelfCount), onOpen) { go("board/${b.genre.name}/${b.sub.name}") }
             }
         }
     }
@@ -396,10 +397,18 @@ private fun PosterHero(board: String, picks: List<HGSeries>, index: Int, setInde
     val buttonStyle = LocalTextStyle.current.merge(androidx.compose.ui.text.TextStyle(
         fontSize = 13.sp, lineHeight = 16.sp, fontWeight = FontWeight.SemiBold,
         platformStyle = androidx.compose.ui.text.PlatformTextStyle(includeFontPadding = false)))
+    val metrics = LocalLayoutMetrics.current
+    val scope = rememberCoroutineScope()
+    // Tablet: the hero card takes ~62 % and a 「热播速览」 stack fills the rest, so a wide window never shows one
+    // small poster in front of an empty dark gradient.
+    val withSide = metrics.tier != SizeTier.Compact && picks.size > 1
     BoxWithConstraints(Modifier.padding(horizontal = 16.dp).fillMaxWidth()) {
-        // Preserve the spec's 112 dp poster normally; narrow windows keep a usable info column.
-        val posterWidth = minOf(112.dp, (maxWidth - 28.dp - 14.dp - 160.dp).coerceAtLeast(80.dp))
-        val infoWidth = maxWidth - 28.dp - posterWidth - 14.dp
+        val sideGap = 14.dp
+        val heroWidth = if (withSide) (maxWidth - sideGap) * 0.62f else maxWidth
+        // Preserve the spec's 112 dp poster on phones (132 dp on tablets); narrow windows keep a usable info column.
+        val posterMax = if (metrics.tier == SizeTier.Compact) 112.dp else 132.dp
+        val posterWidth = minOf(posterMax, (heroWidth - 28.dp - 14.dp - 160.dp).coerceAtLeast(80.dp))
+        val infoWidth = heroWidth - 28.dp - posterWidth - 14.dp
         val infoPx = with(density) { infoWidth.roundToPx() }
         fun textHeight(text: String, style: androidx.compose.ui.text.TextStyle, lines: Int) = with(density) {
             measurer.measure(text, style, maxLines = lines, overflow = TextOverflow.Ellipsis,
@@ -429,7 +438,8 @@ private fun PosterHero(board: String, picks: List<HGSeries>, index: Int, setInde
                 8.dp + footerHeight
         }.maxOrNull() ?: 149.dp
         val cardHeight = maxOf(posterWidth * 4 / 3, infoHeight) + 28.dp
-        Box(Modifier.fillMaxWidth().height(cardHeight)
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(sideGap)) {
+        Box(Modifier.width(heroWidth).height(cardHeight)
             .shadow(15.dp, RoundedCornerShape(22.dp), ambientColor = Color.Black.copy(0.22f), spotColor = Color.Black.copy(0.22f))
             .clip(RoundedCornerShape(22.dp)).background(Color(0xFF241A1A))) {
             androidx.compose.animation.Crossfade(cur?.cover, label = "heroBg") { url ->
@@ -479,6 +489,61 @@ private fun PosterHero(board: String, picks: List<HGSeries>, index: Int, setInde
                 }
             }
         }
+        if (withSide) HeroSideStack(board, picks, index, Modifier.weight(1f).height(cardHeight), onOpen) { i ->
+            scope.launch { pager.animateScrollToPage(i) }
+        }
+        }
+    }
+}
+
+/**
+ * Tablet-only 「热播速览」 companion to the hero: the other picks of the same board as compact rows on the same
+ * blurred-cover material, so the hero row is balanced edge to edge. Tapping a row focuses it in the hero; the
+ * round arrow opens its detail page.
+ */
+@Composable
+private fun HeroSideStack(board: String, picks: List<HGSeries>, current: Int, modifier: Modifier, onOpen: (String) -> Unit, onFocus: (Int) -> Unit) {
+    val others = picks.indices.filter { it != current }.take(3)
+    Box(modifier
+        .shadow(15.dp, RoundedCornerShape(22.dp), ambientColor = Color.Black.copy(0.22f), spotColor = Color.Black.copy(0.22f))
+        .clip(RoundedCornerShape(22.dp)).background(Color(0xFF1E1A22))) {
+        androidx.compose.animation.Crossfade(picks.getOrNull(others.firstOrNull() ?: 0)?.cover, label = "heroSideBg") { url ->
+            BlurBackdrop(url, Modifier.fillMaxSize().scale(1.6f), 40.dp, 0.7f)
+        }
+        Box(Modifier.fillMaxSize().background(Brush.linearGradient(listOf(Color.Black.copy(0.42f), Color.Black.copy(0.70f)))))
+        Column(Modifier.fillMaxSize().padding(horizontal = 14.dp, vertical = 12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("热播速览", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.width(6.dp))
+                if (board.isNotEmpty()) Text(board, color = Color.White.copy(0.55f), fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            Spacer(Modifier.height(6.dp))
+            Column(Modifier.weight(1f).fillMaxWidth(), verticalArrangement = Arrangement.SpaceEvenly) {
+                others.forEach { i ->
+                    val s = picks[i]
+                    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                        .pressClick(0.98f, label = "home.hero.side.$i") { onFocus(i) }.padding(vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically) {
+                        Box(Modifier.size(36.dp, 48.dp).clip(RoundedCornerShape(7.dp)).background(Color.White.copy(0.1f))) {
+                            AsyncImage(s.cover, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                        }
+                        Spacer(Modifier.width(10.dp))
+                        Text("${i + 1}", color = Color(0xFFF2B55C), fontSize = 16.sp, fontWeight = FontWeight.Black,
+                            fontStyle = androidx.compose.ui.text.font.FontStyle.Italic, modifier = Modifier.width(18.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(s.title, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            val meta = homeShelfMeta(s)
+                            if (meta.isNotEmpty()) Text(meta, color = Color.White.copy(0.62f), fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                        Spacer(Modifier.width(6.dp))
+                        Box(Modifier.size(30.dp).clip(CircleShape).background(Color.White.copy(0.14f))
+                            .pressClick(label = "打开 ${s.title}") { onOpen(s.seriesId) }, contentAlignment = Alignment.Center) {
+                            Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, Modifier.size(18.dp), tint = Color.White)
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -493,16 +558,20 @@ fun HomeBadge(text: String, modifier: Modifier = Modifier) {
 @Composable
 private fun HomeSection(title: String, note: String?, list: List<HGSeries>?, onOpen: (String) -> Unit, onMore: () -> Unit) {
     val c = IdjThemeColors
+    val metrics = LocalLayoutMetrics.current
+    // Tablet: larger cells and up to 16 items so a 1100 dp shelf fills edge to edge instead of stopping at 60 %.
+    val cell = metrics.shelfCardWidth
+    val gap = if (metrics.tier == SizeTier.Compact) 10.dp else 14.dp
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         SectionHeader2(title, note) { MoreLink(onClick = onMore) }
-        LazyRow(contentPadding = PaddingValues(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            if (list == null) items(4) {
-                Column(Modifier.width(112.dp)) {
+        LazyRow(contentPadding = PaddingValues(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(gap)) {
+            if (list == null) items(if (metrics.tier == SizeTier.Compact) 4 else 9) {
+                Column(Modifier.width(cell)) {
                     Box(Modifier.fillMaxWidth().aspectRatio(3f / 4f).clip(RoundedCornerShape(12.dp)).background(c.glass))
                     Box(Modifier.padding(top = 8.dp).width(80.dp).height(12.dp).clip(RoundedCornerShape(4.dp)).background(c.glass))
                 }
             } else items(list, key = { it.seriesId }) { s ->
-                app.iduanju.ui.category.PosterCell(s, null, homeShelfMeta(s), onOpen, Modifier.width(112.dp))
+                app.iduanju.ui.category.PosterCell(s, null, homeShelfMeta(s), onOpen, Modifier.width(cell))
             }
         }
     }
@@ -538,11 +607,14 @@ fun PosterCard(s: HGSeries, onOpen: (String) -> Unit) = HomePosterCard(s, onOpen
 internal fun ContinueRow(list: List<app.iduanju.data.WatchProgress>, onOpen: (String) -> Unit, onPlay: ((app.iduanju.data.WatchProgress) -> Unit)? = null) {
     val c = IdjThemeColors
     val go = app.iduanju.ui.LocalNavigate.current
+    val metrics = LocalLayoutMetrics.current
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         SectionHeader2("继续观看") { MoreLink { go("library/history") } }
-        LazyRow(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 2.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        // A full shelf of recent dramas; tablets get 280 dp cards with a wider gap.
+        LazyRow(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 2.dp),
+            horizontalArrangement = Arrangement.spacedBy(if (metrics.tier == SizeTier.Compact) 10.dp else 14.dp)) {
             items(list.take(10), key = { it.seriesId }) { p ->
-                Row(Modifier.width(296.dp).dsCard(18.dp).pressClick(0.98f, label = p.title) { onOpen(p.seriesId) }
+                Row(Modifier.width(metrics.continueCardWidth).dsCard(18.dp).pressClick(0.98f, label = p.title) { onOpen(p.seriesId) }
                     .padding(start = 10.dp, end = 12.dp, top = 10.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Box(Modifier.size(52.dp, 69.dp).clip(RoundedCornerShape(8.dp)).background(c.glass)) {

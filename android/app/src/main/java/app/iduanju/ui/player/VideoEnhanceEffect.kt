@@ -1,7 +1,21 @@
 package app.iduanju.ui.player
 
+import android.app.Activity
 import android.content.Context
+import android.content.pm.ActivityInfo
+import android.graphics.RenderEffect
+import android.graphics.RuntimeShader
 import android.opengl.GLES20
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.provider.Settings
+import android.util.Log
+import android.view.TextureView
+import android.view.View
+import android.view.Window
+import android.view.WindowManager
+import androidx.annotation.RequiresApi
 import androidx.media3.common.VideoFrameProcessingException
 import androidx.media3.common.util.GlProgram
 import androidx.media3.common.util.GlUtil
@@ -10,6 +24,9 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.effect.BaseGlShaderProgram
 import androidx.media3.effect.GlEffect
 import androidx.media3.effect.GlShaderProgram
+import java.lang.ref.WeakReference
+import java.util.WeakHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
@@ -18,58 +35,107 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
- * SenPlayer-grade (mpv + libplacebo style) single-pass GPU video enhancer for Media3.
- *
- * One persistent [GlEffect] is installed before `player.prepare()`; [level] and [sdrToHdr] are
- * `@Volatile` and read on every frame, so toggling them takes effect on the very next frame with
- * no pipeline rebuild and no black frames.
- *
- * Pipeline (all in one fragment shader, each stage gated by uniforms):
- * - **Stage A · Deband** (`deband=yes`) — active when `level > 0 || sdrToHdr`.
- *   4 samples at a per-pixel random direction/distance (2.5..4.5 texels); if they all sit within
- *   the banding threshold of the centre, blend toward their mean and add ±0.5/255 dither.
- * - **Stage B · AI Super-Resolution** (`scale=ewa_lanczossharp` / `ewa_lanczos4sharpest`,
- *   `sigmoid-upscaling=yes`, `antiring`) — active when `level > 0`.
- *   The 3×3 neighbourhood is linearised and sigmoidised (centre 0.75, slope 6.5), filtered with
- *   real EWA Lanczos (jinc · jinc-window) weights evaluated at the tap radii, the negative-lobe
- *   response is applied with a CAS-style local-contrast adaptive weight, clamped to the
- *   neighbourhood range (anti-ringing) and un-sigmoidised.
- *   Media3 renders effects at source resolution (the TextureView does the final upscale), so the
- *   EWA kernel is used as a same-resolution reconstruction/sharpening filter.
- * - **Stage C · SDR → HDR** (`inverse-tone-mapping`, `hdr-contrast-recovery=0.30`,
- *   `tone-mapping-desaturate=0.5`, `gamut-mapping-mode=desaturate`) — active when `sdrToHdr`.
- *   Linear-light luminance gets a shadow toe + BT.2390-style Hermite highlight expansion,
- *   local log-luminance detail is recovered in highlights, midtone chroma is expanded ×1.12,
- *   speculars are desaturated and out-of-range colours are luma-preservingly gamut mapped.
- *
- * Native HDR streams (`useHdr == true`) and the all-off state are exact single-read passthrough.
- *
- * Levels: `0 = 关闭`, `1 = 标准 (ewa_lanczossharp)`, `2 = 强效 (ewa_lanczos4sharpest)`.
+ * Install once before `player.prepare()`. The renderer reads live settings on each frame.
+ * Media3 and the API 33+ fallback share the deband, EWA detail reconstruction and SDR tone curve.
+ * SR is a same-resolution GPU detail filter, not neural upscaling; SDR enhancement does not change
+ * Media3's output transfer function or signal HDR metadata. Native HDR is left unmodified.
  */
 @UnstableApi
 class VideoEnhanceEffect(
-    @Volatile var level: Int,
-    @Volatile var sdrToHdr: Boolean = false,
+    level: Int,
+    sdrToHdr: Boolean = false,
 ) : GlEffect {
 
+    @Volatile var level: Int = level
+        set(value) {
+            if (field == value) return
+            field = value
+            requestUiSync()
+        }
+
+    @Volatile var sdrToHdr: Boolean = sdrToHdr
+        set(value) {
+            if (field == value) return
+            field = value
+            requestUiSync()
+        }
+
+    @Volatile var framesProcessed: Long = 0L
+        private set
+
+    private var currentProgram: EnhanceShaderProgram? = null
+    @Volatile private var programUsesHdr = false
+    @Volatile private var sourceIsNativeHdr = false
+    @Volatile private var uiBinding: EnhanceUiBinding? = null
+    private val syncPending = AtomicBoolean()
+
     override fun toGlShaderProgram(context: Context, useHdr: Boolean): GlShaderProgram =
-        EnhanceShaderProgram(useHdr, this)
+        EnhanceShaderProgram(useHdr, this).also { setProgram(it, useHdr) }
 
     override fun isNoOp(inputWidth: Int, inputHeight: Int): Boolean = false
 
-    /** Per-level libplacebo-equivalent scaler preset, with EWA tap weights precomputed. */
+    @Synchronized
+    private fun setProgram(program: EnhanceShaderProgram?, useHdr: Boolean) {
+        currentProgram = program
+        programUsesHdr = useHdr
+        framesProcessed = 0L
+        requestUiSync()
+    }
+
+    @Synchronized
+    private fun recordFrame(program: EnhanceShaderProgram) {
+        if (currentProgram === program && ++framesProcessed == 1L) requestUiSync()
+    }
+
+    @Synchronized
+    private fun releaseProgram(program: EnhanceShaderProgram) {
+        if (currentProgram === program) setProgram(null, false)
+    }
+
+    private fun requestUiSync() {
+        if (uiBinding != null && syncPending.compareAndSet(false, true)) {
+            enhanceMainHandler.post {
+                syncPending.set(false)
+                uiBinding?.sync()
+            }
+        }
+    }
+
+    internal fun syncUi(activity: Activity?, textureView: TextureView?, isNativeHdr: Boolean) = onEnhanceMain {
+        sourceIsNativeHdr = isNativeHdr
+        val binding = uiBinding
+        if (binding != null && binding.matches(activity, textureView)) {
+            binding.sync()
+        } else {
+            binding?.close()
+            uiBinding = null
+            if (activity != null || textureView != null) {
+                uiBinding = EnhanceUiBinding(this, activity, textureView).also { it.sync() }
+            }
+        }
+    }
+
+    internal fun clearUi() = onEnhanceMain {
+        uiBinding?.close()
+        uiBinding = null
+        sourceIsNativeHdr = false
+    }
+
+    internal fun isNativeHdr(): Boolean = sourceIsNativeHdr || programUsesHdr
+
     private class SrPreset(
         radius: Double,
         blur: Double,
-        /** Tap distance in texels (the 3×3 kernel is sampled at `r * tapScale`). */
-        val tapScale: Float,
-        val gain: Float,
-        val antiring: Float,
+        tapScale: Float,
+        gain: Float,
+        nearGain: Float,
+        farGain: Float,
         val debandThreshold: Float,
     ) {
-        val wAxial: Float = ewaLanczos(1.0 * tapScale, radius, blur).toFloat()
-        val wDiag: Float = ewaLanczos(SQRT2 * tapScale, radius, blur).toFloat()
-        val wNorm: Float = 1f / (1f + 4f * wAxial + 4f * wDiag)
+        private val wAxial = ewaLanczos(tapScale.toDouble(), radius, blur).toFloat()
+        private val wDiag = ewaLanczos(SQRT2 * tapScale, radius, blur).toFloat()
+        val kernel = floatArrayOf(tapScale, wAxial, wDiag, 1f / (1f + 4f * wAxial + 4f * wDiag))
+        val sr = floatArrayOf(gain, nearGain, farGain, 0.82f)
     }
 
     private class EnhanceShaderProgram(
@@ -80,6 +146,7 @@ class VideoEnhanceEffect(
         private val glProgram: GlProgram
         private var inputWidth = 1
         private var inputHeight = 1
+        private val texelSize = FloatArray(2)
 
         init {
             try {
@@ -89,6 +156,7 @@ class VideoEnhanceEffect(
                     GlUtil.getNormalizedCoordinateBounds(),
                     GlUtil.HOMOGENEOUS_COORDINATE_VECTOR_SIZE,
                 )
+                glProgram.setFloatsUniform("uSigmoid", SIGMOID_PARAMS)
             } catch (e: GlUtil.GlException) {
                 throw VideoFrameProcessingException(e)
             }
@@ -97,53 +165,52 @@ class VideoEnhanceEffect(
         override fun configure(inputWidth: Int, inputHeight: Int): Size {
             this.inputWidth = inputWidth.coerceAtLeast(1)
             this.inputHeight = inputHeight.coerceAtLeast(1)
+            texelSize[0] = 1f / this.inputWidth
+            texelSize[1] = 1f / this.inputHeight
             return Size(this.inputWidth, this.inputHeight)
         }
 
         override fun drawFrame(inputTexId: Int, presentationTimeUs: Long) {
             try {
                 // Native HDR10 / HLG / Dolby Vision: the SDR-domain math below would clip, so bypass.
-                val lvl = if (useHdr) 0 else owner.level.coerceIn(0, 2)
-                val itm = !useHdr && owner.sdrToHdr
+                val nativeHdr = useHdr || owner.sourceIsNativeHdr
+                val lvl = if (nativeHdr) 0 else owner.level.coerceIn(0, 2)
+                val itm = !nativeHdr && owner.sdrToHdr
                 val active = lvl > 0 || itm
                 val preset = if (lvl >= 2) PRESET_STRONG else PRESET_STANDARD
 
                 glProgram.use()
                 glProgram.setSamplerTexIdUniform("uTexSampler", inputTexId, /* texUnitIndex= */ 0)
-                glProgram.setFloatsUniform("uTexelSize", floatArrayOf(1.0f / inputWidth, 1.0f / inputHeight))
+                glProgram.setFloatsUniform("uTexelSize", texelSize)
                 glProgram.setFloatUniform("uActive", if (active) 1f else 0f)
 
                 // Stage A · deband
                 glProgram.setFloatUniform("uDebandThreshold", if (active) preset.debandThreshold else 0f)
 
                 // Stage B · EWA Lanczos super-resolution in sigmoid space
-                glProgram.setFloatUniform("uSrGain", if (lvl > 0) preset.gain else 0f)
-                glProgram.setFloatUniform("uTapScale", preset.tapScale)
-                glProgram.setFloatUniform("uWAxial", preset.wAxial)
-                glProgram.setFloatUniform("uWDiag", preset.wDiag)
-                glProgram.setFloatUniform("uWNorm", preset.wNorm)
-                glProgram.setFloatUniform("uAntiring", preset.antiring)
-                glProgram.setFloatsUniform("uSigmoid", SIGMOID_PARAMS)
+                glProgram.setFloatsUniform("uSr", if (lvl > 0) preset.sr else SR_OFF)
+                glProgram.setFloatsUniform("uKernel", preset.kernel)
 
                 // Stage C · inverse tone mapping
                 glProgram.setFloatUniform("uItm", if (itm) 1f else 0f)
-                glProgram.setFloatsUniform("uItmCurve", ITM_CURVE)
-                glProgram.setFloatsUniform("uItmColor", ITM_COLOR)
 
                 glProgram.bindAttributesAndUniforms()
                 GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
                 GlUtil.checkGlError()
+                owner.recordFrame(this)
             } catch (e: GlUtil.GlException) {
                 throw VideoFrameProcessingException(e, presentationTimeUs)
             }
         }
 
         override fun release() {
-            super.release()
             try {
+                super.release()
                 glProgram.delete()
             } catch (e: GlUtil.GlException) {
                 throw VideoFrameProcessingException(e)
+            } finally {
+                owner.releaseProgram(this)
             }
         }
     }
@@ -164,22 +231,16 @@ class VideoEnhanceEffect(
         /** (center, slope, offset, scale) */
         private val SIGMOID_PARAMS = floatArrayOf(SIGMOID_CENTER, SIGMOID_SLOPE, SIGMOID_OFFSET, SIGMOID_SCALE)
 
-        /**
-         * Inverse tone mapping curve: (knee, shoulder slope at peak, shadow toe depth, hdr-contrast-recovery).
-         * Knee 0.35 linear, shoulder 0.35 lifts the 0.35..1.0 range by up to ~+0.07 linear.
-         */
-        private val ITM_CURVE = floatArrayOf(0.35f, 0.35f, 0.12f, 0.30f)
-
-        /** (midtone chroma expansion, tone-mapping-desaturate, specular start, unused) */
-        private val ITM_COLOR = floatArrayOf(1.12f, 0.5f, 0.88f, 0f)
+        private val SR_OFF = FloatArray(4)
 
         /** 标准 ≈ `ewa_lanczossharp`: crisp and natural. */
         private val PRESET_STANDARD = SrPreset(
             radius = 3.2383154841662362,
             blur = 0.9812505837223707,
             tapScale = 1.25f,
-            gain = 0.90f,
-            antiring = 0.85f,
+            gain = 1.55f,
+            nearGain = 0.38f,
+            farGain = 0.17f,
             debandThreshold = 0.022f,
         )
 
@@ -188,9 +249,10 @@ class VideoEnhanceEffect(
             radius = 4.2678535886059700,
             blur = 0.8845120932605005,
             tapScale = 1.25f,
-            gain = 1.15f,
-            antiring = 0.85f,
-            debandThreshold = 0.028f,
+            gain = 2.05f,
+            nearGain = 0.62f,
+            farGain = 0.28f,
+            debandThreshold = 0.022f,
         )
 
         /** EWA Lanczos: `jinc(r / blur) * jinc(r * JINC_ZERO / radius)` for `r < radius`. */
@@ -238,36 +300,27 @@ class VideoEnhanceEffect(
             }
         """
 
-        private const val FRAGMENT_SHADER = """
-            #version 100
-            precision highp float;
-            uniform sampler2D uTexSampler;
+        private const val ENHANCE_UNIFORMS = """
             uniform vec2 uTexelSize;
             uniform float uActive;
-            // Stage A
             uniform float uDebandThreshold;
-            // Stage B
-            uniform float uSrGain;
-            uniform float uTapScale;
-            uniform float uWAxial;
-            uniform float uWDiag;
-            uniform float uWNorm;
-            uniform float uAntiring;
-            uniform vec4 uSigmoid;   // center, slope, offset, scale
-            // Stage C
+            uniform vec4 uSr;
+            uniform vec4 uKernel;
+            uniform vec4 uSigmoid;
             uniform float uItm;
-            uniform vec4 uItmCurve;  // knee, shoulder slope, toe depth, contrast recovery
-            uniform vec4 uItmColor;  // chroma expansion, desaturate, specular start, -
-            varying vec2 vTexSamplingCoord;
+        """
 
+        private const val COLOR_MATH = """
+            vec3 toLinear(vec3 c) { return pow(max(c, vec3(0.0)), vec3(2.2)); }
+            vec3 toGamma(vec3 c) { return pow(max(c, vec3(0.0)), vec3(1.0 / 2.2)); }
+        """
+
+        private const val ENHANCE_BODY = """
             const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 
             float hash12(vec2 p) {
                 return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
             }
-
-            vec3 toLinear(vec3 c) { return pow(max(c, vec3(0.0)), vec3(2.2)); }
-            vec3 toGamma(vec3 c) { return pow(max(c, vec3(0.0)), vec3(1.0 / 2.2)); }
 
             // libplacebo pl_shader_sigmoidize / unsigmoidize (operating on linear light)
             vec3 sigmoidize(vec3 lin) {
@@ -280,31 +333,36 @@ class VideoEnhanceEffect(
             }
             vec3 sigG(vec3 gammaRgb) { return sigmoidize(toLinear(gammaRgb)); }
 
-            void main() {
-                vec4 cSample = texture2D(uTexSampler, vTexSamplingCoord);
-                if (uActive < 0.5) {
-                    gl_FragColor = cSample;
-                    return;
-                }
-                vec2 uv = vTexSamplingCoord;
-                vec3 e0 = cSample.rgb;
+            float expandLuma(float y) {
+                float toe = mix(0.53, 1.0, smoothstep(0.0, 0.16, y));
+                if (y <= 0.62) return y * (toe + 0.30 * smoothstep(0.18, 0.255, y));
+                float t = (y - 0.62) / 0.38;
+                float t2 = t * t;
+                float t3 = t2 * t;
+                return (2.0 * t3 - 3.0 * t2 + 1.0) * 0.806
+                    + (t3 - 2.0 * t2 + t) * 0.494
+                    + (-2.0 * t3 + 3.0 * t2) + (t3 - t2) * 0.0608;
+            }
+
+            vec3 enhance(vec2 uv, vec3 e0) {
                 vec3 e = e0;
 
                 // ---------------- Stage A · Deband ----------------
                 float debandW = 0.0;
                 if (uDebandThreshold > 0.0) {
-                    float h1 = hash12(uv);
-                    float h2 = hash12(uv + vec2(0.4231, 0.1793));
-                    float h3 = hash12(uv + vec2(0.7719, 0.5381));
+                    vec2 seed = uv / (uTexelSize * 4096.0);
+                    float h1 = hash12(seed);
+                    float h2 = hash12(seed + vec2(0.4231, 0.1793));
+                    float h3 = hash12(seed + vec2(0.7719, 0.5381));
                     float dist = mix(2.5, 4.5, h1);
                     float ang = h2 * 6.2831853;
                     vec2 dir = vec2(cos(ang), sin(ang)) * dist;   // in texels
                     vec2 dirA = dir * uTexelSize;
                     vec2 dirB = vec2(-dir.y, dir.x) * uTexelSize; // perpendicular pair
-                    vec3 o1 = texture2D(uTexSampler, uv + dirA).rgb;
-                    vec3 o2 = texture2D(uTexSampler, uv - dirA).rgb;
-                    vec3 o3 = texture2D(uTexSampler, uv + dirB).rgb;
-                    vec3 o4 = texture2D(uTexSampler, uv - dirB).rgb;
+                    vec3 o1 = sampleRgb(uv + dirA);
+                    vec3 o2 = sampleRgb(uv - dirA);
+                    vec3 o3 = sampleRgb(uv + dirB);
+                    vec3 o4 = sampleRgb(uv - dirB);
                     vec3 dmax = max(max(abs(o1 - e0), abs(o2 - e0)), max(abs(o3 - e0), abs(o4 - e0)));
                     float diff = max(max(dmax.r, dmax.g), dmax.b);
                     debandW = 1.0 - smoothstep(uDebandThreshold * 0.4, uDebandThreshold, diff);
@@ -313,93 +371,276 @@ class VideoEnhanceEffect(
                 }
 
                 // 3x3 neighbourhood (shared by Stage B and Stage C local luminance)
-                vec2 st = uTexelSize * uTapScale;
-                vec3 a = texture2D(uTexSampler, uv + vec2(-st.x, -st.y)).rgb;
-                vec3 b = texture2D(uTexSampler, uv + vec2(0.0, -st.y)).rgb;
-                vec3 c = texture2D(uTexSampler, uv + vec2(st.x, -st.y)).rgb;
-                vec3 d = texture2D(uTexSampler, uv + vec2(-st.x, 0.0)).rgb;
-                vec3 f = texture2D(uTexSampler, uv + vec2(st.x, 0.0)).rgb;
-                vec3 g = texture2D(uTexSampler, uv + vec2(-st.x, st.y)).rgb;
-                vec3 h = texture2D(uTexSampler, uv + vec2(0.0, st.y)).rgb;
-                vec3 i = texture2D(uTexSampler, uv + vec2(st.x, st.y)).rgb;
+                vec2 st = uTexelSize * uKernel.x;
+                vec3 tl = sampleRgb(uv + vec2(-st.x, -st.y));
+                vec3 tc = sampleRgb(uv + vec2(0.0, -st.y));
+                vec3 tr = sampleRgb(uv + vec2(st.x, -st.y));
+                vec3 ml = sampleRgb(uv + vec2(-st.x, 0.0));
+                vec3 mr = sampleRgb(uv + vec2(st.x, 0.0));
+                vec3 bl = sampleRgb(uv + vec2(-st.x, st.y));
+                vec3 bc = sampleRgb(uv + vec2(0.0, st.y));
+                vec3 br = sampleRgb(uv + vec2(st.x, st.y));
 
                 vec3 lin = toLinear(e);
 
                 // ---------------- Stage B · EWA Lanczos SR (sigmoid space) ----------------
-                if (uSrGain > 0.0) {
-                    vec3 sa = sigG(a); vec3 sb = sigG(b); vec3 sc = sigG(c);
-                    vec3 sd = sigG(d); vec3 se = sigmoidize(lin); vec3 sf = sigG(f);
-                    vec3 sg = sigG(g); vec3 sh = sigG(h); vec3 si = sigG(i);
-
-                    // EWA reconstruction: radial weights 1 (centre), w(1) axial, w(sqrt2) diagonal
-                    vec3 ewa = (se + uWAxial * (sb + sd + sf + sh) + uWDiag * (sa + sc + sg + si)) * uWNorm;
-
-                    // Local-contrast adaptive weight (CAS-style) on the gamma neighbourhood
-                    vec3 mnCross = min(min(min(d, e), min(f, b)), h);
-                    vec3 mxCross = max(max(max(d, e), max(f, b)), h);
-                    vec3 mnBox = min(mnCross, min(min(a, c), min(g, i)));
-                    vec3 mxBox = max(mxCross, max(max(a, c), max(g, i)));
-                    vec3 mnRGB = (mnCross + mnBox) * 0.5;
-                    vec3 mxRGB = (mxCross + mxBox) * 0.5;
-                    vec3 ampRGB = sqrt(clamp(min(mnRGB, 1.0 - mxRGB) / max(mxRGB, vec3(0.0001)), 0.0, 1.0));
-
-                    // Don't sharpen what deband just flattened
-                    float gain = uSrGain * (1.0 - 0.75 * debandW);
-                    vec3 sr = se + (ewa - se) * (gain * (0.35 + 0.65 * ampRGB));
-
-                    // Anti-ringing: clamp to the 3x3 range (sigmoid is monotonic) with a small margin
-                    vec3 sMn = min(min(min(sa, sb), min(sc, sd)), min(min(se, sf), min(min(sg, sh), si)));
-                    vec3 sMx = max(max(max(sa, sb), max(sc, sd)), max(max(se, sf), max(max(sg, sh), si)));
-                    vec3 margin = (sMx - sMn) * (1.0 - uAntiring) * 0.5;
-                    sr = clamp(sr, sMn - margin, sMx + margin);
-
+                if (uSr.x > 0.0) {
+                    vec3 center = sigmoidize(lin);
+                    vec3 axial = sigG(tc) + sigG(ml) + sigG(mr) + sigG(bc);
+                    vec3 diag = sigG(tl) + sigG(tr) + sigG(bl) + sigG(br);
+                    vec3 ewa = (center + uKernel.y * axial + uKernel.z * diag) * uKernel.w;
+                    vec3 nearLeft = sampleRgb(uv - vec2(uTexelSize.x, 0.0));
+                    vec3 nearRight = sampleRgb(uv + vec2(uTexelSize.x, 0.0));
+                    vec3 nearTop = sampleRgb(uv - vec2(0.0, uTexelSize.y));
+                    vec3 nearBottom = sampleRgb(uv + vec2(0.0, uTexelSize.y));
+                    vec3 nearMean = (sigG(nearLeft) + sigG(nearRight) + sigG(nearTop) + sigG(nearBottom)) * 0.25;
+                    vec3 nearMin = min(min(nearLeft, nearRight), min(nearTop, nearBottom));
+                    vec3 nearMax = max(max(nearLeft, nearRight), max(nearTop, nearBottom));
+                    vec3 lo = min(min(nearMin, e), min(min(tl, tr), min(bl, br)));
+                    vec3 hi = max(max(nearMax, e), max(max(tl, tr), max(bl, br)));
+                    float edge = max(max(hi.r - lo.r, hi.g - lo.g), hi.b - lo.b);
+                    float hardEdge = smoothstep(0.23, 0.65, edge);
+                    float weight = (1.0 - 0.75 * debandW) * (1.0 - 0.60 * hardEdge);
+                    vec3 detail = uSr.x * (ewa - center) + uSr.y * (center - nearMean)
+                        + uSr.z * (nearMean - diag * 0.25);
+                    vec3 margin = vec3((1.0 - uSr.w) * min(edge, 0.035) * (1.0 - hardEdge));
+                    vec3 sr = clamp(center + weight * detail, sigG(lo) - margin, sigG(hi) + margin);
                     lin = clamp(unsigmoidize(sr), 0.0, 1.0);
                 }
 
                 // ---------------- Stage C · SDR -> HDR (inverse tone mapping) ----------------
                 if (uItm > 0.5) {
-                    float Y = max(dot(lin, LUMA), 1e-5);
-                    vec3 gauss = (e0 * 4.0 + (b + d + f + h) * 2.0 + (a + c + g + i)) * 0.0625;
-                    float Yl = max(dot(toLinear(gauss), LUMA), 1e-5);
+                    float y = clamp(dot(lin, LUMA), 0.0, 1.0);
+                    float baseY = dot(toLinear(e0), LUMA);
+                    vec3 axial = toLinear(tc) + toLinear(ml) + toLinear(mr) + toLinear(bc);
+                    vec3 diag = toLinear(tl) + toLinear(tr) + toLinear(bl) + toLinear(br);
+                    float localY = (4.0 * baseY + dot(2.0 * axial + diag, LUMA)) * 0.0625;
+                    float logDetail = log2(max(baseY, 1e-5)) - log2(max(localY, 1e-5));
+                    float contrast = 0.65 * smoothstep(0.13, 0.44, y)
+                        * (1.0 - smoothstep(0.33, 0.92, abs(logDetail)));
+                    float mappedY = expandLuma(y);
+                    float delta = mappedY * (exp2(clamp(logDetail, -0.25, 0.25) * contrast) - 1.0);
+                    float room = delta > 0.0 ? 1.0 - mappedY : mappedY;
+                    mappedY += delta * room / max(room + abs(delta), 1e-5);
 
-                    float knee = uItmCurve.x;
-                    // Shadow toe: deepen the black floor up to toe-depth, fading out by 0.18
-                    float Yn = Y * mix(1.0 - uItmCurve.z, 1.0, smoothstep(0.0, 0.18, Y));
-                    // BT.2390-style Hermite expansion above the knee (unit slope in, shoulder slope at peak)
-                    if (Y > knee) {
-                        float span = 1.0 - knee;
-                        float t = clamp((Y - knee) / span, 0.0, 1.0);
-                        float t2 = t * t;
-                        float t3 = t2 * t;
-                        float m0 = span;
-                        float m1 = span * uItmCurve.y;
-                        Yn = (2.0 * t3 - 3.0 * t2 + 1.0) * knee + (t3 - 2.0 * t2 + t) * m0
-                            + (-2.0 * t3 + 3.0 * t2) + (t3 - t2) * m1;
-                    }
-                    // hdr-contrast-recovery: re-inject local log-luminance detail in highlights
-                    float logDetail = clamp(log2(Y) - log2(Yl), -1.0, 1.0);
-                    float hiW = smoothstep(knee, knee + 0.30, Y);
-                    Yn *= exp2(logDetail * uItmCurve.w * hiW);
-                    Yn = clamp(Yn, 0.0, 1.0);
-
-                    vec3 col = lin * (Yn / Y);
-                    // Midtone chroma expansion + tone-mapping-desaturate on speculars
-                    float midW = smoothstep(0.02, 0.18, Yn) * (1.0 - smoothstep(0.60, uItmColor.z, Yn));
-                    float sat = 1.0 + (uItmColor.x - 1.0) * midW;
-                    float desat = uItmColor.y * smoothstep(uItmColor.z, 1.0, Yn);
-                    col = vec3(Yn) + (col - vec3(Yn)) * sat * (1.0 - desat);
-                    // gamut-mapping-mode=desaturate: pull out-of-range colours toward luma
+                    vec3 rgb = toGamma(lin);
+                    float warm = smoothstep(0.025, 0.10, rgb.r - rgb.g)
+                        * smoothstep(0.015, 0.07, rgb.g - rgb.b)
+                        * (1.0 - smoothstep(0.26, 0.46, rgb.r - rgb.b));
+                    float vibrance = 1.0 + 0.26 * smoothstep(0.08, 0.30, y) * (1.0 - 0.80 * warm);
+                    float specular = smoothstep(0.85, 1.0, y);
+                    vec3 col = vec3(mappedY) + (lin - vec3(y)) * (mappedY / max(y, 1e-5))
+                        * vibrance * (1.0 - 0.36 * specular);
                     float cMax = max(max(col.r, col.g), col.b);
                     float cMin = min(min(col.r, col.g), col.b);
-                    float k = 1.0;
-                    if (cMax > 1.0) k = min(k, (1.0 - Yn) / max(cMax - Yn, 1e-5));
-                    if (cMin < 0.0) k = min(k, Yn / max(Yn - cMin, 1e-5));
-                    lin = vec3(Yn) + (col - vec3(Yn)) * clamp(k, 0.0, 1.0);
+                    float gamut = min(1.0, (1.0 - mappedY) / max(cMax - mappedY, 1e-5));
+                    gamut = min(gamut, mappedY / max(mappedY - cMin, 1e-5));
+                    lin = vec3(mappedY) + (col - vec3(mappedY)) * clamp(gamut, 0.0, 1.0);
                 }
 
-                gl_FragColor = vec4(clamp(toGamma(lin), 0.0, 1.0), cSample.a);
+                return clamp(toGamma(lin), 0.0, 1.0);
             }
         """
+
+        private const val FRAGMENT_SHADER = """
+            #version 100
+            precision highp float;
+            uniform sampler2D uTexSampler;
+            varying vec2 vTexSamplingCoord;
+            $ENHANCE_UNIFORMS
+            $COLOR_MATH
+            vec3 sampleRgb(vec2 uv) { return texture2D(uTexSampler, uv).rgb; }
+            $ENHANCE_BODY
+            void main() {
+                vec4 sampleColor = texture2D(uTexSampler, vTexSamplingCoord);
+                gl_FragColor = uActive < 0.5 ? sampleColor
+                    : vec4(enhance(vTexSamplingCoord, sampleColor.rgb), sampleColor.a);
+            }
+        """
+
+        private const val TEXTURE_SHADER = """
+            uniform shader video;
+            uniform float2 uSize;
+            $ENHANCE_UNIFORMS
+            $COLOR_MATH
+            vec3 asGamma(vec4 color) {
+                return toGamma(toLinearSrgb(half3(color.rgb / max(color.a, 1e-5))));
+            }
+            vec3 sampleRgb(vec2 xy) {
+                return asGamma(video.eval(clamp(xy, vec2(0.5), uSize - vec2(0.5))));
+            }
+            $ENHANCE_BODY
+            half4 main(float2 xy) {
+                half4 sampleColor = video.eval(xy);
+                if (uActive < 0.5 || sampleColor.a <= 0.0) return sampleColor;
+                vec3 rgb = enhance(xy, asGamma(sampleColor));
+                return half4(fromLinearSrgb(half3(toLinear(rgb))) * sampleColor.a, sampleColor.a);
+            }
+        """
+
+        @RequiresApi(33)
+        internal fun textureEffect(level: Int, sdrToHdr: Boolean, width: Float, height: Float): RenderEffect {
+            val preset = if (level >= 2) PRESET_STRONG else PRESET_STANDARD
+            val shader = RuntimeShader(TEXTURE_SHADER).apply {
+                setFloatUniform("uSize", width, height)
+                setFloatUniform("uTexelSize", 1f, 1f)
+                setFloatUniform("uActive", 1f)
+                setFloatUniform("uDebandThreshold", preset.debandThreshold)
+                setFloatUniform("uSr", if (level > 0) preset.sr else SR_OFF)
+                setFloatUniform("uKernel", preset.kernel)
+                setFloatUniform("uSigmoid", SIGMOID_PARAMS)
+                setFloatUniform("uItm", if (sdrToHdr) 1f else 0f)
+            }
+            return RenderEffect.createRuntimeShaderEffect(shader, "video")
+        }
+    }
+}
+
+private val enhanceMainHandler by lazy { Handler(Looper.getMainLooper()) }
+
+private fun onEnhanceMain(action: () -> Unit) {
+    if (Looper.myLooper() == Looper.getMainLooper()) action() else enhanceMainHandler.post { action() }
+}
+
+private val boostedWindows = WeakHashMap<Window, Float>()
+
+/** Request wide-gamut composition and a window-local brightness override, not an HDR output mode. */
+fun applyHdrWindowBoost(activity: Activity?, enabled: Boolean) = onEnhanceMain {
+    if (activity == null || activity.isDestroyed) return@onEnhanceMain
+    val window = activity.window
+    val mode = if (enabled) ActivityInfo.COLOR_MODE_WIDE_COLOR_GAMUT else ActivityInfo.COLOR_MODE_DEFAULT
+    if (window.colorMode != mode) window.colorMode = mode
+    setHdrBrightness(activity, enabled)
+}
+
+private fun setHdrBrightness(activity: Activity, enabled: Boolean) {
+    val window = activity.window
+    val attrs = window.attributes
+    val target = if (enabled) {
+        val existing = boostedWindows[window]
+        if (existing != null && attrs.screenBrightness == existing) return
+        val baseline = if (attrs.screenBrightness >= 0f) attrs.screenBrightness else {
+            runCatching {
+                Settings.System.getInt(activity.contentResolver, Settings.System.SCREEN_BRIGHTNESS, 128) / 255f
+            }.getOrDefault(0.5f)
+        }
+        (baseline + 0.18f).coerceIn(0.35f, 1.0f).also { boostedWindows[window] = it }
+    } else {
+        boostedWindows.remove(window)
+        WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+    }
+    if (attrs.screenBrightness != target) {
+        attrs.screenBrightness = target
+        window.attributes = attrs
+    }
+}
+
+/** Build the API 33+ fallback for an SDR TextureView. Returns null when disabled or unavailable. */
+@androidx.annotation.OptIn(UnstableApi::class)
+fun buildTextureRenderEffect(level: Int, sdrToHdr: Boolean, width: Float, height: Float): RenderEffect? {
+    if (Build.VERSION.SDK_INT < 33 || (level <= 0 && !sdrToHdr) ||
+        !width.isFinite() || !height.isFinite() || width < 1f || height < 1f
+    ) return null
+    return runCatching { VideoEnhanceEffect.textureEffect(level.coerceIn(0, 2), sdrToHdr, width, height) }
+        .onFailure { Log.w("IDJ", "Could not create TextureView enhancement shader", it) }
+        .getOrNull()
+}
+
+/**
+ * Bind the playback window and video view once available, and resync when the view or HDR state
+ * changes. Setting the same effect's level or SDR flag then updates this binding automatically.
+ * Call [clearWindowAndFallback] on disposal. The view's RenderEffect slot belongs to this binding.
+ */
+@androidx.annotation.OptIn(UnstableApi::class)
+fun syncWindowAndFallback(activity: Activity?, textureView: TextureView?, effect: VideoEnhanceEffect, isNativeHdr: Boolean) {
+    effect.syncUi(activity, textureView, isNativeHdr)
+}
+
+@androidx.annotation.OptIn(UnstableApi::class)
+fun clearWindowAndFallback(effect: VideoEnhanceEffect) {
+    effect.clearUi()
+}
+
+@androidx.annotation.OptIn(UnstableApi::class)
+private class EnhanceUiBinding(
+    private val effect: VideoEnhanceEffect,
+    activity: Activity?,
+    view: TextureView?,
+) : View.OnAttachStateChangeListener, View.OnLayoutChangeListener {
+    private val activityRef = WeakReference(activity)
+    private val viewRef = WeakReference(view)
+    private var cachedFallback: FallbackKey? = null
+    private var fallbackApplied = false
+    private var ownsBrightness = false
+
+    private data class FallbackKey(val level: Int, val hdr: Boolean, val width: Int, val height: Int)
+
+    init {
+        view?.addOnAttachStateChangeListener(this)
+        view?.addOnLayoutChangeListener(this)
+    }
+
+    fun matches(activity: Activity?, view: TextureView?) = activityRef.get() === activity && viewRef.get() === view
+
+    fun sync() {
+        val view = viewRef.get()
+        if (view != null && !view.isAttachedToWindow) return
+        val nativeHdr = effect.isNativeHdr()
+        val hdr = effect.sdrToHdr && !nativeHdr
+        activityRef.get()?.takeUnless { it.isDestroyed }?.let { activity ->
+            if (hdr) {
+                applyHdrWindowBoost(activity, true)
+                ownsBrightness = true
+            } else {
+                if (ownsBrightness) setHdrBrightness(activity, false)
+                ownsBrightness = false
+                val mode = if (nativeHdr) ActivityInfo.COLOR_MODE_WIDE_COLOR_GAMUT else ActivityInfo.COLOR_MODE_DEFAULT
+                if (activity.window.colorMode != mode) activity.window.colorMode = mode
+            }
+        }
+        if (Build.VERSION.SDK_INT < 33 || view == null) return
+        val level = effect.level.coerceIn(0, 2)
+        val desired = if (!nativeHdr && effect.framesProcessed == 0L && (level > 0 || hdr) &&
+            view.isHardwareAccelerated && view.width > 0 && view.height > 0
+        ) FallbackKey(level, hdr, view.width, view.height) else null
+        if (desired == cachedFallback) return
+        cachedFallback = desired
+        val renderEffect = desired?.let { buildTextureRenderEffect(it.level, it.hdr, it.width.toFloat(), it.height.toFloat()) }
+        if (renderEffect != null || fallbackApplied) view.setRenderEffect(renderEffect)
+        fallbackApplied = renderEffect != null
+    }
+
+    private fun clearFallback(view: View) {
+        if (Build.VERSION.SDK_INT >= 33 && fallbackApplied) view.setRenderEffect(null)
+        cachedFallback = null
+        fallbackApplied = false
+    }
+
+    override fun onViewAttachedToWindow(view: View) = sync()
+
+    override fun onViewDetachedFromWindow(view: View) {
+        clearFallback(view)
+        resetWindow()
+    }
+
+    override fun onLayoutChange(view: View, left: Int, top: Int, right: Int, bottom: Int,
+        oldLeft: Int, oldTop: Int, oldRight: Int, oldBottom: Int) = sync()
+
+    private fun resetWindow() {
+        activityRef.get()?.takeUnless { it.isDestroyed }?.let { activity ->
+            if (ownsBrightness) applyHdrWindowBoost(activity, false)
+            else activity.window.colorMode = ActivityInfo.COLOR_MODE_DEFAULT
+        }
+        ownsBrightness = false
+    }
+
+    fun close() {
+        viewRef.get()?.let { view ->
+            view.removeOnAttachStateChangeListener(this)
+            view.removeOnLayoutChangeListener(this)
+            clearFallback(view)
+        }
+        resetWindow()
     }
 }
 

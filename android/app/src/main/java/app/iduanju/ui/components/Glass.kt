@@ -501,7 +501,13 @@ fun GlassTabBar(
     }
 }
 
-/** Vertical floating glass navigation rail for Expanded tablet / desktop widths (>= 840dp). */
+/**
+ * Vertical floating glass navigation rail for Expanded tablet / desktop widths (>= 840dp).
+ *
+ * 84 dp slot = 8 dp gutters + a 68 dp glass column. The search button sits at the same height as the pages' 46 dp
+ * top search capsule (status bar + 6 dp), the tab column is vertically centred in the remaining height, and the
+ * active tab gets a crisp 48×30 pill behind its icon (Material 3 rail indicator) plus a semibold label.
+ */
 @Composable
 fun GlassNavigationRail(
     selected: Int,
@@ -520,54 +526,71 @@ fun GlassNavigationRail(
             .fillMaxHeight()
             .statusBarsPadding()
             .navigationBarsPadding()
-            .padding(vertical = 16.dp, horizontal = 8.dp),
+            .padding(top = 6.dp, bottom = 16.dp, start = 8.dp, end = 8.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         if (onSearch != null && searchIcon != null) {
             Box(
                 Modifier
-                    .size(56.dp)
-                    .glassSurface(shape = PillShape, backdrop = backdrop, shadowRadius = 14.dp, activeOverlay = if (searchSelected) c.text.copy(alpha = if (c.dark) 0.14f else 0.10f) else Color.Transparent)
-                    .clickable(onClick = onSearch),
+                    .size(56.dp, 46.dp)
+                    .glassSurface(
+                        shape = PillShape,
+                        backdrop = backdrop,
+                        shadowRadius = 14.dp,
+                        activeOverlay = if (searchSelected) c.accent.copy(alpha = if (c.dark) 0.16f else 0.12f) else Color.Transparent,
+                    )
+                    .pressClick(0.94f, label = "搜索", onClick = onSearch),
                 contentAlignment = Alignment.Center,
             ) {
                 searchIcon(searchSelected)
             }
         }
-
+        Spacer(Modifier.weight(1f))
         Column(
             Modifier
-                .fillMaxWidth()
+                .width(68.dp)
                 .glassSurface(shape = RailShape, backdrop = backdrop, shadowRadius = 14.dp)
-                .padding(6.dp),
+                .padding(vertical = 10.dp, horizontal = 4.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(6.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             items.forEachIndexed { i, (label, icon) ->
                 val on = i == selected && !searchSelected
-                Box(
+                val pill by animateFloatAsState(if (on) 1f else 0f, spring(dampingRatio = 0.8f, stiffness = 520f), label = "railPill")
+                Column(
                     Modifier
                         .fillMaxWidth()
-                        .height(56.dp)
-                        .clip(RoundedCornerShape(22.dp))
-                        .background(if (on) c.text.copy(alpha = if (c.dark) 0.12f else 0.09f) else Color.Transparent)
+                        .height(60.dp)
+                        .clip(RoundedCornerShape(18.dp))
                         .clickable { onSelect(i) },
-                    contentAlignment = Alignment.Center,
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center,
                 ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        icon(on)
-                        Spacer(Modifier.height(3.dp))
-                        Text(
-                            label,
-                            color = if (on) c.text else c.secondary,
-                            fontSize = 11.sp,
-                            fontWeight = if (on) FontWeight.SemiBold else FontWeight.Medium,
+                    Box(Modifier.size(48.dp, 30.dp), contentAlignment = Alignment.Center) {
+                        Box(
+                            Modifier
+                                .matchParentSize()
+                                .graphicsLayer { scaleX = 0.6f + 0.4f * pill; alpha = pill }
+                                .clip(PillShape)
+                                .background(c.text.copy(alpha = if (c.dark) 0.16f else 0.10f)),
                         )
+                        icon(on)
                     }
+                    Spacer(Modifier.height(3.dp))
+                    Text(
+                        label,
+                        color = if (on) c.text else c.secondary,
+                        fontSize = 11.sp,
+                        lineHeight = 13.sp,
+                        maxLines = 1,
+                        fontWeight = if (on) FontWeight.SemiBold else FontWeight.Medium,
+                    )
                 }
             }
         }
+        Spacer(Modifier.weight(1f))
+        // Keep the tab column optically centred under the search button.
+        Spacer(Modifier.height(46.dp))
     }
 }
 

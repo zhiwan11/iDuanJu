@@ -48,6 +48,7 @@ import app.iduanju.core.hongguo.HGRankGenre
 import app.iduanju.core.hongguo.HGRankSub
 import app.iduanju.core.hongguo.HGSeries
 import app.iduanju.ui.components.LocalLayoutMetrics
+import app.iduanju.ui.components.SizeTier
 import app.iduanju.ui.components.SearchDockState
 import app.iduanju.ui.components.glassSurface
 import app.iduanju.ui.home.HomeFmt
@@ -164,7 +165,8 @@ fun SearchScreen(
         if (!useBottomSearchDock) {
             // Standalone / Tablet Rail SearchField: elevated capsule 38 high + 取消/搜索
             Row(Modifier.padding(horizontal = 16.dp).padding(top = 6.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                Row(Modifier.weight(1f).height(38.dp).clip(RoundedCornerShape(50)).background(c.elevated).padding(horizontal = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+                // On the tablet rail the field matches the rail's 46 dp search button so both tops line up.
+                Row(Modifier.weight(1f).height(if (metrics.useRail) 46.dp else 38.dp).clip(RoundedCornerShape(50)).background(c.elevated).padding(horizontal = 14.dp), verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.Filled.Search, null, tint = c.secondary, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
                     Box(Modifier.weight(1f)) {
@@ -233,7 +235,8 @@ fun SearchScreen(
             )
           } else {
             LazyVerticalGrid(
-                GridCells.Fixed(metrics.wideCardCols),
+                // Section blocks span the full width; the #N rank rows flow into 1 / 2 / 3 columns.
+                GridCells.Fixed(metrics.listCols),
                 Modifier.fillMaxSize(),
                 state = discoverGrid,
                 contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 10.dp, bottom = gridBottomPadding),
@@ -277,19 +280,22 @@ fun SearchScreen(
                         }
                     }
                 }
+                // Tablets show 4 / 5 hero rank cards so each card stays poster-sized instead of 400 dp wide.
+                val topCount = when (metrics.tier) { SizeTier.Compact -> 3; SizeTier.Medium -> 4; SizeTier.Expanded -> 5 }
+                val gap = if (metrics.tier == SizeTier.Compact) 8.dp else 12.dp
                 item(span = { GridItemSpan(maxLineSpan) }) {
                     Column(Modifier.padding(top = 6.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text("搜索实时排行", color = c.text, fontSize = 20.sp, fontWeight = FontWeight.Bold)
                         when {
                             hot.isEmpty() && hotErr != null -> Text(hotErr!!, color = c.secondary, fontSize = 13.sp)
-                            hot.isEmpty() -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { repeat(3) { Box(Modifier.weight(1f).aspectRatio(0.6f).clip(RoundedCornerShape(12.dp)).background(c.elevated.copy(0.6f))) } }
-                            else -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { hot.take(3).forEachIndexed { i, s -> Box(Modifier.weight(1f)) { TopRankCard(s, i + 1, onOpenDetail) } } }
+                            hot.isEmpty() -> Row(horizontalArrangement = Arrangement.spacedBy(gap)) { repeat(topCount) { Box(Modifier.weight(1f).aspectRatio(0.6f).clip(RoundedCornerShape(12.dp)).background(c.elevated.copy(0.6f))) } }
+                            else -> Row(horizontalArrangement = Arrangement.spacedBy(gap)) { hot.take(topCount).forEachIndexed { i, s -> Box(Modifier.weight(1f)) { TopRankCard(s, i + 1, onOpenDetail) } } }
                         }
                     }
                 }
                 // #4…: full-width rows so cover / title / tags / heat / 集数 always stay on single clean lines
-                val rest = hot.drop(3)
-                items(rest.size, span = { GridItemSpan(maxLineSpan) }) { i -> CompactRankRow(rest[i], i + 4, onOpenDetail) }
+                val rest = hot.drop(topCount)
+                items(rest.size) { i -> CompactRankRow(rest[i], i + topCount + 1, onOpenDetail) }
             }
           }
         } else {
