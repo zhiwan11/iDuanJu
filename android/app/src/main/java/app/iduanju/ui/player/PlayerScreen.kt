@@ -95,6 +95,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
     var fillMode by remember { mutableStateOf(PlayerPrefs.getFillMode(ctx)) }
     var ambientMode by remember { mutableStateOf(PlayerPrefs.getAmbientMode(ctx)) }
     var enhanceLevel by remember { mutableIntStateOf(PlayerPrefs.getEnhanceLevel(ctx)) }
+    var sdrToHdr by remember { mutableStateOf(PlayerPrefs.getSdrToHdr(ctx)) }
     var textureView by remember { mutableStateOf<android.view.TextureView?>(null) }
     var ambientTop by remember { mutableStateOf(Color.Black) }
     var ambientBottom by remember { mutableStateOf(Color.Black) }
@@ -128,6 +129,8 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
         if (landscape) ic.hide(androidx.core.view.WindowInsetsCompat.Type.systemBars()) else ic.show(androidx.core.view.WindowInsetsCompat.Type.systemBars())
     }
     var tags by remember { mutableStateOf(TechTags()) }
+    /** Native HDR10 / HLG / Dolby Vision: no SDR→HDR, no 8-bit getBitmap ambient sampling. */
+    val isNativeHdr = remember(tags.range) { tags.range != null && tags.range != "SDR" }
     var retry by remember { mutableIntStateOf(0) }
     var detailRetry by remember { mutableIntStateOf(0) }
 
@@ -139,13 +142,23 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
             androidx.media3.exoplayer.source.DefaultMediaSourceFactory(androidx.media3.datasource.DefaultDataSource.Factory(ctx, httpFactory))
         ).build().also { it.playWhenReady = true }
     }
-    val casEffect = remember(player) { CasSharpenEffect(enhanceLevel) }
-    var casFailed by remember(player) { mutableStateOf(false) }
-    LaunchedEffect(player, casFailed) {
-        installVideoEnhance(player, if (casFailed) null else casEffect)
+    // One persistent GlEffect; level / sdrToHdr are @Volatile and picked up on the next frame.
+    val enhanceEffect = remember(player) { VideoEnhanceEffect(enhanceLevel, sdrToHdr && !isNativeHdr) }
+    var enhanceFailed by remember(player) { mutableStateOf(false) }
+    fun syncEnhance() {
+        enhanceEffect.level = if (enhanceFailed) 0 else enhanceLevel
+        enhanceEffect.sdrToHdr = !enhanceFailed && sdrToHdr && !isNativeHdr
     }
-    LaunchedEffect(enhanceLevel) {
-        casEffect.level = if (casFailed) 0 else enhanceLevel
+    LaunchedEffect(player, enhanceFailed) {
+        installVideoEnhance(player, if (enhanceFailed) null else enhanceEffect)
+    }
+    LaunchedEffect(enhanceLevel, sdrToHdr, isNativeHdr, enhanceFailed) { syncEnhance() }
+    // Wide colour gamut for SDR→HDR / native HDR. Not COLOR_MODE_HDR: on a TextureView that would
+    // dim the Compose overlays and break the getBitmap() ambient readback.
+    LaunchedEffect(sdrToHdr, isNativeHdr, enhanceFailed) {
+        activity?.window?.colorMode =
+            if ((sdrToHdr && !enhanceFailed) || isNativeHdr) android.content.pm.ActivityInfo.COLOR_MODE_WIDE_COLOR_GAMUT
+            else android.content.pm.ActivityInfo.COLOR_MODE_DEFAULT
     }
 
     DisposableEffect(player) {
@@ -164,19 +177,22 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                 }
             }
             override fun onPlayerError(e: PlaybackException) {
-                if (e.errorCode in 7000..7009 && !casFailed) {
+                if (e.errorCode in 7000..7009 && !enhanceFailed) {
                     android.util.Log.w("IDJ", "VideoFrameProcessor error ${e.errorCode}, falling back to direct surface", e)
-                    casFailed = true
-                    casEffect.level = 0
+                    enhanceFailed = true
+                    enhanceEffect.level = 0
+                    enhanceEffect.sdrToHdr = false
                     enhanceLevel = 0
+                    sdrToHdr = false
                     PlayerPrefs.setEnhanceLevel(ctx, 0)
+                    PlayerPrefs.setSdrToHdr(ctx, false)
                     val resumePos = player.currentPosition.coerceAtLeast(0L)
                     val shouldPlay = player.playWhenReady
                     installVideoEnhance(player, null)
                     if (resumePos > 0L) player.seekTo(resumePos)
                     player.prepare()
                     player.playWhenReady = shouldPlay
-                    seekHint = "当前设备不支持 GPU 锐化，已自动回退"
+                    seekHint = "当前设备不支持 GPU 画质增强，已自动回退"
                     return
                 }
                 if (queue == null) error = "播放失败：${e.errorCodeName}"
@@ -220,8 +236,10 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
         ambientRight = Color.Black
         ambientBitmap = null
     }
-    LaunchedEffect(ambientMode, fillMode, inPip, playing, textureView, ambientSampleTick) {
-        if (!ambientMode || fillMode || inPip) return@LaunchedEffect
+    val hdrAmbientLocked = isNativeHdr || (sdrToHdr && !enhanceFailed)
+    LaunchedEffect(ambientMode, fillMode, inPip, hdrAmbientLocked, playing, textureView, ambientSampleTick) {
+        // Locked off whenever native HDR/DV or SDR->HDR is active.
+        if (!ambientMode || fillMode || inPip || hdrAmbientLocked) return@LaunchedEffect
         val tv = textureView ?: return@LaunchedEffect
         while (isActive) {
             val bmp = if (tv.isAvailable) runCatching { tv.getBitmap(24, 24) }.getOrNull() else null
@@ -289,8 +307,8 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
             val local=java.io.File(ctx.cacheDir,"ui-color-bars.mp4")
             if(!local.exists())withContext(Dispatchers.IO){ctx.assets.open("player_landscape.mp4").use{input->local.outputStream().use{input.copyTo(it)}}}
             player.setMediaItem(MediaItem.fromUri(android.net.Uri.fromFile(local)))
-            casEffect.level = if (casFailed) 0 else enhanceLevel
-            installVideoEnhance(player, if (casFailed) null else casEffect)
+            syncEnhance()
+            installVideoEnhance(player, if (enhanceFailed) null else enhanceEffect)
             status="";player.prepare();player.play()
             return@LaunchedEffect
         }
@@ -307,8 +325,8 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
             )
             p.note?.let { android.util.Log.i("IDJ", "hls: $it") }
             player.setPlaybackSpeed(speed)
-            casEffect.level = if (casFailed) 0 else enhanceLevel
-            installVideoEnhance(player, if (casFailed) null else casEffect)
+            syncEnhance()
+            installVideoEnhance(player, if (enhanceFailed) null else enhanceEffect)
             val resume = lib.progress(seriesId)
             if (resume != null && resume.episodeIndex == epIndex && resume.seconds > 3 && resume.fraction < 0.95f) player.seekTo((resume.seconds * 1000).toLong())
             player.prepare(); player.play()
@@ -357,6 +375,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
     DisposableEffect(Unit) {
         onDispose {
             activity?.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            activity?.window?.colorMode = android.content.pm.ActivityInfo.COLOR_MODE_DEFAULT
             if (landscape) {
                 activity?.window?.let { w -> androidx.core.view.WindowCompat.getInsetsController(w, w.decorView).show(androidx.core.view.WindowInsetsCompat.Type.systemBars()) }
             }
@@ -476,7 +495,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
             rightColor = ambientRight,
             glowBitmap = ambientBitmap,
             videoAspectRatio = videoAspectRatio,
-            visible = ambientMode && !fillMode && !inPip,
+            visible = ambientMode && !fillMode && !inPip && !hdrAmbientLocked,
         )
         AndroidView(
             factory = {
@@ -609,7 +628,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                         Text(detail?.title.orEmpty(),color=Color.White,fontSize=16.sp,fontWeight=FontWeight.Bold,maxLines=1,overflow=androidx.compose.ui.text.style.TextOverflow.Ellipsis)
                         Text(if (queue != null) "第 ${epIndex + 1} 章 · ${detail?.episodes?.getOrNull(epIndex)?.title.orEmpty()}" else "第 ${detail?.episodes?.getOrNull(epIndex)?.ep ?: 1} 集 / 共 ${detail?.episodes?.size ?: 0} 集",maxLines=1,overflow=androidx.compose.ui.text.style.TextOverflow.Ellipsis,color=Color.White.copy(0.7f),fontSize=12.sp)
                     }
-                    TechLine(tags,Modifier.padding(end=14.dp))
+                    TechLine(tags, Modifier.padding(end = 14.dp), enhanceLevel, sdrToHdr)
                     if (queue == null) LandChip(Icons.Filled.Repeat,"连播",if(autoNext)"开" else "关",autoNext,showChrome&&!locked){autoNext=!autoNext}
                     Spacer(Modifier.width(10.dp))
                     CircleBtn(if(locked)Icons.Filled.Lock else Icons.Filled.LockOpen,if(locked)"解锁" else "锁屏",showChrome){locked=!locked}
@@ -629,7 +648,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                     CircleBtn(Icons.Filled.MoreHoriz, "更多", showChrome) { panel = if (panel == "more") null else "more" }
                 }
             }
-            if (!landscape) TechLine(tags, Modifier.fillMaxWidth().padding(top = 6.dp))
+            if (!landscape) TechLine(tags, Modifier.fillMaxWidth().padding(top = 6.dp), enhanceLevel, sdrToHdr)
         }
         androidx.compose.animation.AnimatedVisibility(!inPip && showChrome && ready && !centerSuppressed && !locked && panel == null, Modifier.align(Alignment.Center),
             enter = fadeIn(DS.panel()) + androidx.compose.animation.scaleIn(DS.panel(), initialScale = 0.92f),
@@ -755,6 +774,8 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                             fillMode = fillMode,
                             ambientMode = ambientMode,
                             enhanceLevel = enhanceLevel,
+                            sdrToHdr = sdrToHdr,
+                            nativeHdrRange = if (isNativeHdr) tags.range else null,
                             sleepMode = sleepMode,
                             sleepEndMs = sleepEndMs,
                             autoNext = autoNext,
@@ -766,17 +787,32 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                                 seekHint = if (fill) "画面：铺满裁剪" else "画面：完整适应"
                             },
                             onAmbientMode = { on ->
-                                ambientMode = on
-                                PlayerPrefs.setAmbientMode(ctx, on)
-                                seekHint = if (on) "氛围光晕：已开启" else "氛围光晕：已关闭"
+                                when {
+                                    isNativeHdr -> seekHint = "原生 ${tags.range} 模式下不可开启氛围光晕"
+                                    sdrToHdr -> seekHint = "HDR 模式下不可开启氛围光晕，请先关闭 SDR 转 HDR"
+                                    else -> {
+                                        ambientMode = on
+                                        PlayerPrefs.setAmbientMode(ctx, on)
+                                        seekHint = if (on) "氛围光晕：已开启" else "氛围光晕：已关闭"
+                                    }
+                                }
                             },
                             onEnhance = { lvl ->
                                 enhanceLevel = lvl
                                 PlayerPrefs.setEnhanceLevel(ctx, lvl)
                                 seekHint = when (lvl) {
-                                    1 -> "画质增强：标准超分锐化"
-                                    2 -> "画质增强：强效超分锐化"
-                                    else -> "画质增强：已关闭"
+                                    1 -> "AI 超分辨率：标准"
+                                    2 -> "AI 超分辨率：强效"
+                                    else -> "AI 超分辨率：已关闭"
+                                }
+                            },
+                            onSdrToHdr = { on ->
+                                if (isNativeHdr) {
+                                    seekHint = "当前片源已是原生 ${tags.range}"
+                                } else {
+                                    sdrToHdr = on
+                                    PlayerPrefs.setSdrToHdr(ctx, on)
+                                    seekHint = if (on) "SDR 转 HDR：已开启" else "SDR 转 HDR：已关闭"
                                 }
                             },
                             onSleep = { mode ->
@@ -875,7 +911,14 @@ data class TechTags(val res: String? = null, val range: String? = null, val code
             val v = p.videoFormat; val a = p.audioFormat
             val res = quality?.uppercase() ?: v?.let { f -> val h = minOf(f.width, f.height); if (h > 0) "${h}P" else null }
             val codec = v?.sampleMimeType?.let { when { it.contains("hevc") -> "HEVC"; it.contains("avc") -> "H.264"; it.contains("av01") -> "AV1"; else -> null } }
-            val range = if (v?.colorInfo?.colorTransfer == androidx.media3.common.C.COLOR_TRANSFER_ST2084 || v?.colorInfo?.colorTransfer == androidx.media3.common.C.COLOR_TRANSFER_HLG) "HDR" else "SDR"
+            val dolbyVision = v?.sampleMimeType == androidx.media3.common.MimeTypes.VIDEO_DOLBY_VISION ||
+                v?.codecs?.let { c -> c.startsWith("dvh") || c.startsWith("dvav") || c.startsWith("dva1") || c.startsWith("dav1") } == true
+            val range = when {
+                dolbyVision -> "Dolby Vision"
+                v?.colorInfo?.colorTransfer == androidx.media3.common.C.COLOR_TRANSFER_HLG -> "HLG"
+                v?.colorInfo?.colorTransfer == androidx.media3.common.C.COLOR_TRANSFER_ST2084 -> "HDR10"
+                else -> "SDR"
+            }
             val audio = a?.let { f -> val n = when { f.sampleMimeType?.contains("mp4a") == true -> "AAC"; f.sampleMimeType?.contains("eac3") == true -> "E-AC-3"; else -> "音频" }
                 if (f.channelCount > 0) "$n ${f.channelCount}.0" else n }
             val fps = v?.frameRate?.takeIf { it > 0 }?.let { Math.round(it) }
@@ -886,10 +929,21 @@ data class TechTags(val res: String? = null, val range: String? = null, val code
 
 /** spec `.tech`: one small centred line instead of a row of badges. */
 @Composable
-private fun TechLine(t: TechTags, modifier: Modifier = Modifier) {
-    val parts = listOfNotNull(t.res, t.range, t.codec, t.audio, t.fps?.let { "$it fps" })
-    if (parts.isEmpty()) return
-    Text(parts.joinToString(" · "), modifier = modifier, color = Color.White.copy(0.55f), fontSize = 11.sp, fontWeight = FontWeight.Medium,
+private fun TechLine(t: TechTags, modifier: Modifier = Modifier, enhanceLevel: Int = 0, sdrToHdr: Boolean = false) {
+    val sdr = t.range == "SDR"
+    // On SDR content the active GPU stages are shown in accent: "SDR→HDR" replaces "SDR", "AI超分" is appended.
+    val hdrOn = sdrToHdr && sdr
+    val parts = listOfNotNull(t.res, if (hdrOn) null else t.range, t.codec, t.audio, t.fps?.let { "$it fps" })
+    val active = listOfNotNull(if (hdrOn) "SDR→HDR" else null, if (enhanceLevel > 0 && (t.range == null || sdr)) "AI超分" else null)
+    if (parts.isEmpty() && active.isEmpty()) return
+    val accent = IdjDarkColors.accent
+    Text(androidx.compose.ui.text.buildAnnotatedString {
+        parts.forEachIndexed { i, p -> if (i > 0) append(" · "); append(p) }
+        active.forEach { a ->
+            if (length > 0) append(" · ")
+            pushStyle(androidx.compose.ui.text.SpanStyle(color = accent, fontWeight = FontWeight.SemiBold)); append(a); pop()
+        }
+    }, modifier = modifier, color = Color.White.copy(0.55f), fontSize = 11.sp, fontWeight = FontWeight.Medium,
         letterSpacing = 0.3.sp, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
 }
 
@@ -1034,6 +1088,9 @@ private fun MoreSettingsPanel(
     fillMode: Boolean,
     ambientMode: Boolean,
     enhanceLevel: Int,
+    sdrToHdr: Boolean,
+    /** Non-null ("HDR10" / "HLG" / "Dolby Vision") when the stream is already native HDR. */
+    nativeHdrRange: String?,
     sleepMode: Int,
     sleepEndMs: Long,
     autoNext: Boolean,
@@ -1042,6 +1099,7 @@ private fun MoreSettingsPanel(
     onFillMode: (Boolean) -> Unit,
     onAmbientMode: (Boolean) -> Unit,
     onEnhance: (Int) -> Unit,
+    onSdrToHdr: (Boolean) -> Unit,
     onSleep: (Int) -> Unit,
     onAutoNext: (Boolean) -> Unit,
 ) {
@@ -1065,22 +1123,48 @@ private fun MoreSettingsPanel(
     )
     Spacer(Modifier.height(10.dp))
 
+    val hdrLocked = nativeHdrRange != null || sdrToHdr
     MoreOptionRow(
-        label = "黑边氛围光晕",
+        label = when {
+            nativeHdrRange != null -> "黑边氛围光晕 (原生 $nativeHdrRange 已锁定关闭)"
+            sdrToHdr -> "黑边氛围光晕 (SDR 转 HDR 开启时已锁定关闭)"
+            else -> "黑边氛围光晕"
+        },
         options = listOf("开启" to true, "关闭" to false),
-        selected = ambientMode,
+        selected = if (hdrLocked) false else ambientMode,
+        enabled = !hdrLocked,
         pc = pc,
         onSelect = onAmbientMode,
     )
     Spacer(Modifier.height(10.dp))
 
     MoreOptionRow(
-        label = "画质增强 (GPU 超分锐化)",
+        label = "AI 超分辨率 (EWA-Lanczos4)",
         options = listOf("关闭" to 0, "标准" to 1, "强效" to 2),
         selected = enhanceLevel,
         pc = pc,
         onSelect = onEnhance,
     )
+    Spacer(Modifier.height(10.dp))
+
+    if (nativeHdrRange != null) {
+        MoreOptionRow(
+            label = "SDR 转 HDR (逆色调映射) · 当前片源已是原生 $nativeHdrRange",
+            options = listOf("原生 $nativeHdrRange" to true),
+            selected = true,
+            enabled = false,
+            pc = pc,
+            onSelect = onSdrToHdr,
+        )
+    } else {
+        MoreOptionRow(
+            label = "SDR 转 HDR (逆色调映射)",
+            options = listOf("关闭" to false, "开启" to true),
+            selected = sdrToHdr,
+            pc = pc,
+            onSelect = onSdrToHdr,
+        )
+    }
     Spacer(Modifier.height(10.dp))
 
     MoreOptionRow(
@@ -1109,12 +1193,13 @@ private fun <T> MoreOptionRow(
     options: List<Pair<String, T>>,
     selected: T,
     pc: IdjColors,
+    enabled: Boolean = true,
     onSelect: (T) -> Unit,
 ) {
-    Text(label, color = Color.White.copy(0.60f), fontSize = 12.sp, fontWeight = FontWeight.Medium)
+    Text(label, color = Color.White.copy(if (enabled) 0.60f else 0.38f), fontSize = 12.sp, fontWeight = FontWeight.Medium)
     Spacer(Modifier.height(6.dp))
     Row(
-        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).graphicsLayer { alpha = if (enabled) 1f else 0.45f },
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         options.forEach { (title, value) ->
