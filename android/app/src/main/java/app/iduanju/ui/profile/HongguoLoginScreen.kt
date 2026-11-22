@@ -8,8 +8,6 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
-import android.os.Handler
-import android.os.Looper
 import android.provider.MediaStore
 import android.util.Base64
 import android.util.Log
@@ -38,7 +36,6 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -47,7 +44,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -61,15 +57,11 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -84,7 +76,6 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -199,178 +190,8 @@ private val BRIDGE_JS: String by lazy {
       return cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0';
     }
 
-    function isVisibleRect(el, minW, minH) {
-      if (!el) return false;
-      var cs = getComputedStyle(el);
-      if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
-      var r = el.getBoundingClientRect();
-      return r.width >= minW && r.height >= minH;
-    }
-
     function findDialog() {
       return document.querySelector('[role="dialog"], [class*="pc-login-dialog"]');
-    }
-
-    function setNativeValue(el, val) {
-      if (!el) return;
-      el.focus();
-      var lastVal = el.value;
-      var setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-      setter.call(el, val);
-      var tracker = el._valueTracker;
-      if (tracker) tracker.setValue(lastVal);
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-    }
-
-    function ensureAgreement(dlg) {
-      if (!dlg) return;
-      var cb = dlg.querySelector('input[type="checkbox"]');
-      if (cb) {
-        if (!cb.checked) cb.click();
-        return;
-      }
-      var roleCb = dlg.querySelector('[role="checkbox"]');
-      if (roleCb && roleCb.getAttribute('aria-checked') !== 'true') {
-        roleCb.click();
-        return;
-      }
-      var unchecked = dlg.querySelector('[class*="agreement"] [class*="unchecked"], [class*="agreement"] [class*="checkbox"]:not([class*="checked"])');
-      if (unchecked) unchecked.click();
-    }
-
-    function isAreaCodeInput(inp) {
-      if (!inp) return true;
-      if (inp.closest('.web-login-area-code')) return true;
-      var val = (inp.value || '').trim();
-      return val.indexOf('+') === 0;
-    }
-
-    function ensureSmsTab(dlg) {
-      if (!dlg) return;
-      var existingPhone = findPhoneInput(dlg);
-      if (existingPhone && isElVisible(existingPhone)) return;
-      var tabs = dlg.querySelectorAll('button, [role="tab"], [role="button"], span, div');
-      for (var i = 0; i < tabs.length; i++) {
-        var t = (tabs[i].textContent || '').trim();
-        if (t === '验证码登录' || t === '手机登录' || t === '手机号登录') {
-          tabs[i].click();
-          break;
-        }
-      }
-    }
-
-    function findPhoneInput(dlg) {
-      if (!dlg) return null;
-      var preferred = dlg.querySelectorAll('.web-login-mobile-code__mobile-input-wrapper input, input[placeholder*="手机"], input[type="tel"], input[name*="mobile"], input[name*="phone"]');
-      for (var p = 0; p < preferred.length; p++) {
-        if (!isAreaCodeInput(preferred[p])) return preferred[p];
-      }
-      var inputs = dlg.querySelectorAll('input');
-      for (var i = 0; i < inputs.length; i++) {
-        var inp = inputs[i];
-        if (isAreaCodeInput(inp)) continue;
-        var type = (inp.type || 'text').toLowerCase();
-        var ph = inp.placeholder || '';
-        if (type !== 'checkbox' && type !== 'hidden' && ph.indexOf('验证码') < 0) return inp;
-      }
-      return null;
-    }
-
-    function findCodeInput(dlg) {
-      if (!dlg) return null;
-      var direct = dlg.querySelector('input[placeholder*="验证码"], input[name*="code"], input[name*="sms"]');
-      if (direct) return direct;
-      var phoneInp = findPhoneInput(dlg);
-      var inputs = dlg.querySelectorAll('input');
-      for (var i = 0; i < inputs.length; i++) {
-        var inp = inputs[i];
-        if (isAreaCodeInput(inp)) continue;
-        var type = (inp.type || 'text').toLowerCase();
-        if (inp !== phoneInp && type !== 'checkbox' && type !== 'hidden') return inp;
-      }
-      return null;
-    }
-
-    function findSmsBtn(dlg) {
-      if (!dlg) return null;
-      var btn = dlg.querySelector('.web-login-button-input button, .web-login-button-input [role="button"], .web-login-button-input span');
-      if (btn) return btn;
-      var btns = dlg.querySelectorAll('button, [role="button"], span');
-      for (var i = 0; i < btns.length; i++) {
-        var bt = (btns[i].textContent || '').trim();
-        if (bt.indexOf('获取验证码') >= 0 || bt.indexOf('重新发送') >= 0 || bt.indexOf('重新获取') >= 0 || /^\d+\s*[s秒]$/i.test(bt)) {
-          return btns[i];
-        }
-      }
-      return null;
-    }
-
-    function findSubmitBtn(dlg) {
-      if (!dlg) return null;
-      var smsBtn = findSmsBtn(dlg);
-      var btns = dlg.querySelectorAll('button, [role="button"]');
-      for (var i = 0; i < btns.length; i++) {
-        var b = btns[i];
-        if (b === smsBtn) continue;
-        var t = (b.textContent || '').replace(/\s+/g, '');
-        if (t === '登录/注册' || t === '登录' || t === '立即登录') return b;
-      }
-      return dlg.querySelector('button[type="submit"]');
-    }
-
-    function detectCaptcha() {
-      var iframes = document.querySelectorAll('iframe');
-      for (var i = 0; i < iframes.length; i++) {
-        if (isVisibleRect(iframes[i], 150, 150)) return true;
-      }
-      var capEls = document.querySelectorAll('[class*="captcha"], [id*="captcha"], [class*="turing"], [class*="secsdk"], [class*="verify-bar"], [class*="vc-"]');
-      for (var ci = 0; ci < capEls.length; ci++) {
-        if (isVisibleRect(capEls[ci], 120, 80)) return true;
-      }
-      if (document.body && (document.body.textContent || '').indexOf('请完成下列验证') >= 0) {
-        return true;
-      }
-      return false;
-    }
-
-    function pushSmsState(dlg) {
-      var hasCaptcha = detectCaptcha();
-      var countdownText = '获取验证码';
-      var errorText = '';
-      if (dlg) {
-        var smsBtn = findSmsBtn(dlg);
-        if (smsBtn) {
-          var bt = (smsBtn.textContent || '').trim();
-          if (bt) countdownText = bt;
-        }
-        var errEl = dlg.querySelector('.web-login-error, [class*="web-login-error"], [class*="error-msg"], [class*="error-tip"]');
-        if (errEl) {
-          var et = (errEl.textContent || '').trim();
-          if (et && isElVisible(errEl)) errorText = et;
-        }
-      }
-      var smsKey = countdownText + '|' + errorText + '|' + hasCaptcha;
-      if (smsKey !== window.__idjLastSmsKey) {
-        window.__idjLastSmsKey = smsKey;
-        if (window.IdjNativeLogin && window.IdjNativeLogin.onSmsState) {
-          window.IdjNativeLogin.onSmsState(countdownText, errorText, hasCaptcha);
-        }
-      }
-      return hasCaptcha;
-    }
-
-    function triggerClick(el) {
-      if (!el) return;
-      var r = el.getBoundingClientRect();
-      var cx = r.left + r.width / 2;
-      var cy = r.top + r.height / 2;
-      var opts = { bubbles: true, cancelable: true, clientX: cx, clientY: cy, view: window };
-      el.dispatchEvent(new MouseEvent('pointerdown', opts));
-      el.dispatchEvent(new MouseEvent('mousedown', opts));
-      el.dispatchEvent(new MouseEvent('pointerup', opts));
-      el.dispatchEvent(new MouseEvent('mouseup', opts));
-      el.click();
     }
 
     function diag(msg) {
@@ -392,68 +213,6 @@ private val BRIDGE_JS: String by lazy {
             if (innerBtn) innerBtn.click();
             return 'clicked';
           }
-        }
-        location.reload();
-        return 'reloaded';
-      },
-      sendSms: function(phone) {
-        var dlg = findDialog();
-        if (!dlg) {
-          diag('sendSms dlg=null');
-          if (window.IdjNativeLogin) {
-            window.IdjNativeLogin.onSmsState('获取验证码', '登录服务正在初始化，请稍候重试', false);
-          }
-          return;
-        }
-        ensureSmsTab(dlg);
-        setTimeout(function() {
-          var phoneInp = findPhoneInput(dlg);
-          if (phoneInp) setNativeValue(phoneInp, phone);
-          ensureAgreement(dlg);
-          setTimeout(function() {
-            var btn = findSmsBtn(dlg);
-            diag('sendSms phoneInp=' + (phoneInp ? 'found(' + (phoneInp.placeholder || phoneInp.name || phoneInp.type) + ')' : 'null') +
-                 ' smsBtn=' + (btn ? (btn.tagName + ':' + (btn.textContent || '').trim()) : 'null') +
-                 ' disabled=' + (btn ? (!!btn.disabled || btn.getAttribute('aria-disabled') === 'true') : 'n/a') +
-                 ' hasCaptcha=' + detectCaptcha());
-            if (btn) triggerClick(btn);
-            setTimeout(function() {
-              var cap1 = pushSmsState(dlg);
-              diag('sendSms +400ms hasCaptcha=' + cap1);
-            }, 400);
-            setTimeout(function() {
-              var cap2 = pushSmsState(dlg);
-              diag('sendSms +1100ms hasCaptcha=' + cap2);
-            }, 1100);
-          }, 100);
-        }, 60);
-      },
-      submitSms: function(phone, code) {
-        var dlg = findDialog();
-        if (!dlg) {
-          if (window.IdjNativeLogin) {
-            window.IdjNativeLogin.onSmsState('获取验证码', '登录服务正在初始化，请稍候重试', false);
-          }
-          return;
-        }
-        ensureSmsTab(dlg);
-        setTimeout(function() {
-          var phoneInp = findPhoneInput(dlg);
-          var codeInp = findCodeInput(dlg);
-          if (phoneInp) setNativeValue(phoneInp, phone);
-          if (codeInp) setNativeValue(codeInp, code);
-          ensureAgreement(dlg);
-          setTimeout(function() {
-            var sub = findSubmitBtn(dlg);
-            if (sub) triggerClick(sub);
-          }, 100);
-        }, 60);
-      },
-      cancelCaptcha: function() {
-        var closeBtn = document.querySelector('[class*="captcha"] [class*="close"], #captcha_container [class*="close"], [aria-label="关闭"]');
-        if (closeBtn) {
-          closeBtn.click();
-          return 'closed';
         }
         location.reload();
         return 'reloaded';
@@ -501,14 +260,13 @@ private val BRIDGE_JS: String by lazy {
     }, 500);
 
     window.__idjLastQrKey = null;
-    window.__idjLastSmsKey = null;
     if (window.__idjStateObserver) clearInterval(window.__idjStateObserver);
     window.__idjStateObserver = setInterval(function() {
       try {
         ensureFixStyle();
         var dlg = findDialog();
 
-        // 1 & 2. QR image + status
+        // QR image + status
         var qrSrc = '';
         var qrStatus = 'loading';
         if (dlg) {
@@ -546,7 +304,7 @@ private val BRIDGE_JS: String by lazy {
           }
         }
 
-        // 3. Push QR updates on change
+        // Push QR updates on change
         var qrKey = qrStatus + '|' + qrSrc;
         if (qrKey !== window.__idjLastQrKey) {
           window.__idjLastQrKey = qrKey;
@@ -554,9 +312,6 @@ private val BRIDGE_JS: String by lazy {
             window.IdjNativeLogin.onQrUpdate(qrSrc, qrStatus);
           }
         }
-
-        // 4 & 5. Detect CAPTCHA + Read SMS countdown & error text
-        pushSmsState(dlg);
       } catch (e) {}
     }, 1200);
   } catch (e) {}
@@ -566,18 +321,11 @@ private val BRIDGE_JS: String by lazy {
 
 private class IdjNativeLoginBridge(
     private val onQr: (base64DataUrl: String, status: String) -> Unit,
-    private val onSms: (countdownText: String, errorText: String, hasCaptcha: Boolean) -> Unit,
 ) {
     @JavascriptInterface
     fun onQrUpdate(base64DataUrl: String, status: String) {
         Log.i("IDJ-HGLogin", "onQrUpdate status=$status len=${base64DataUrl.length}")
         onQr(base64DataUrl, status)
-    }
-
-    @JavascriptInterface
-    fun onSmsState(countdownText: String, errorText: String, hasCaptcha: Boolean) {
-        Log.i("IDJ-HGLogin", "onSmsState btn=$countdownText err=$errorText captcha=$hasCaptcha")
-        onSms(countdownText, errorText, hasCaptcha)
     }
 
     @JavascriptInterface
@@ -635,10 +383,8 @@ fun HongguoLoginScreen(onBack: () -> Unit) {
     val scope = rememberCoroutineScope()
     val account = IdjApp.instance.hgWebAccount
     val currentOnBack by rememberUpdatedState(onBack)
-    val mainHandler = remember { Handler(Looper.getMainLooper()) }
 
     var webView by remember { mutableStateOf<WebView?>(null) }
-    var selectedTab by remember { mutableIntStateOf(0) }
     var loggedInName by remember { mutableStateOf<String?>(null) }
 
     // QR state
@@ -649,28 +395,12 @@ fun HongguoLoginScreen(onBack: () -> Unit) {
     var saveNotice by remember { mutableStateOf<String?>(null) }
     var saveError by remember { mutableStateOf(false) }
 
-    // SMS state
-    var phone by remember { mutableStateOf("") }
-    var smsCode by remember { mutableStateOf("") }
-    var smsBtnText by remember { mutableStateOf("获取验证码") }
-    var smsError by remember { mutableStateOf("") }
-    var submittingSms by remember { mutableStateOf(false) }
-    var captchaVisible by remember { mutableStateOf(false) }
-    val currentCaptchaVisible by rememberUpdatedState(captchaVisible)
-
     DisposableEffect(Unit) {
         onDispose {
             webView?.removeJavascriptInterface("IdjNativeLogin")
             webView?.stopLoading()
             webView?.destroy()
             webView = null
-        }
-    }
-
-    LaunchedEffect(submittingSms) {
-        if (submittingSms) {
-            delay(8000)
-            submittingSms = false
         }
     }
 
@@ -696,53 +426,6 @@ fun HongguoLoginScreen(onBack: () -> Unit) {
         ) { result ->
             if (result?.contains("reloaded") == true) {
                 qrBitmap = null
-            }
-        }
-    }
-
-    fun sendSmsCode(number: String) {
-        val clean = number.trim()
-        if (clean.length < 11) {
-            smsError = "请输入 11 位手机号码"
-            return
-        }
-        smsError = ""
-        val quoted = JSONObject.quote(clean)
-        webView?.evaluateJavascript(
-            "(function(){ if (window.__idjActions) window.__idjActions.sendSms($quoted); })();",
-            null,
-        )
-    }
-
-    fun submitSmsLogin(number: String, code: String) {
-        val cleanPhone = number.trim()
-        val cleanCode = code.trim()
-        if (cleanPhone.length < 11) {
-            smsError = "请输入 11 位手机号码"
-            return
-        }
-        if (cleanCode.length < 4) {
-            smsError = "请输入短信验证码"
-            return
-        }
-        smsError = ""
-        submittingSms = true
-        val qp = JSONObject.quote(cleanPhone)
-        val qc = JSONObject.quote(cleanCode)
-        webView?.evaluateJavascript(
-            "(function(){ if (window.__idjActions) window.__idjActions.submitSms($qp, $qc); })();",
-            null,
-        )
-    }
-
-    fun cancelCaptcha() {
-        captchaVisible = false
-        submittingSms = false
-        webView?.evaluateJavascript(
-            "(function(){ if (window.__idjActions) return window.__idjActions.cancelCaptcha(); return 'none'; })();",
-        ) { res ->
-            if (res == null || res.contains("none")) {
-                webView?.reload()
             }
         }
     }
@@ -774,8 +457,7 @@ fun HongguoLoginScreen(onBack: () -> Unit) {
             .fillMaxSize()
             .background(c.bg)
             .statusBarsPadding()
-            .navigationBarsPadding()
-            .imePadding(),
+            .navigationBarsPadding(),
     ) {
         // Native Top Bar
         Box(Modifier.fillMaxWidth().height(48.dp)) {
@@ -811,15 +493,14 @@ fun HongguoLoginScreen(onBack: () -> Unit) {
 
         Box(Modifier.fillMaxWidth().weight(1f)) {
             // Hidden WebView engine mounted continuously at full layout size behind the native UI.
-            // Brought to front only when Hongguo presents an interactive slider/image CAPTCHA.
             AndroidView(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(top = if (captchaVisible) 52.dp else 0.dp),
+                modifier = Modifier.fillMaxSize(),
                 factory = { ctx ->
                     WebView(ctx).apply {
                         visibility = View.INVISIBLE
-                        setOnTouchListener { _, _ -> !currentCaptchaVisible }
+                        isFocusable = false
+                        isFocusableInTouchMode = false
+                        setOnTouchListener { _, _ -> true }
                         settings.apply {
                             javaScriptEnabled = true
                             domStorageEnabled = true
@@ -853,19 +534,6 @@ fun HongguoLoginScreen(onBack: () -> Unit) {
                                         } else if (status == "loading" && dataUrl.isBlank()) {
                                             qrBitmap = null
                                         }
-                                    }
-                                },
-                                onSms = { countdown, error, hasCaptcha ->
-                                    mainHandler.post {
-                                        smsBtnText = countdown.ifBlank { "获取验证码" }
-                                        if (error.isNotBlank()) {
-                                            smsError = error
-                                            submittingSms = false
-                                        }
-                                        if (hasCaptcha) {
-                                            submittingSms = false
-                                        }
-                                        captchaVisible = hasCaptcha
                                     }
                                 },
                             ),
@@ -909,155 +577,54 @@ fun HongguoLoginScreen(onBack: () -> Unit) {
                         webView = this
                     }
                 },
-                update = { wv ->
-                    wv.visibility = if (captchaVisible) View.VISIBLE else View.INVISIBLE
-                    wv.isFocusable = captchaVisible
-                    wv.isFocusableInTouchMode = captchaVisible
-                },
             )
 
-            if (!captchaVisible) {
-                // Opaque 100% native Compose UI layer covering the hidden WebView
-                Box(
+            // Opaque 100% native Compose UI layer covering the hidden WebView
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(c.bg)
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                    ) {},
+            ) {
+                Column(
                     Modifier
                         .fillMaxSize()
-                        .background(c.bg)
-                        .clickable(
-                            interactionSource = remember { MutableInteractionSource() },
-                            indication = null,
-                        ) {},
+                        .verticalScroll(rememberScrollState())
+                        .padding(horizontal = 20.dp, vertical = 22.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center,
                 ) {
                     Column(
                         Modifier
-                            .fillMaxSize()
-                            .verticalScroll(rememberScrollState())
-                            .padding(horizontal = 20.dp, vertical = 22.dp),
+                            .widthIn(max = 420.dp)
+                            .fillMaxWidth(),
                         horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(18.dp),
                     ) {
-                        Column(
-                            Modifier
-                                .widthIn(max = 420.dp)
-                                .fillMaxWidth(),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.spacedBy(18.dp),
-                        ) {
-                            // Segmented Tab Switcher
-                            Row(
-                                Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .background(c.elevated)
-                                    .padding(4.dp),
-                                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                            ) {
-                                LoginTabButton(
-                                    title = "扫码登录",
-                                    selected = selectedTab == 0,
-                                    onClick = { selectedTab = 0 },
-                                    modifier = Modifier.weight(1f),
-                                )
-                                LoginTabButton(
-                                    title = "验证码登录",
-                                    selected = selectedTab == 1,
-                                    onClick = { selectedTab = 1 },
-                                    modifier = Modifier.weight(1f),
-                                )
-                            }
-
-                            if (selectedTab == 0) {
-                                QrLoginCard(
-                                    qrBitmap = qrBitmap,
-                                    qrStatus = qrStatus,
-                                    savingQr = savingQr,
-                                    saveNotice = saveNotice,
-                                    saveError = saveError,
-                                    onRefresh = { refreshQr() },
-                                    onSave = { saveQrToGallery() },
-                                )
-                            } else {
-                                val isCountdownActive = smsBtnText.any { it.isDigit() }
-                                SmsLoginCard(
-                                    phone = phone,
-                                    onPhoneChange = { input ->
-                                        phone = input.filter { it.isDigit() }.take(11)
-                                        smsError = ""
-                                    },
-                                    smsCode = smsCode,
-                                    onSmsCodeChange = { input ->
-                                        smsCode = input.filter { it.isDigit() }.take(8)
-                                        smsError = ""
-                                    },
-                                    smsBtnText = smsBtnText,
-                                    isCountdownActive = isCountdownActive,
-                                    smsError = smsError,
-                                    submitting = submittingSms,
-                                    onSendCode = { sendSmsCode(phone) },
-                                    onSubmit = { submitSmsLogin(phone, smsCode) },
-                                )
-                            }
-
-                            Text(
-                                "登录后看剧记录与进度将自动同步到你的红果账号",
-                                color = c.secondary,
-                                fontSize = 12.sp,
-                                textAlign = TextAlign.Center,
-                                modifier = Modifier.padding(top = 2.dp),
-                            )
-                        }
-                    }
-                }
-            } else {
-                // Temporary CAPTCHA overlay banner above the visible WebView
-                Column(Modifier.fillMaxWidth()) {
-                    Row(
-                        Modifier
-                            .fillMaxWidth()
-                            .height(52.dp)
-                            .background(c.warmSoft)
-                            .padding(horizontal = 16.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                    ) {
-                        Text(
-                            "请完成下方安全验证后继续",
-                            color = c.accentWarm,
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.Medium,
-                            modifier = Modifier.weight(1f),
+                        QrLoginCard(
+                            qrBitmap = qrBitmap,
+                            qrStatus = qrStatus,
+                            savingQr = savingQr,
+                            saveNotice = saveNotice,
+                            saveError = saveError,
+                            onRefresh = { refreshQr() },
+                            onSave = { saveQrToGallery() },
                         )
-                        TextButton(onClick = { cancelCaptcha() }) {
-                            Text("取消", color = c.text, fontWeight = FontWeight.SemiBold)
-                        }
+
+                        Text(
+                            "登录后看剧记录与进度将自动同步到你的红果账号",
+                            color = c.secondary,
+                            fontSize = 12.sp,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.padding(top = 2.dp),
+                        )
                     }
-                    HorizontalDivider(thickness = 0.5.dp, color = c.hairline)
                 }
             }
         }
-    }
-}
-
-@Composable
-private fun LoginTabButton(
-    title: String,
-    selected: Boolean,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    val c = IdjThemeColors
-    Box(
-        modifier = modifier
-            .height(38.dp)
-            .clip(RoundedCornerShape(9.dp))
-            .background(if (selected) c.surface else Color.Transparent)
-            .clickable(onClick = onClick),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(
-            text = title,
-            color = if (selected) c.text else c.secondary,
-            fontSize = 14.sp,
-            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
-        )
     }
 }
 
@@ -1271,135 +838,6 @@ private fun QrLoginCard(
                 fontSize = 12.sp,
                 lineHeight = 17.sp,
                 textAlign = TextAlign.Center,
-            )
-        }
-    }
-}
-
-@Composable
-private fun SmsLoginCard(
-    phone: String,
-    onPhoneChange: (String) -> Unit,
-    smsCode: String,
-    onSmsCodeChange: (String) -> Unit,
-    smsBtnText: String,
-    isCountdownActive: Boolean,
-    smsError: String,
-    submitting: Boolean,
-    onSendCode: () -> Unit,
-    onSubmit: () -> Unit,
-) {
-    val c = IdjThemeColors
-    val fieldColors = OutlinedTextFieldDefaults.colors(
-        focusedBorderColor = c.accent,
-        unfocusedBorderColor = c.hairline,
-        focusedLabelColor = c.accent,
-        unfocusedLabelColor = c.secondary,
-        focusedTextColor = c.text,
-        unfocusedTextColor = c.text,
-        cursorColor = c.accent,
-    )
-
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
-            .background(c.surface)
-            .border(0.5.dp, c.hairline, RoundedCornerShape(16.dp))
-            .padding(horizontal = 20.dp, vertical = 24.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp),
-    ) {
-        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text(
-                "手机号验证码登录",
-                color = c.text,
-                fontSize = 17.sp,
-                fontWeight = FontWeight.SemiBold,
-            )
-            Text(
-                "支持使用中国大陆手机号接收短信验证码登录",
-                color = c.secondary,
-                fontSize = 12.sp,
-            )
-        }
-
-        OutlinedTextField(
-            value = phone,
-            onValueChange = onPhoneChange,
-            modifier = Modifier.fillMaxWidth(),
-            label = { Text("手机号") },
-            prefix = { Text("+86 ", color = c.secondary) },
-            singleLine = true,
-            shape = RoundedCornerShape(12.dp),
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
-            colors = fieldColors,
-        )
-
-        Row(
-            Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            OutlinedTextField(
-                value = smsCode,
-                onValueChange = onSmsCodeChange,
-                modifier = Modifier.weight(1f),
-                label = { Text("验证码") },
-                singleLine = true,
-                shape = RoundedCornerShape(12.dp),
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                colors = fieldColors,
-            )
-
-            OutlinedButton(
-                onClick = onSendCode,
-                enabled = !isCountdownActive,
-                modifier = Modifier
-                    .padding(top = 6.dp)
-                    .height(52.dp),
-                shape = RoundedCornerShape(12.dp),
-                border = ButtonDefaults.outlinedButtonBorder(enabled = !isCountdownActive).copy(
-                    brush = SolidColor(if (!isCountdownActive) c.accentLine else c.hairline),
-                ),
-                contentPadding = PaddingValues(horizontal = 14.dp),
-            ) {
-                Text(
-                    smsBtnText.ifBlank { "获取验证码" },
-                    color = if (!isCountdownActive) c.accent else c.secondary,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Medium,
-                    maxLines = 1,
-                )
-            }
-        }
-
-        if (smsError.isNotBlank()) {
-            Text(
-                smsError,
-                color = c.accentWarm,
-                fontSize = 13.sp,
-                lineHeight = 18.sp,
-            )
-        }
-
-        Button(
-            onClick = onSubmit,
-            enabled = !submitting,
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(48.dp),
-            shape = RoundedCornerShape(12.dp),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = c.accent,
-                contentColor = c.onAccent,
-                disabledContainerColor = c.accent.copy(alpha = 0.45f),
-                disabledContentColor = c.onAccent.copy(alpha = 0.7f),
-            ),
-        ) {
-            Text(
-                if (submitting) "正在登录…" else "登录",
-                fontSize = 15.sp,
-                fontWeight = FontWeight.SemiBold,
             )
         }
     }

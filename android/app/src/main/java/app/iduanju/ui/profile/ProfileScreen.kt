@@ -78,7 +78,7 @@ fun ProfileScreen(onOpenDetail: (String) -> Unit = {}) {
             Group("红果账号") {
                 val hgProfile = ia.hgWebAccount.profile
                 if (hgProfile == null) {
-                    LinkRow("登录红果账号", ProfileIcons.key, sub = "扫码或手机验证码登录，看剧进度同步到红果", trailing = "去登录") { go("hongguo-login") }
+                    LinkRow("登录红果账号", ProfileIcons.key, sub = "使用红果 App 扫码登录，看剧进度同步到红果", trailing = "去登录") { go("hongguo-login") }
                 } else {
                     Row(
                         Modifier.fillMaxWidth().clickable { confirmLogout = true }.padding(horizontal = 14.dp, vertical = 14.dp),
