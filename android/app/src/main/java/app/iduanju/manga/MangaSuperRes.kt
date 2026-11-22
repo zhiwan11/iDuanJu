@@ -15,17 +15,21 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntSize
 
 /**
- * 漫画超分「标准」: instant API 33+ two-pass AGSL RenderEffect implementing an Anime4K restoration pipeline
- * (`Anime4K_Deblur_DoG` + `Anime4K_Upscale_Original` edge push, followed by `Anime4K_Darken` + paper/ink levels).
+ * 漫画超分「标准」: instant (API 33+) single-pass AGSL RenderEffect porting the Anime4K `Deblur_DoG` restore plus an
+ * Anime4K edge-directed push, applied in on-screen pixels.
  *
- * Why the previous single-pass shader looked like a no-op:
- * 1. Its 3×3 unsharp mask was clamped strictly to local `[mn, mx]`, which clamped stroke cores (`mid == mn`) and paper
- *    borders (`mid == mx`) right back to `mid` — literally zero change at line centers and edges.
- * 2. When pages fit the screen (`scale <= 1`), `uAmount` fell to `0.45` and `uInk` to `0.45` (`3%` levels shift).
+ * Strictly colour-preserving, exactly like Anime4K itself: only a *luma delta* is computed and it is added equally
+ * to R, G and B (`rgb + Δ`), so hue, saturation, paper tone and overall brightness of the page are untouched — no
+ * levels stretch, no line darkening, no tinting. Flat areas (paper, screen-tone fields, JPEG grain below the noise
+ * threshold) get exactly Δ = 0; only edge slopes are steepened. Every result is clamped to the local 3×3 luma range
+ * of the original with a small soft margin, so there is no ringing / white halo around lines and text.
  *
- * Now Pass 1 runs Anime4K DoG Deblur (non-linear power curve `0.55` on a 5×5 DoG footprint) + Sobel edge-directed
- * sharpening, and Pass 2 runs Anime4K Line Darken (deepening washed-out ink lines and small text without white halos)
- * plus clean paper/ink levels. Below Android 13 [mangaInkLevels] gives the levels part via colour matrix.
+ *  1. DoG deblur: Δ = curve(mid − Gauss5×5) where curve is Anime4K's power curve (noise gate, then x^0.6 lift of
+ *     soft slopes), so blurry lines and small text tighten visibly while already-sharp edges are left alone.
+ *  2. Edge push: on real edges (Sobel-gated) the deblurred value is pulled toward its nearer local extremum, which
+ *     thins the soft anti-aliased fringe of ink lines without moving them.
+ * The kernel footprint scales with the on-screen magnification of the page (low-res scans shown enlarged have
+ * wider blur), never with the layer size.
  */
 @Composable
 fun Modifier.mangaSuperRes(
@@ -38,26 +42,15 @@ fun Modifier.mangaSuperRes(
     var measuredSize by remember { mutableStateOf(IntSize.Zero) }
     val size = if (measuredSize.width > 0 && measuredSize.height > 0) measuredSize else viewSize
     val scale = superResScale(size, contentSize, fillWidth)
-    val effect = remember(size, scale) {
+    val effect = remember(size.width > 0 && size.height > 0, scale) {
         if (size.width < 1 || size.height < 1) null
         else runCatching { // AGSL compilation can fail on broken drivers: fall back to the plain page
-            val k = ((scale - 1f) / 0.8f).coerceIn(0f, 1f) // 0 = ≤ 1:1, 1 = enlarged ≥ 1.8×
-            val radius = scale.coerceIn(1f, 2.5f)
-
-            val deblur = RuntimeShader(MANGA_DEBLUR_SHADER)
-            deblur.setFloatUniform("uRadius", radius)
-            deblur.setFloatUniform("uDeblur", 0.95f + 0.35f * k)
-            deblur.setFloatUniform("uRefine", 0.24f + 0.16f * k)
-            val deblurEffect = RenderEffect.createRuntimeShaderEffect(deblur, "img")
-
-            val darken = RuntimeShader(MANGA_DARKEN_LEVELS_SHADER)
-            darken.setFloatUniform("uRadius", radius)
-            darken.setFloatUniform("uDarken", 0.85f + 0.30f * k)
-            darken.setFloatUniform("uBlack", 0.05f)
-            darken.setFloatUniform("uWhite", 0.95f)
-            val darkenEffect = RenderEffect.createRuntimeShaderEffect(darken, "img")
-
-            RenderEffect.createChainEffect(darkenEffect, deblurEffect).asComposeRenderEffect()
+            val k = ((scale - 1f) / 1.2f).coerceIn(0f, 1f) // 0 = shown ≤ 1:1, 1 = enlarged ≥ 2.2×
+            val shader = RuntimeShader(MANGA_RESTORE_SHADER)
+            shader.setFloatUniform("uStep", scale.coerceIn(1f, 2.5f))
+            shader.setFloatUniform("uDeblur", 1.05f + 0.45f * k)
+            shader.setFloatUniform("uPush", 0.38f + 0.22f * k)
+            RenderEffect.createRuntimeShaderEffect(shader, "img").asComposeRenderEffect()
         }.getOrNull()
     }
     return onSizeChanged { measuredSize = it }.graphicsLayer { renderEffect = effect }
@@ -68,128 +61,71 @@ private fun superResScale(layout: IntSize, content: IntSize, fillWidth: Boolean)
     if (layout.width < 1 || layout.height < 1 || content.width < 1 || content.height < 1) return 1f
     val sx = layout.width.toFloat() / content.width
     val sy = layout.height.toFloat() / content.height
-    return if (fillWidth) sx else minOf(sx, sy)
+    val s = if (fillWidth) sx else minOf(sx, sy)
+    return (kotlin.math.round(s * 8f) / 8f) // quantised so tiny size jitter never recompiles the effect
 }
 
-/** Ink / paper levels for the 标准 fallback below Android 13 (the AGSL pass applies its own). */
-fun mangaInkLevels(): FloatArray {
-    val black = 0.05f; val white = 0.95f
-    val gain = 1f / (white - black)
-    val off = -black * 255f * gain
-    return floatArrayOf(gain, 0f, 0f, 0f, off, 0f, gain, 0f, 0f, off, 0f, 0f, gain, 0f, off, 0f, 0f, 0f, 1f, 0f)
-}
-
-/** Pass 1: Anime4K DoG Deblur + Sobel edge-directed refinement (no coordinate clamp). */
-private const val MANGA_DEBLUR_SHADER = """
+/** Anime4K DoG deblur + edge-directed push; adds one luma delta to R, G and B (hue / paper tone preserved). */
+private const val MANGA_RESTORE_SHADER = """
 uniform shader img;
-uniform float uRadius;
+uniform float uStep;
 uniform float uDeblur;
-uniform float uRefine;
+uniform float uPush;
 
 const half3 LUMA = half3(0.299, 0.587, 0.114);
+const half NOISE_T = 0.002;
+const half BLUR_T = 0.10;
+const half CURVE = 0.6;
 
 half lumaAt(float2 p, half centre) {
     half4 c = img.eval(p);
-    return dot(c.rgb, LUMA) + (1.0 - c.a) * centre;
+    // transparent letterbox around a fitted page reads as the centre pixel: no edge against "nothing"
+    return c.a > 0.004 ? dot(c.rgb, LUMA) / c.a : centre;
 }
 
 half4 main(float2 pos) {
     half4 base = img.eval(pos);
-    if (base.a == 0.0) return base;
+    if (base.a < 0.004) return base;
     half mid = dot(base.rgb, LUMA) / base.a;
 
-    // 3x3 ring at 1 px: inner Gaussian, local [mn, mx], and Sobel gradient
-    half a0 = lumaAt(pos + float2(-1.0, -1.0), mid); half a1 = lumaAt(pos + float2(0.0, -1.0), mid); half a2 = lumaAt(pos + float2(1.0, -1.0), mid);
-    half a3 = lumaAt(pos + float2(-1.0,  0.0), mid);                                                 half a5 = lumaAt(pos + float2(1.0,  0.0), mid);
-    half a6 = lumaAt(pos + float2(-1.0,  1.0), mid); half a7 = lumaAt(pos + float2(0.0,  1.0), mid); half a8 = lumaAt(pos + float2(1.0,  1.0), mid);
-
-    half mn = min(mid, min(min(min(a0, a1), min(a2, a3)), min(min(a5, a6), min(a7, a8))));
-    half mx = max(mid, max(max(max(a0, a1), max(a2, a3)), max(max(a5, a6), max(a7, a8))));
-    half blur3 = (a0 + a2 + a6 + a8 + 2.0 * (a1 + a3 + a5 + a7) + 4.0 * mid) / 16.0;
-
-    // Outer cardinal taps scaled to the page's on-screen magnification for wide blur capture
-    float r = uRadius * 1.75;
-    half o1 = lumaAt(pos + float2(0.0, -r), mid);
-    half o3 = lumaAt(pos + float2(-r, 0.0), mid);
-    half o5 = lumaAt(pos + float2(r, 0.0), mid);
-    half o7 = lumaAt(pos + float2(0.0, r), mid);
-    half blurWide = 0.55 * blur3 + 0.45 * (0.25 * (o1 + o3 + o5 + o7));
-
-    // Anime4K DoG Deblur power curve (lifts soft edge slopes, ignores flat-paper JPEG grain)
-    half c = (mid - blurWide) * half(uDeblur);
-    half ac = abs(c);
-    half noiseT = 0.008;
-    half blurT = 0.14;
-    if (ac > noiseT) {
-        half t = clamp((ac - noiseT) / (blurT - noiseT), 0.0, 1.0);
-        half boosted = pow(max(t, 0.0001), 0.55) * (blurT - noiseT) + noiseT;
-        c = (ac < blurT ? boosted : ac) * sign(c);
-    } else {
-        c = 0.0;
+    half blur = 0.0; half wsum = 0.0;
+    half mn = mid; half mx = mid;
+    half gx = 0.0; half gy = 0.0;
+    for (float j = -2.0; j <= 2.0; j += 1.0) {
+        for (float i = -2.0; i <= 2.0; i += 1.0) {
+            half l = (i == 0.0 && j == 0.0) ? mid : lumaAt(pos + float2(i, j) * uStep, mid);
+            half wgt = half(exp(-0.5 * (i * i + j * j)));
+            blur += l * wgt; wsum += wgt;
+            if (abs(i) <= 1.0 && abs(j) <= 1.0) {
+                mn = min(mn, l); mx = max(mx, l);
+                gx += l * half(i * (2.0 - abs(j)));
+                gy += l * half(j * (2.0 - abs(i)));
+            }
+        }
     }
-    half deblurred = clamp(mid + c, mn, mx);
+    blur /= wsum;
 
-    // Anime4K-style edge-directed push: tighten blurry slopes toward nearer extremum within [mn, mx]
-    half gx = (a2 + 2.0 * a5 + a8) - (a0 + 2.0 * a3 + a6);
-    half gy = (a6 + 2.0 * a7 + a8) - (a0 + 2.0 * a1 + a2);
+    // 1. Anime4K Deblur_DoG power curve
+    half c = (mid - blur) * half(uDeblur);
+    half ac = abs(c);
+    half ct = c;
+    if (ac > NOISE_T) {
+        half t = (ac - NOISE_T) / (BLUR_T - NOISE_T);
+        ct = (pow(t, CURVE) * (BLUR_T - NOISE_T) + NOISE_T) * sign(c);
+    } else {
+        ct = 0.0; // flat paper / tone / grain: untouched
+    }
+    half margin = min(0.02, 0.08 * (mx - mn));
+    half lo = mn - margin; half hi = mx + margin;
+    half v = clamp(mid + ct, lo, hi);
+
+    // 2. edge-directed push toward the nearer local extremum on real edges only
     half grad = sqrt(gx * gx + gy * gy) * 0.25;
-    half edgeGate = smoothstep(0.14, 0.55, grad);
-    half nearest = (deblurred - mn < mx - deblurred) ? mn : mx;
-    half target = mix(deblurred, nearest, half(uRefine) * edgeGate);
+    half gate = smoothstep(0.05, 0.28, grad);
+    half nearest = (v - mn < mx - v) ? mn : mx;
+    v = clamp(mix(v, nearest, half(uPush) * gate), lo, hi);
 
-    half delta = target - mid;
-    half3 rgb = (delta < 0.0 && mid > 0.01)
-        ? base.rgb * (target / mid)
-        : base.rgb + delta * base.a;
-    return half4(clamp(rgb, 0.0, base.a), base.a);
-}
-"""
-
-/** Pass 2: Anime4K Line Darken + clean manga paper/ink levels (color-preserving). */
-private const val MANGA_DARKEN_LEVELS_SHADER = """
-uniform shader img;
-uniform float uRadius;
-uniform float uDarken;
-uniform float uBlack;
-uniform float uWhite;
-
-const half3 LUMA = half3(0.299, 0.587, 0.114);
-
-half lumaAt(float2 p, half centre) {
-    half4 c = img.eval(p);
-    return dot(c.rgb, LUMA) + (1.0 - c.a) * centre;
-}
-
-half4 main(float2 pos) {
-    half4 base = img.eval(pos);
-    if (base.a == 0.0) return base;
-    half mid = dot(base.rgb, LUMA) / base.a;
-
-    // Surrounding neighborhood luma (excluding center so thin 1-2 px strokes pop strongly)
-    half a0 = lumaAt(pos + float2(-1.0, -1.0), mid); half a1 = lumaAt(pos + float2(0.0, -1.0), mid); half a2 = lumaAt(pos + float2(1.0, -1.0), mid);
-    half a3 = lumaAt(pos + float2(-1.0,  0.0), mid);                                                 half a5 = lumaAt(pos + float2(1.0,  0.0), mid);
-    half a6 = lumaAt(pos + float2(-1.0,  1.0), mid); half a7 = lumaAt(pos + float2(0.0,  1.0), mid); half a8 = lumaAt(pos + float2(1.0,  1.0), mid);
-    half ring1 = (a0 + a2 + a6 + a8 + 2.0 * (a1 + a3 + a5 + a7)) / 12.0;
-
-    float r = max(2.0, uRadius * 1.8);
-    half o1 = lumaAt(pos + float2(0.0, -r), mid);
-    half o3 = lumaAt(pos + float2(-r, 0.0), mid);
-    half o5 = lumaAt(pos + float2(r, 0.0), mid);
-    half o7 = lumaAt(pos + float2(0.0, r), mid);
-    half surround = 0.65 * ring1 + 0.35 * (0.25 * (o1 + o3 + o5 + o7));
-
-    // Anime4K Line Darken: darken only pixels noticeably darker than local paper/surround (no white halos)
-    half neg = max(surround - mid, 0.0);
-    half lineGate = smoothstep(0.025, 0.11, neg);
-    half darkened = clamp(mid - neg * half(uDarken) * lineGate, 0.0, 1.0);
-
-    // Ink / paper levels: clean speech-bubble paper and deep ink blacks
-    half leveled = clamp((darkened - half(uBlack)) / half(uWhite - uBlack), 0.0, 1.0);
-
-    half delta = leveled - mid;
-    half3 rgb = (delta < 0.0 && mid > 0.01)
-        ? base.rgb * (leveled / mid)
-        : base.rgb + delta * base.a;
-    return half4(clamp(rgb, 0.0, base.a), base.a);
+    half delta = v - mid;
+    return half4(clamp(base.rgb + delta * base.a, 0.0, base.a), base.a);
 }
 """

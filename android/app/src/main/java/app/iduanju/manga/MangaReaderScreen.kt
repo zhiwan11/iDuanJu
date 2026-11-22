@@ -164,9 +164,7 @@ fun MangaReaderScreen(id: String, startIndex: Int, startPage: Int, onBack: () ->
     val chapter = d.chapters[index]
     val mode = P.mode
     val rtl = mode == MangaReadMode.RTL || (mode == MangaReadMode.DUAL && P.dualRtl)
-    // 标准 below Android 13: no AGSL, so the ink / paper levels ride on the page colour matrix instead.
-    val inkFallback = Build.VERSION.SDK_INT < 33 && P.superResLevel >= 1
-    val filter = remember(P.invert, P.grayscale, inkFallback) { readerColorFilter(P.invert, P.grayscale, inkFallback) }
+    val filter = remember(P.invert, P.grayscale) { readerColorFilter(P.invert, P.grayscale) }
     // 图片背景
     val darkTheme = IdjThemeColors.dark
     val pageBg = P.pageBg
@@ -590,7 +588,7 @@ internal fun ReaderImage(
     val ink = LocalPageInk.current
     /** Decoded page size (what is actually drawn) — the 标准 pass sizes its kernel from the on-screen magnification. */
     var contentSize by remember(url, half, crop) { mutableStateOf(IntSize.Zero) }
-    /** The page's on-screen box — 增强 never shrinks a page below it. */
+    /** The page's on-screen box (the 标准 pass sizes from it; 增强 starts once the page is laid out). */
     var boxSize by remember { mutableStateOf(IntSize.Zero) }
     fun request() = ImageRequest.Builder(ctx).data(url).apply { headers.forEach { (k, v) -> addHeader(k, v) } }
         .transformations(buildList { if (crop) add(AutoCropTransformation(sidesOnly = webtoon)); if (half != 0) add(HalfCropTransformation(right = half == 2)) })
@@ -604,31 +602,37 @@ internal fun ReaderImage(
     }
     val contentScale = if (webtoon) ContentScale.FillWidth else if (thumb) ContentScale.Crop else ContentScale.Fit
     // 漫画超分 on the real pages (all modes); never on scrubber thumbnails. 1 标准 = instant AGSL pass;
-    // 2 增强 = native-resolution Real-ESRGAN page from MangaAiUpscaler, previewed with the 标准 pass until it lands.
+    // 2 增强 = Real-ESRGAN page from MangaAiUpscaler, previewed with the 标准 pass until it lands.
     val srLevel = if (thumb) 0 else MangaReaderPrefs.superResLevel
     val aiKey = "$url|$crop|$half|$webtoon"
     var aiPage by remember(aiKey, srLevel) { mutableStateOf(if (srLevel == 2) MangaAiUpscaler.getCached(aiKey) else null) }
     val active by rememberUpdatedState(LocalReaderPageActive.current)
     LaunchedEffect(aiKey, srLevel) {
         if (srLevel != 2 || aiPage != null) return@LaunchedEffect
-        // The page on screen goes first; a preloaded neighbour (the next page) waits until it becomes visible or the
-        // upscaler has gone idle, so reading ahead is prefetched without ever delaying the current page.
         snapshotFlow { boxSize.width > 0 }.first { it }
-        if (!active) {
-            delay(500)
-            snapshotFlow { active || !MangaAiUpscaler.busy }.first { it }
+        while (aiPage == null) {
+            // The page on screen goes first; a preloaded neighbour (the next page) is prefetched only once the
+            // upscaler is idle, and gives way again between tiles as soon as a visible page is waiting.
+            if (!active) {
+                delay(350)
+                snapshotFlow { active || !MangaAiUpscaler.busy }.first { it }
+            }
+            // Full-resolution software decode (Size.ORIGINAL, no hardware bitmap) of the same (cropped) page; leaving
+            // composition — fast scrolling / flipping — cancels the job between tiles.
+            val result = ctx.imageLoader.execute(request().size(coil.size.Size.ORIGINAL).allowHardware(false).build())
+            val source = ((result as? SuccessResult)?.drawable as? BitmapDrawable)?.bitmap ?: return@LaunchedEffect
+            try {
+                aiPage = MangaAiUpscaler.upscale(ctx, aiKey, source, fillWidth = webtoon) { active } ?: return@LaunchedEffect
+            } catch (_: MangaAiUpscaler.Preempted) {
+                delay(200) // yielded to the visible page: resume the prefetch when the upscaler is idle again
+            }
         }
-        // Full-resolution software decode (Size.ORIGINAL, no hardware bitmap) of the same (cropped) page; leaving
-        // composition — fast scrolling / flipping — cancels it.
-        val result = ctx.imageLoader.execute(request().size(coil.size.Size.ORIGINAL).allowHardware(false).build())
-        val source = ((result as? SuccessResult)?.drawable as? BitmapDrawable)?.bitmap ?: return@LaunchedEffect
-        aiPage = MangaAiUpscaler.upscale(ctx, aiKey, source, boxSize.width, if (webtoon) 0 else boxSize.height, fillWidth = webtoon)
     }
     val measured = modifier.onSizeChanged { boxSize = it }
     aiPage?.let { page ->
         LaunchedEffect(page) { sizeCb?.invoke(page.width, page.height) }
         val aiFilter = remember(MangaReaderPrefs.invert, MangaReaderPrefs.grayscale) {
-            readerColorFilter(MangaReaderPrefs.invert, MangaReaderPrefs.grayscale, inkLevels = false)
+            readerColorFilter(MangaReaderPrefs.invert, MangaReaderPrefs.grayscale)
         }
         // Mipmapped + high filter quality: the big page is minified on screen without aliasing.
         Image(page.asImageBitmap(), null, measured, alignment = alignment, contentScale = contentScale, colorFilter = aiFilter, filterQuality = FilterQuality.High)
@@ -768,9 +772,9 @@ private fun ImagePanel() {
         PanelTitle("漫画超分")
         PanelSegments(listOf(0, 1, 2), P.superResLevel, { when (it) { 1 -> "标准"; 2 -> "增强"; else -> "关闭" } }) { P.updateSuperResLevel(it) }
         Text(when (P.superResLevel) {
-            1 -> if (Build.VERSION.SDK_INT >= 33) "极速超分：Anime4K DoG 去模糊 + 墨线加深 + 气泡净白，无光晕零延迟" else "极速超分：墨色加深 / 气泡净白（Android 13+ 另含 Anime4K GPU 锐化）"
-            2 -> "AI 精修：低清图 Real-ESRGAN 4× 神经网络重建，高清图 Anime4K 降噪去模糊 + 墨线加深，当前页优先"
-            else -> "标准 = 极速 Anime4K GPU 锐化 · 增强 = 离线 AI / Anime4K 精修"
+            1 -> if (Build.VERSION.SDK_INT >= 33) "极速超分：Anime4K DoG 去模糊 + 边缘收紧，只锐化线条与文字，原色原纸色不变，零延迟" else "标准需 Android 13+（GPU 着色器）；本机可选「增强」"
+            2 -> "AI 精修：Real-ESRGAN 4× 神经网络重建后 2× 输出，色彩不偏移；当前页优先，空闲时预取下一页"
+            else -> "标准 = 极速 Anime4K GPU 锐化 · 增强 = 离线 Real-ESRGAN 神经网络"
         }, color = Color.White.copy(0.45f), fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp, start = 2.dp))
         PanelTitle("沉浸氛围")
         PanelSegments(MangaAtmosphere.entries, P.atmosphere, { it.label }) { P.updateAtmosphere(it) }
