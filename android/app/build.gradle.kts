@@ -19,6 +19,9 @@ android {
         versionCode = 1622
         versionName = "1.6.22-android"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
     }
     signingConfigs {
         create("distribution") {
