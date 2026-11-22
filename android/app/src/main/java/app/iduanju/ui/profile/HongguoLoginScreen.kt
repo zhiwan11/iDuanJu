@@ -12,7 +12,9 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
 import android.util.Base64
+import android.util.Log
 import android.view.View
+import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
@@ -104,9 +106,9 @@ private const val BASE_LOGIN_STYLE_CSS =
     "* { -webkit-backdrop-filter: none !important; backdrop-filter: none !important; } " +
         "[role=\"dialog\"], [class*=\"pc-login-dialog\"] { " +
         "-webkit-backdrop-filter: none !important; backdrop-filter: none !important; " +
+        "max-height: calc(100% - 32px) !important; " +
         "opacity: 1 !important; visibility: visible !important; }"
 
-private val VIEWPORT_DEVICE_WIDTH_RE = Regex("width\\s*=\\s*device-width", RegexOption.IGNORE_CASE)
 private val VIEWPORT_META_RE = Regex("<meta\\b[^>]*\\bname\\s*=\\s*[\"']?viewport[\"']?[^>]*>", RegexOption.IGNORE_CASE)
 private val HEAD_OPEN_RE = Regex("<head\\b[^>]*>", RegexOption.IGNORE_CASE)
 
@@ -123,20 +125,20 @@ private fun isMainEntryUrl(url: Uri?): Boolean {
 }
 
 private fun forceDesktopViewport(html: String): String {
-    var out = VIEWPORT_DEVICE_WIDTH_RE.replace(html, "width=1280")
-    if (!VIEWPORT_META_RE.containsMatchIn(out)) {
-        val headMatch = HEAD_OPEN_RE.find(out)
-        out = if (headMatch != null) {
-            out.replaceRange(
-                headMatch.range.last + 1,
-                headMatch.range.last + 1,
-                "<meta name=\"viewport\" content=\"width=1280\">",
-            )
-        } else {
-            "<meta name=\"viewport\" content=\"width=1280\">$out"
-        }
+    val desktopMeta = "<meta name=\"viewport\" content=\"width=1280\">"
+    if (VIEWPORT_META_RE.containsMatchIn(html)) {
+        return VIEWPORT_META_RE.replace(html, desktopMeta)
     }
-    return out
+    val headMatch = HEAD_OPEN_RE.find(html)
+    return if (headMatch != null) {
+        html.replaceRange(
+            headMatch.range.last + 1,
+            headMatch.range.last + 1,
+            desktopMeta,
+        )
+    } else {
+        "$desktopMeta$html"
+    }
 }
 
 private fun fetchDesktopHtmlResponse(url: String): WebResourceResponse? {
@@ -152,6 +154,7 @@ private fun fetchDesktopHtmlResponse(url: String): WebResourceResponse? {
             reqBuilder.header("Cookie", cookie)
         }
         desktopHtmlHttp.newCall(reqBuilder.build()).execute().use { resp ->
+            Log.i("IDJ-HGLogin", "fetchDesktopHtmlResponse code=${resp.code} url=$url")
             if (!resp.isSuccessful) return null
             resp.headers("Set-Cookie").forEach { sc ->
                 cm.setCookie(url, sc)
@@ -159,9 +162,12 @@ private fun fetchDesktopHtmlResponse(url: String): WebResourceResponse? {
             val html = resp.body?.string()
             if (html.isNullOrBlank()) return null
             val patched = forceDesktopViewport(html)
+            val vpMatch = VIEWPORT_META_RE.find(patched)?.value
+            Log.i("IDJ-HGLogin", "fetchDesktopHtmlResponse len=${html.length} vp=$vpMatch")
             WebResourceResponse("text/html", "UTF-8", patched.byteInputStream())
         }
-    } catch (_: Throwable) {
+    } catch (t: Throwable) {
+        Log.w("IDJ-HGLogin", "fetchDesktopHtmlResponse failed for $url", t)
         null
     }
 }
@@ -354,6 +360,17 @@ private val BRIDGE_JS: String by lazy {
       }
     };
 
+    function diag(msg) {
+      try {
+        if (window.IdjNativeLogin && window.IdjNativeLogin.logDiag) {
+          window.IdjNativeLogin.logDiag(String(msg));
+        }
+      } catch (e) {}
+    }
+
+    var vpEl = document.querySelector('meta[name="viewport"]');
+    diag('init iw=' + window.innerWidth + ' ih=' + window.innerHeight + ' vp=' + (vpEl ? vpEl.getAttribute('content') : 'none'));
+
     if (window.__idjLoginOpenTimer) clearInterval(window.__idjLoginOpenTimer);
     var openTries = 0;
     window.__idjLoginOpenTimer = setInterval(function() {
@@ -361,7 +378,9 @@ private val BRIDGE_JS: String by lazy {
       try {
         ensureFixStyle();
         var dlg = findDialog();
-        if (dlg && dlg.getBoundingClientRect().width > 0 && dlg.getBoundingClientRect().height > 0) {
+        var rect = dlg ? dlg.getBoundingClientRect() : null;
+        if (dlg && rect.width > 0 && rect.height > 0) {
+          diag('dlgOpen iw=' + window.innerWidth + ' rect=' + Math.round(rect.width) + 'x' + Math.round(rect.height));
           clearInterval(window.__idjLoginOpenTimer);
           window.__idjLoginOpenTimer = null;
           return;
@@ -381,8 +400,9 @@ private val BRIDGE_JS: String by lazy {
             }
           }
         }
-      } catch (e) {}
+      } catch (e) { diag('openErr=' + e); }
       if (openTries >= 40) {
+        diag('openTimeout iw=' + window.innerWidth);
         clearInterval(window.__idjLoginOpenTimer);
         window.__idjLoginOpenTimer = null;
       }
@@ -492,12 +512,19 @@ private class IdjNativeLoginBridge(
 ) {
     @JavascriptInterface
     fun onQrUpdate(base64DataUrl: String, status: String) {
+        Log.i("IDJ-HGLogin", "onQrUpdate status=$status len=${base64DataUrl.length}")
         onQr(base64DataUrl, status)
     }
 
     @JavascriptInterface
     fun onSmsState(countdownText: String, errorText: String, hasCaptcha: Boolean) {
+        Log.i("IDJ-HGLogin", "onSmsState btn=$countdownText err=$errorText captcha=$hasCaptcha")
         onSms(countdownText, errorText, hasCaptcha)
+    }
+
+    @JavascriptInterface
+    fun logDiag(msg: String) {
+        Log.i("IDJ-HGLogin", "JS: $msg")
     }
 }
 
@@ -777,7 +804,14 @@ fun HongguoLoginScreen(onBack: () -> Unit) {
                             ),
                             "IdjNativeLogin",
                         )
-                        webChromeClient = WebChromeClient()
+                        webChromeClient = object : WebChromeClient() {
+                            override fun onConsoleMessage(cm: ConsoleMessage?): Boolean {
+                                if (cm != null && cm.messageLevel() == ConsoleMessage.MessageLevel.ERROR) {
+                                    Log.w("IDJ-HGLogin", "console[ERROR]: ${cm.message()} (${cm.sourceId()}:${cm.lineNumber()})")
+                                }
+                                return super.onConsoleMessage(cm)
+                            }
+                        }
                         webViewClient = object : WebViewClient() {
                             override fun shouldInterceptRequest(
                                 view: WebView?,
@@ -786,17 +820,21 @@ fun HongguoLoginScreen(onBack: () -> Unit) {
                                 if (request == null || !request.isForMainFrame) return null
                                 if (!request.method.equals("GET", ignoreCase = true)) return null
                                 val url = request.url ?: return null
-                                if (!isMainEntryUrl(url)) return null
+                                val isEntry = isMainEntryUrl(url)
+                                Log.i("IDJ-HGLogin", "shouldInterceptRequest mainFrame=$url isEntry=$isEntry")
+                                if (!isEntry) return null
                                 return fetchDesktopHtmlResponse(url.toString())
                             }
 
                             override fun onPageCommitVisible(view: WebView?, url: String?) {
                                 super.onPageCommitVisible(view, url)
+                                Log.i("IDJ-HGLogin", "onPageCommitVisible url=$url")
                                 view?.evaluateJavascript(BRIDGE_JS, null)
                             }
 
                             override fun onPageFinished(view: WebView?, url: String?) {
                                 super.onPageFinished(view, url)
+                                Log.i("IDJ-HGLogin", "onPageFinished url=$url")
                                 view?.evaluateJavascript(BRIDGE_JS, null)
                             }
                         }
@@ -1151,8 +1189,8 @@ private fun QrLoginCard(
                 )
                 Spacer(Modifier.width(6.dp))
                 Text(
-                    if (savingQr) "保存中…" else "保存二维码到相册",
-                    fontSize = 12.sp,
+                    if (savingQr) "保存中…" else "保存二维码",
+                    fontSize = 13.sp,
                     maxLines = 1,
                 )
             }
