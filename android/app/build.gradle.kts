@@ -73,6 +73,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("io.coil-kt:coil-compose:2.7.0")
     implementation("androidx.media3:media3-exoplayer:1.5.1")
+    implementation("androidx.media3:media3-effect:1.5.1")
     implementation("org.jellyfin.media3:media3-ffmpeg-decoder:1.5.0+1")
     implementation("androidx.media3:media3-ui:1.5.1")
     implementation("androidx.media3:media3-session:1.5.1")

@@ -217,6 +217,10 @@ fun RootScreen(initialRoute: String? = null) {
                         navArgument("sid") { type = NavType.StringType },
                         navArgument("ep") { type = NavType.IntType },
                     ),
+                    enterTransition = { androidx.compose.animation.fadeIn(androidx.compose.animation.core.tween(180)) },
+                    exitTransition = { androidx.compose.animation.fadeOut(androidx.compose.animation.core.tween(160)) },
+                    popEnterTransition = { androidx.compose.animation.fadeIn(androidx.compose.animation.core.tween(180)) },
+                    popExitTransition = { androidx.compose.animation.fadeOut(androidx.compose.animation.core.tween(160)) },
                 ) { e ->
                     PlayerScreen(
                         seriesId = e.arguments!!.getString("sid")!!,

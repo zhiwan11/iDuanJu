@@ -19,6 +19,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:supportsPictureInPicture="true"
             android:configChanges="orientation|screenSize|smallestScreenSize|keyboardHidden|screenLayout"
             android:windowSoftInputMode="adjustResize"
             android:theme="@style/Theme.Idj">

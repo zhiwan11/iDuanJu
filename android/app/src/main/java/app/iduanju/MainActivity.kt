@@ -1,15 +1,22 @@
 package app.iduanju
 
+import android.content.res.Configuration
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Modifier
 import app.iduanju.ui.RootScreen
 import app.iduanju.ui.theme.IdjTheme
 import app.iduanju.ui.theme.IdjThemeColors
+
+object PipHost {
+    val isInPip = mutableStateOf(false)
+    var onUserLeaveHint: (() -> Unit)? = null
+}
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -31,5 +38,15 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        PipHost.onUserLeaveHint?.invoke()
+    }
+
+    override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        PipHost.isInPip.value = isInPictureInPictureMode
     }
 }
