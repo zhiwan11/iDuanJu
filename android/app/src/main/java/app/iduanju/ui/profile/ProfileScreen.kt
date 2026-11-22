@@ -119,6 +119,17 @@ fun ProfileScreen(onOpenDetail: (String) -> Unit = {}) {
                 RowDivider()
                 LinkRow("下载管理", ProfileIcons.download, trailing = "暂未支持") { message = "Android 版暂不支持离线下载" }
             }
+            Group("外观", footer = "液态玻璃：通透折射的 Liquid Glass；毛玻璃：高可读性的磨砂质感。切换即时生效，无需重启。") {
+                Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("玻璃质感", color = c.text, fontSize = 16.sp)
+                    app.iduanju.ui.components.SegmentedTabs(
+                        items = app.iduanju.ui.components.GlassStyle.entries,
+                        selected = app.iduanju.ui.components.GlassStylePref.style,
+                        label = { it.label },
+                        onSelect = { app.iduanju.ui.components.GlassStylePref.update(it) },
+                    )
+                }
+            }
             Group {
                 LinkRow("片源管理", ProfileIcons.sources, trailing = "红果") { go("sources") }
                 RowDivider()

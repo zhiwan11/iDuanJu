@@ -1,5 +1,6 @@
 package app.iduanju.ui.player
 
+import app.iduanju.ui.components.glassSurface
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import androidx.compose.animation.AnimatedVisibility
@@ -635,7 +636,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
             exit = fadeOut(DS.panel()) + androidx.compose.animation.scaleOut(DS.panel(), targetScale = 0.92f)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(if(landscape)72.dp else 44.dp)) {
                 Icon(Icons.Filled.Replay10, "后退10秒", tint = Color.White, modifier = Modifier.size(36.dp).pressClick(0.9f) { player.seekTo((player.currentPosition - 10_000).coerceAtLeast(0)) })
-                Box(Modifier.size(68.dp).clip(CircleShape).background(Color(0x7514141A)).border(1.dp, Color.White.copy(0.18f), CircleShape)
+                Box(Modifier.size(68.dp).glassSurface(CircleShape, dark = true, shadowRadius = 10.dp, fallbackAlpha = 0.46f)
                     .pressClick(0.92f, label = if (playing) "暂停" else "播放") { if (player.isPlaying) player.pause() else player.play() },
                     contentAlignment = Alignment.Center) {
                     androidx.compose.animation.Crossfade(playing, label = "pp") { p ->
@@ -722,8 +723,9 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
             val last = remember { arrayOfNulls<String>(1) }
             if (panel != null) last[0] = panel
             val shown = last[0]
-            Column(Modifier.fillMaxWidth().widthIn(max = 520.dp).clip(RoundedCornerShape(24.dp)).background(Color(0xF51C1E24))
-                .border(1.dp, Color.White.copy(0.12f), RoundedCornerShape(24.dp)).pointerInput(Unit) { detectTapGestures { } }
+            Column(Modifier.fillMaxWidth().widthIn(max = 520.dp)
+                .glassSurface(RoundedCornerShape(24.dp), dark = true, base = Color(0xFF1C1E24), shadowRadius = 20.dp, fallbackAlpha = 0.92f)
+                .pointerInput(Unit) { detectTapGestures { } }
                 .padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 14.dp)) {
                 when (shown) {
                     "episodes" -> detail?.let { d -> EpisodesPanel(d, epIndex, pc, onPick = { selectEpisode(it); panel = null },
@@ -806,9 +808,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                     .align(Alignment.TopEnd)
                     .statusBarsPadding()
                     .padding(top = 14.dp, end = 16.dp)
-                    .clip(RoundedCornerShape(50))
-                    .background(Color(0x9915181F))
-                    .border(1.dp, Color.White.copy(0.16f), RoundedCornerShape(50))
+                    .glassSurface(RoundedCornerShape(50), dark = true, shadowRadius = 8.dp, fallbackAlpha = 0.60f)
                     .clickable { padDrawerOpen = true }
                     .padding(horizontal = 14.dp, vertical = 8.dp),
             ) {
@@ -895,18 +895,18 @@ private fun TechLine(t: TechTags, modifier: Modifier = Modifier) {
 
 @Composable
 private fun CircleBtn(icon: ImageVector, label: String, enabled: Boolean = true, onClick: () -> Unit) {
-    // spec `.pbtn`: 40 dp, rgba(20,20,24,.42) + white 14 % hairline
-    Box(Modifier.size(40.dp).clip(CircleShape).background(Color(0x6B141418)).border(1.dp, Color.White.copy(0.14f), CircleShape)
-        .pressClick(0.92f, enabled = enabled, label = label, onClick = onClick), contentAlignment = Alignment.Center) {
-        Icon(icon, label, tint = Color.White, modifier = Modifier.size(20.dp))
-    }
+    // spec `.pbtn`: 40 dp dark glass. Drawn over the video (inside the root layer), so no backdrop sampling:
+    // LIQUID = sheer fill + specular rim, FROSTED = denser frosted fill + hairline.
+    app.iduanju.ui.components.GlassIconButton(icon, label, dark = true, fallbackAlpha = 0.42f, enabled = enabled, onClick = onClick)
 }
 
 @Composable
 private fun LandChip(icon:ImageVector,title:String,value:String?,on:Boolean,enabled:Boolean,onClick:()->Unit){
     val pc=IdjDarkColors
-    Row(Modifier.height(34.dp).graphicsLayer { alpha = if(enabled)1f else 0.45f }.clip(CircleShape).background(if(on)pc.accentSoft else Color(0x75141418))
-        .border(1.dp,if(on)pc.accentLine else Color.White.copy(0.14f),CircleShape).pressClick(enabled=enabled,onClick=onClick).padding(horizontal=13.dp),
+    Row(Modifier.height(34.dp).graphicsLayer { alpha = if(enabled)1f else 0.45f }
+        .then(if (on) Modifier.clip(CircleShape).background(pc.accentSoft).border(1.dp, pc.accentLine, CircleShape)
+              else Modifier.glassSurface(CircleShape, dark = true, shadowRadius = 0.dp, fallbackAlpha = 0.46f))
+        .pressClick(enabled=enabled,onClick=onClick).padding(horizontal=13.dp),
         verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(6.dp)){
         Icon(icon,null,tint=if(on)pc.accent else Color.White,modifier=Modifier.size(17.dp))
         Text(title+(value?.let{" $it"}?:""),color=if(on)pc.accent else Color.White.copy(0.8f),fontSize=13.sp,maxLines=1,softWrap=false)
@@ -1242,29 +1242,29 @@ private fun computeAmbientEdgeColors(bmp: android.graphics.Bitmap): AmbientEdgeC
         }
     }
 
-    val frameRgb = sampleRawRgb(activeLeft, activeRight, activeTop, activeBottom)
-
+    /**
+     * Gentle vibrancy that preserves darkness: near-black stays black (a black suit must not glow), everything else
+     * gets a mild brightness curve and saturation lift. Never lifts dark pixels to a fixed minimum brightness.
+     */
     fun boostColorInt(r: Int, g: Int, b: Int): Int {
         val hsv = FloatArray(3)
         android.graphics.Color.RGBToHSV(r, g, b, hsv)
-        if (hsv[1] > 0.03f) {
-            hsv[1] = (hsv[1] * 1.38f).coerceIn(0.24f, 0.90f)
-        }
-        hsv[2] = if (hsv[2] < 0.02f) 0f else hsv[2].coerceIn(0.42f, 0.90f)
+        val s = hsv[1]
+        val v = hsv[2]
+        if (v < 0.06f) return 0xFF000000.toInt()
+        if (s > 0.05f) hsv[1] = (s * 1.25f).coerceIn(0f, 0.88f)
+        hsv[2] = (v * 1.15f).coerceIn(0f, 0.85f)
         return android.graphics.Color.HSVToColor(hsv)
     }
 
+    // Edge colours come only from their own region: no blending with the whole-frame average, so a dark edge stays
+    // dark even when the rest of the frame is bright.
     fun regionToAmbientColor(xStart: Int, xEnd: Int, yStart: Int, yEnd: Int): Color {
         val raw = sampleRawRgb(xStart, xEnd, yStart, yEnd)
-        val edgeMax = maxOf(raw[0], raw[1], raw[2])
-        val frameBlend = if (edgeMax < 48) 0.55f else 0.30f
-        val r = (raw[0] * (1f - frameBlend) + frameRgb[0] * frameBlend).toInt().coerceIn(0, 255)
-        val g = (raw[1] * (1f - frameBlend) + frameRgb[1] * frameBlend).toInt().coerceIn(0, 255)
-        val b = (raw[2] * (1f - frameBlend) + frameRgb[2] * frameBlend).toInt().coerceIn(0, 255)
-        return Color(boostColorInt(r, g, b))
+        return Color(boostColorInt(raw[0].coerceIn(0, 255), raw[1].coerceIn(0, 255), raw[2].coerceIn(0, 255)))
     }
 
-    // Build a 16x16 multi-color vibrant glow bitmap from the trimmed active frame for API 31+ RenderEffect blur
+    // Build a 16x16 spatially accurate glow bitmap from the trimmed active frame for API 31+ RenderEffect blur
     val glowSize = 16
     val glowPixels = IntArray(glowSize * glowSize)
     for (gy in 0 until glowSize) {
@@ -1276,11 +1276,8 @@ private fun computeAmbientEdgeColors(bmp: android.graphics.Bitmap): AmbientEdgeC
             val pr = (px shr 16) and 0xFF
             val pg = (px shr 8) and 0xFF
             val pb = px and 0xFF
-            val maxCh = maxOf(pr, pg, pb)
-            val r = if (maxCh < 22) (pr * 0.4f + frameRgb[0] * 0.6f).toInt() else pr
-            val g = if (maxCh < 22) (pg * 0.4f + frameRgb[1] * 0.6f).toInt() else pg
-            val b = if (maxCh < 22) (pb * 0.4f + frameRgb[2] * 0.6f).toInt() else pb
-            glowPixels[gy * glowSize + gx] = boostColorInt(r.coerceIn(0, 255), g.coerceIn(0, 255), b.coerceIn(0, 255))
+            // spatially faithful: each glow cell is its own pixel, dark stays dark and bright glows locally
+            glowPixels[gy * glowSize + gx] = boostColorInt(pr, pg, pb)
         }
     }
     val glowImg = runCatching {
@@ -1323,110 +1320,91 @@ private fun AmbientGlowLayer(
     val animLeft by androidx.compose.animation.animateColorAsState(leftColor, androidx.compose.animation.core.tween(600), label = "ambLeft")
     val animRight by androidx.compose.animation.animateColorAsState(rightColor, androidx.compose.animation.core.tween(600), label = "ambRight")
 
+    val useBitmapGlow = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S && glowBitmap != null
     Box(modifier.fillMaxSize()) {
-        // Multi-color hardware RenderEffect blur glow on API 31+ (scaled around actual video rect + expanded by 48.dp)
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S && glowBitmap != null) {
-            androidx.compose.foundation.Canvas(
-                Modifier
-                    .fillMaxSize()
-                    .blur(
-                        radius = 48.dp,
-                        edgeTreatment = BlurredEdgeTreatment.Unbounded,
+        if (useBitmapGlow) {
+            // API 31+: the 16x16 frame map, scaled onto the actual video rect (+44 dp) and hardware-blurred. No uniform
+            // full-width blooms, so dark regions stay dark and bright regions glow right next to their true colours.
+            androidx.compose.animation.Crossfade(
+                targetState = glowBitmap,
+                animationSpec = androidx.compose.animation.core.tween(260),
+                label = "ambientFrame",
+            ) { bmp ->
+                androidx.compose.foundation.Canvas(
+                    Modifier
+                        .fillMaxSize()
+                        .graphicsLayer { alpha = 0.75f * layerAlpha }
+                        .blur(radius = 48.dp, edgeTreatment = BlurredEdgeTreatment.Unbounded),
+                ) {
+                    val w = size.width
+                    val h = size.height
+                    if (w <= 0f || h <= 0f) return@Canvas
+                    val expandPx = 44.dp.toPx()
+                    val viewAspect = w / h
+                    val ar = if (videoAspectRatio > 0.05f) videoAspectRatio else (16f / 9f)
+                    val vidW: Float
+                    val vidH: Float
+                    if (ar > viewAspect) {
+                        vidW = w
+                        vidH = w / ar
+                    } else {
+                        vidH = h
+                        vidW = h * ar
+                    }
+                    val dstW = vidW + expandPx * 2f
+                    val dstH = vidH + expandPx * 2f
+                    drawImage(
+                        image = bmp,
+                        dstOffset = androidx.compose.ui.unit.IntOffset(((w - dstW) * 0.5f).toInt(), ((h - dstH) * 0.5f).toInt()),
+                        dstSize = androidx.compose.ui.unit.IntSize(dstW.toInt().coerceAtLeast(1), dstH.toInt().coerceAtLeast(1)),
+                        filterQuality = androidx.compose.ui.graphics.FilterQuality.Low,
                     )
-                    .graphicsLayer { alpha = 0.85f * layerAlpha },
-            ) {
+                }
+            }
+        } else {
+            // API < 31 fallback: per-edge gradients, each tinted only by its own (darkness-preserving) edge colour.
+            androidx.compose.foundation.Canvas(Modifier.fillMaxSize()) {
                 val w = size.width
                 val h = size.height
                 if (w <= 0f || h <= 0f) return@Canvas
-                val expandPx = 48.dp.toPx()
-                val viewAspect = w / h
-                val ar = if (videoAspectRatio > 0.05f) videoAspectRatio else (16f / 9f)
-                val vidW: Float
-                val vidH: Float
-                if (ar > viewAspect) {
-                    vidW = w
-                    vidH = w / ar
-                } else {
-                    vidH = h
-                    vidW = h * ar
-                }
-                val dstW = (vidW + expandPx * 2f).coerceAtMost(w * 1.15f)
-                val dstH = (vidH + expandPx * 4f).coerceAtMost(h * 1.15f)
-                val dstLeft = (w - dstW) * 0.5f
-                val dstTop = (h - dstH) * 0.5f
-                // Full-screen soft ambient wash
-                drawImage(
-                    image = glowBitmap,
-                    dstOffset = androidx.compose.ui.unit.IntOffset(0, 0),
-                    dstSize = androidx.compose.ui.unit.IntSize(w.toInt().coerceAtLeast(1), h.toInt().coerceAtLeast(1)),
-                    alpha = 0.42f,
+                val baseAlpha = 0.78f * layerAlpha
+                drawRect(
+                    brush = Brush.verticalGradient(
+                        0f to animTop.copy(alpha = baseAlpha * 0.52f),
+                        0.34f to animTop.copy(alpha = baseAlpha),
+                        0.55f to Color.Transparent,
+                        startY = 0f,
+                        endY = h,
+                    ),
                 )
-                // Bright multi-color halo expanded directly around the video frame
-                drawImage(
-                    image = glowBitmap,
-                    dstOffset = androidx.compose.ui.unit.IntOffset(dstLeft.toInt(), dstTop.toInt()),
-                    dstSize = androidx.compose.ui.unit.IntSize(dstW.toInt().coerceAtLeast(1), dstH.toInt().coerceAtLeast(1)),
-                    alpha = 0.92f,
+                drawRect(
+                    brush = Brush.verticalGradient(
+                        0.45f to Color.Transparent,
+                        0.66f to animBottom.copy(alpha = baseAlpha),
+                        1f to animBottom.copy(alpha = baseAlpha * 0.52f),
+                        startY = 0f,
+                        endY = h,
+                    ),
+                )
+                drawRect(
+                    brush = Brush.horizontalGradient(
+                        0f to animLeft.copy(alpha = baseAlpha * 0.45f),
+                        0.34f to animLeft.copy(alpha = baseAlpha * 0.85f),
+                        0.55f to Color.Transparent,
+                        startX = 0f,
+                        endX = w,
+                    ),
+                )
+                drawRect(
+                    brush = Brush.horizontalGradient(
+                        0.45f to Color.Transparent,
+                        0.66f to animRight.copy(alpha = baseAlpha * 0.85f),
+                        1f to animRight.copy(alpha = baseAlpha * 0.45f),
+                        startX = 0f,
+                        endX = w,
+                    ),
                 )
             }
-        }
-
-        // Smooth edge-anchored gradient glow (supplements API 31+ and acts as full fallback on API < 31)
-        androidx.compose.foundation.Canvas(Modifier.fillMaxSize()) {
-            val w = size.width
-            val h = size.height
-            if (w <= 0f || h <= 0f) return@Canvas
-            val baseAlpha = (if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S && glowBitmap != null) 0.55f else 0.78f) * layerAlpha
-            drawRect(
-                brush = Brush.verticalGradient(
-                    0f to animTop.copy(alpha = baseAlpha * 0.52f),
-                    0.34f to animTop.copy(alpha = baseAlpha),
-                    0.55f to Color.Transparent,
-                    startY = 0f,
-                    endY = h,
-                ),
-            )
-            drawRect(
-                brush = Brush.verticalGradient(
-                    0.45f to Color.Transparent,
-                    0.66f to animBottom.copy(alpha = baseAlpha),
-                    1f to animBottom.copy(alpha = baseAlpha * 0.52f),
-                    startY = 0f,
-                    endY = h,
-                ),
-            )
-            drawRect(
-                brush = Brush.horizontalGradient(
-                    0f to animLeft.copy(alpha = baseAlpha * 0.45f),
-                    0.34f to animLeft.copy(alpha = baseAlpha * 0.85f),
-                    0.55f to Color.Transparent,
-                    startX = 0f,
-                    endX = w,
-                ),
-            )
-            drawRect(
-                brush = Brush.horizontalGradient(
-                    0.45f to Color.Transparent,
-                    0.66f to animRight.copy(alpha = baseAlpha * 0.85f),
-                    1f to animRight.copy(alpha = baseAlpha * 0.45f),
-                    startX = 0f,
-                    endX = w,
-                ),
-            )
-            drawRect(
-                brush = Brush.radialGradient(
-                    colors = listOf(animTop.copy(alpha = baseAlpha * 0.65f), Color.Transparent),
-                    center = androidx.compose.ui.geometry.Offset(w * 0.5f, h * 0.30f),
-                    radius = maxOf(w, h) * 0.65f,
-                ),
-            )
-            drawRect(
-                brush = Brush.radialGradient(
-                    colors = listOf(animBottom.copy(alpha = baseAlpha * 0.65f), Color.Transparent),
-                    center = androidx.compose.ui.geometry.Offset(w * 0.5f, h * 0.70f),
-                    radius = maxOf(w, h) * 0.65f,
-                ),
-            )
         }
     }
 }

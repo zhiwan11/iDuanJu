@@ -6,6 +6,8 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -19,6 +21,8 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.NorthWest
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.CircularProgressIndicator
@@ -32,6 +36,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -44,6 +49,7 @@ import app.iduanju.core.hongguo.HGRankSub
 import app.iduanju.core.hongguo.HGSeries
 import app.iduanju.ui.components.LocalLayoutMetrics
 import app.iduanju.ui.components.SearchDockState
+import app.iduanju.ui.components.glassSurface
 import app.iduanju.ui.home.HomeFmt
 import app.iduanju.ui.home.HomePosterCard
 import app.iduanju.ui.theme.IdjThemeColors
@@ -206,10 +212,30 @@ fun SearchScreen(
             WindowInsets.navigationBars.union(WindowInsets.ime).getBottom(this).toDp()
         }
         val gridBottomPadding = if (useBottomSearchDock) (bottomInsetDp + 96.dp) else 110.dp
-        if (submitted.isEmpty()) {
+        val focusManager = LocalFocusManager.current
+        val pick: (String) -> Unit = { t ->
+            focusManager.clearFocus()
+            if (dockState != null) dockState.submit(t) else submit(t)
+        }
+        // While typing (query not blank, nothing submitted yet) the page focuses on suggestions + history;
+        // 搜索发现 / 搜索实时排行 come back as soon as the query is cleared.
+        val typing = submitted.isEmpty() && query.isNotBlank()
+        val discoverGrid = rememberLazyGridState()
+        if (submitted.isEmpty()) androidx.compose.animation.Crossfade(typing, label = "searchMode") { isTyping ->
+          if (isTyping) {
+            SearchSuggestions(
+                query = query.trim(),
+                history = lib.searchHistory,
+                hot = hot,
+                bottomPadding = gridBottomPadding,
+                onPick = pick,
+                onOpenDetail = onOpenDetail,
+            )
+          } else {
             LazyVerticalGrid(
                 GridCells.Fixed(metrics.wideCardCols),
                 Modifier.fillMaxSize(),
+                state = discoverGrid,
                 contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 10.dp, bottom = gridBottomPadding),
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -261,9 +287,11 @@ fun SearchScreen(
                         }
                     }
                 }
+                // #4…: full-width rows so cover / title / tags / heat / 集数 always stay on single clean lines
                 val rest = hot.drop(3)
-                items(rest.size) { i -> CompactRankRow(rest[i], i + 4, onOpenDetail) }
+                items(rest.size, span = { GridItemSpan(maxLineSpan) }) { i -> CompactRankRow(rest[i], i + 4, onOpenDetail) }
             }
+          }
         } else {
             if (sources.size > 1) Row(Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(20.dp)) {
                 sources.forEach { (id, name) ->
@@ -307,11 +335,87 @@ fun SearchScreen(
 @Composable
 private fun Chip(t: String, accent: String?, removable: Boolean, onClick: () -> Unit) {
     val c = IdjThemeColors
-    Row(Modifier.clip(RoundedCornerShape(50)).background(c.text.copy(0.09f)).clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 8.dp),
+    Row(Modifier.glassSurface(RoundedCornerShape(50), shadowRadius = 0.dp).clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically) {
-        Text(t, color = c.text, fontSize = 15.sp, maxLines = 1)
+        Text(t, color = c.text, fontSize = 15.sp, maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 220.dp))
         if (accent != null) Text(" ·$accent", color = c.accentWarm, fontSize = 15.sp)
         if (removable) { Spacer(Modifier.width(4.dp)); Icon(Icons.Filled.Cancel, null, tint = c.secondary, modifier = Modifier.size(13.dp)) }
+    }
+}
+
+/**
+ * Typing mode: "搜索「q」" + matching history + matching hot titles. Replaces 搜索发现 / 搜索实时排行 while the
+ * user is typing so the screen stays focused; falls back to the history chips when nothing matches.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun SearchSuggestions(
+    query: String,
+    history: List<String>,
+    hot: List<HGSeries>,
+    bottomPadding: androidx.compose.ui.unit.Dp,
+    onPick: (String) -> Unit,
+    onOpenDetail: (String) -> Unit,
+) {
+    val c = IdjThemeColors
+    // history is a snapshot list (mutated in place) — derive directly so edits are always reflected
+    val historyHits = history.filter { it.contains(query, ignoreCase = true) && !it.equals(query, ignoreCase = true) }.take(6)
+    val hotHits = remember(query, hot) { hot.filter { it.title.contains(query, ignoreCase = true) }.take(8) }
+    LazyColumn(
+        Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 6.dp, bottom = bottomPadding),
+    ) {
+        item(key = "q") { SuggestionRow(Icons.Filled.Search, buildQueryLabel(query, c.accent), c.accent) { onPick(query) } }
+        items(historyHits, key = { "h:$it" }) { t ->
+            SuggestionRow(Icons.Filled.History, androidx.compose.ui.text.AnnotatedString(t), c.secondary) { onPick(t) }
+        }
+        items(hotHits, key = { "s:" + it.seriesId }) { s ->
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .clickable { onOpenDetail(s.seriesId) }
+                    .padding(vertical = 8.dp, horizontal = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(Modifier.size(36.dp, 48.dp).clip(RoundedCornerShape(6.dp)).background(c.elevated)) {
+                    AsyncImage(s.cover, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                }
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(s.title, color = c.text, fontSize = 15.sp, fontWeight = FontWeight.Medium, maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
+                    Text(HomeFmt.metaLine(s), color = c.secondary, fontSize = 12.sp, maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
+                }
+            }
+        }
+        if (historyHits.isEmpty() && hotHits.isEmpty() && history.isNotEmpty()) item(key = "hist") {
+            Column(Modifier.padding(top = 14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("历史搜索", color = c.text, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    history.take(12).forEach { t -> Chip(t, null, false) { onPick(t) } }
+                }
+            }
+        }
+    }
+}
+
+private fun buildQueryLabel(q: String, accent: Color) = androidx.compose.ui.text.buildAnnotatedString {
+    append("搜索「")
+    pushStyle(androidx.compose.ui.text.SpanStyle(color = accent, fontWeight = FontWeight.SemiBold)); append(q); pop()
+    append("」")
+}
+
+@Composable
+private fun SuggestionRow(icon: androidx.compose.ui.graphics.vector.ImageVector, text: androidx.compose.ui.text.AnnotatedString, iconTint: Color, onClick: () -> Unit) {
+    val c = IdjThemeColors
+    Row(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).clickable(onClick = onClick).padding(vertical = 12.dp, horizontal = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(icon, null, tint = iconTint, modifier = Modifier.size(18.dp))
+        Spacer(Modifier.width(12.dp))
+        Text(text, color = c.text, fontSize = 15.sp, maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+        Icon(Icons.Filled.NorthWest, null, tint = c.secondary.copy(0.6f), modifier = Modifier.size(16.dp))
     }
 }
 
@@ -379,9 +483,19 @@ private fun CompactRankRow(s: HGSeries, rank: Int, onOpen: (String) -> Unit) {
                         color = Color(0.95f, 0.30f, 0.30f),
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Medium,
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false),
                     )
                 }
-                Text(if (s.episodeCount > 0) "全${s.episodeCount}集" else "热播短剧", color = c.secondary, fontSize = 12.sp)
+                Text(
+                    if (s.episodeCount > 0) "全${s.episodeCount}集" else "热播短剧",
+                    color = c.secondary,
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    softWrap = false,
+                )
             }
         }
     }

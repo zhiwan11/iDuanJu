@@ -166,9 +166,8 @@ fun HomeScreen(onOpenDetail: (String) -> Unit, onSearch: () -> Unit = {}, onPlay
             if (!immersive) Column(Modifier.dsPinned(pinned).padding(top = 6.dp)) {
                 Row(
                     Modifier.padding(horizontal = 16.dp).fillMaxWidth().height(46.dp)
-                        .clip(RoundedCornerShape(50))
-                        .background(c.glass)
-                        .border(1.dp, c.glassBorder, RoundedCornerShape(50)),
+                        // same glass material as the dock / detail chrome (follows 我的 → 玻璃质感)
+                        .glassSurface(RoundedCornerShape(50), shadowRadius = 0.dp, fallbackAlpha = if (c.dark) 0.60f else 0.80f),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Row(Modifier.weight(1f).fillMaxHeight().clickable(onClick = onSearch).padding(start = 16.dp).semantics { contentDescription = "home.search" },

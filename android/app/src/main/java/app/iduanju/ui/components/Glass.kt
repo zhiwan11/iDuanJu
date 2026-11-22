@@ -6,6 +6,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.CornerBasedShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -77,22 +78,80 @@ class SearchDockState(initialQuery: String = "") {
     }
 }
 
+/** Global glass material, switchable live from 我的 → 外观. */
+enum class GlassStyle(val label: String) { LIQUID("液态玻璃"), FROSTED("毛玻璃") }
+
+/** Reactive, SharedPreferences-backed holder for the app-wide [GlassStyle] (default [GlassStyle.LIQUID]). */
+object GlassStylePref {
+    private const val PREFS = "idj"
+    private const val KEY = "ui.glass.style"
+    private val prefs by lazy {
+        runCatching { app.iduanju.IdjApp.instance.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE) }.getOrNull()
+    }
+
+    var style: GlassStyle by mutableStateOf(
+        prefs?.getString(KEY, null)?.let { n -> GlassStyle.entries.firstOrNull { it.name == n } } ?: GlassStyle.LIQUID,
+    )
+        private set
+
+    fun update(newStyle: GlassStyle) {
+        if (style == newStyle) return
+        style = newStyle
+        prefs?.edit()?.putString(KEY, newStyle.name)?.apply()
+    }
+}
+
+/**
+ * Backdrop recorded from the root NavHost content. Only valid for overlays drawn OUTSIDE the
+ * `layerBackdrop(rootBackdrop)` subtree (tab bar / rail); anything inside the NavHost must use its own local
+ * `rememberLayerBackdrop()` (or [glassSurface] without a backdrop), otherwise the layer would sample itself.
+ */
+val LocalRootBackdrop = compositionLocalOf<Backdrop?> { null }
+
+/** Colours shared by every glass surface so LIQUID / FROSTED look identical everywhere in the app. */
+private class GlassPalette(dark: Boolean) {
+    val liquidTint = if (dark) Color.Black.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.08f)
+    val frostTint = if (dark) Color(0xFF1C1E24).copy(alpha = 0.72f) else Color.White.copy(alpha = 0.68f)
+    val frostFallback = if (dark) Color(0xFF1C1E24).copy(alpha = 0.84f) else Color.White.copy(alpha = 0.90f)
+    val rimTop = Color.White.copy(alpha = if (dark) 0.26f else 0.60f)
+    val rimBottom = Color.White.copy(alpha = if (dark) 0.06f else 0.20f)
+    val frostBorder = if (dark) Color.White.copy(alpha = 0.12f) else Color.Black.copy(alpha = 0.08f)
+    val sheen = Color.White.copy(alpha = if (dark) 0.10f else 0.22f)
+    val shadow = Color.Black.copy(alpha = if (dark) 0.24f else 0.12f)
+}
+
+/**
+ * The single glass material of the app, driven by [GlassStylePref].
+ *
+ * - [backdrop] != null on API 31+: real backdrop sampling. LIQUID (API 33+) = refractive lens + sheer tint + specular
+ *   highlight; FROSTED = 18 dp blur, high-readability tint and a 0.7 dp hairline.
+ * - otherwise: a static surface that visually matches the selected style (sheer fill + specular rim for LIQUID,
+ *   denser frosted fill + soft hairline for FROSTED). [fallbackAlpha] is the LIQUID fallback fill opacity.
+ *
+ * [dark] forces the dark palette (player chrome); [base] is the surface colour of LIQUID fallbacks.
+ */
 @Composable
-private fun Modifier.liquidGlassSurface(
+fun Modifier.glassSurface(
     shape: CornerBasedShape,
-    backdrop: Backdrop?,
-    surfaceTint: Color,
-    noLensSurfaceTint: Color,
-    fallbackColor: Color,
-    borderTopColor: Color,
-    borderBottomColor: Color,
+    backdrop: Backdrop? = null,
+    dark: Boolean = IdjThemeColors.dark,
+    base: Color = if (dark == IdjThemeColors.dark) IdjThemeColors.surface else Color(0xFF15171C),
     shadowRadius: Dp = 18.dp,
-    shadowColor: Color = Color.Black.copy(alpha = 0.14f),
-    highlightAlpha: Float = 0.50f,
     activeOverlay: Color = Color.Transparent,
+    fallbackAlpha: Float = 0.90f,
+    highlightAlpha: Float = 0.50f,
 ): Modifier {
+    val frosted = GlassStylePref.style == GlassStyle.FROSTED
+    val p = remember(dark) { GlassPalette(dark) }
     val canBlur = backdrop != null && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S
-    val hasLens = canBlur && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU
+    val hasLens = canBlur && !frosted && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU
+    val shadowColor = p.shadow
+    val noLensTint = base.copy(alpha = if (dark) 0.50f else 0.54f)
+    val edge = if (frosted) {
+        Modifier.border(0.7.dp, p.frostBorder, shape)
+    } else {
+        Modifier.border(0.7.dp, Brush.verticalGradient(listOf(p.rimTop, p.rimBottom)), shape)
+    }
     return if (canBlur) {
         this
             .drawBackdrop(
@@ -109,24 +168,19 @@ private fun Modifier.liquidGlassSurface(
                             chromaticAberration = true,
                         )
                     } else {
-                        blur(12f.dp.toPx())
+                        blur((if (frosted) 18f else 12f).dp.toPx())
                     }
                 },
                 highlight = {
-                    if (hasLens) {
-                        Highlight(
+                    when {
+                        hasLens -> Highlight(
                             width = 0.75.dp,
                             blurRadius = 0.5.dp,
                             alpha = highlightAlpha,
                             style = HighlightStyle.Default(intensity = 0.5f),
                         )
-                    } else {
-                        Highlight(
-                            width = 0.75.dp,
-                            blurRadius = 0.dp,
-                            alpha = highlightAlpha * 0.8f,
-                            style = HighlightStyle.Plain,
-                        )
+                        frosted -> Highlight(width = 0.5.dp, blurRadius = 0.dp, alpha = 0.22f, style = HighlightStyle.Plain)
+                        else -> Highlight(width = 0.75.dp, blurRadius = 0.dp, alpha = highlightAlpha * 0.8f, style = HighlightStyle.Plain)
                     }
                 },
                 shadow = {
@@ -137,34 +191,65 @@ private fun Modifier.liquidGlassSurface(
                     )
                 },
                 onDrawSurface = {
-                    drawRect(if (hasLens) surfaceTint else noLensSurfaceTint)
-                    if (activeOverlay.alpha > 0f) {
-                        drawRect(activeOverlay)
-                    }
-                },
-            )
-            .then(
-                if (!hasLens) {
-                    Modifier.border(
-                        0.7.dp,
-                        Brush.verticalGradient(listOf(borderTopColor, borderBottomColor)),
-                        shape,
+                    drawRect(
+                        when {
+                            frosted -> p.frostTint
+                            hasLens -> p.liquidTint
+                            else -> noLensTint
+                        },
                     )
-                } else {
-                    Modifier
+                    if (activeOverlay.alpha > 0f) drawRect(activeOverlay)
                 },
             )
+            .then(if (!hasLens) edge else Modifier)
     } else {
         this
             .shadow(shadowRadius, shape, ambientColor = shadowColor, spotColor = shadowColor)
             .clip(shape)
-            .background(fallbackColor)
-            .then(if (activeOverlay.alpha > 0f) Modifier.background(activeOverlay) else Modifier)
-            .border(
-                0.8.dp,
-                Brush.verticalGradient(listOf(borderTopColor, borderBottomColor)),
-                shape,
+            .then(
+                if (frosted) {
+                    Modifier.background(p.frostFallback)
+                } else {
+                    // sheer fill + soft top specular sheen, like a lens catching light
+                    Modifier
+                        .background(base.copy(alpha = fallbackAlpha))
+                        .background(Brush.verticalGradient(0f to p.sheen, 0.55f to Color.Transparent))
+                },
             )
+            .then(if (activeOverlay.alpha > 0f) Modifier.background(activeOverlay) else Modifier)
+            .then(edge)
+    }
+}
+
+/** Round glass icon button (back / favourite / more) built on [glassSurface]. */
+@Composable
+fun GlassIconButton(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    modifier: Modifier = Modifier,
+    backdrop: Backdrop? = null,
+    size: Dp = 40.dp,
+    iconSize: Dp = 20.dp,
+    dark: Boolean = IdjThemeColors.dark,
+    tint: Color = if (dark) Color.White else IdjThemeColors.text,
+    fallbackAlpha: Float = 0.55f,
+    enabled: Boolean = true,
+    onClick: () -> Unit,
+) {
+    Box(
+        modifier
+            .size(size)
+            .glassSurface(
+                shape = CircleShape,
+                backdrop = backdrop,
+                dark = dark,
+                shadowRadius = 8.dp,
+                fallbackAlpha = fallbackAlpha,
+            )
+            .pressClick(0.92f, enabled = enabled, label = label, onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(icon, label, tint = tint, modifier = Modifier.size(iconSize))
     }
 }
 
@@ -178,18 +263,7 @@ fun GlassCapsule(
     val c = IdjThemeColors
     Row(
         modifier
-            .liquidGlassSurface(
-                shape = PillShape,
-                backdrop = backdrop,
-                surfaceTint = if (c.dark) Color.Black.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.08f),
-                noLensSurfaceTint = c.surface.copy(alpha = if (c.dark) 0.50f else 0.54f),
-                fallbackColor = c.surface.copy(alpha = 0.90f),
-                borderTopColor = Color.White.copy(alpha = if (c.dark) 0.24f else 0.55f),
-                borderBottomColor = Color.White.copy(alpha = if (c.dark) 0.06f else 0.20f),
-                shadowRadius = 18.dp,
-                shadowColor = Color.Black.copy(alpha = if (c.dark) 0.24f else 0.12f),
-                highlightAlpha = 0.50f,
-            )
+            .glassSurface(shape = PillShape, backdrop = backdrop, shadowRadius = 18.dp)
             .padding(contentPadding),
         verticalAlignment = Alignment.CenterVertically,
         content = content,
@@ -250,18 +324,7 @@ fun GlassTabBar(
                     Modifier
                         .width(leftW)
                         .height(circleSize)
-                        .liquidGlassSurface(
-                            shape = PillShape,
-                            backdrop = backdrop,
-                            surfaceTint = if (c.dark) Color.Black.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.08f),
-                            noLensSurfaceTint = c.surface.copy(alpha = if (c.dark) 0.50f else 0.54f),
-                            fallbackColor = c.surface.copy(alpha = 0.90f),
-                            borderTopColor = Color.White.copy(alpha = if (c.dark) 0.24f else 0.55f),
-                            borderBottomColor = Color.White.copy(alpha = if (c.dark) 0.06f else 0.20f),
-                            shadowRadius = 18.dp,
-                            shadowColor = Color.Black.copy(alpha = if (c.dark) 0.24f else 0.12f),
-                            highlightAlpha = 0.50f,
-                        )
+                        .glassSurface(shape = PillShape, backdrop = backdrop, shadowRadius = 18.dp)
                         .then(
                             if (searchSelected) {
                                 Modifier.clickable {
@@ -330,19 +393,7 @@ fun GlassTabBar(
                         Modifier
                             .width(rightW)
                             .height(circleSize)
-                            .liquidGlassSurface(
-                                shape = PillShape,
-                                backdrop = backdrop,
-                                surfaceTint = if (c.dark) Color.Black.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.08f),
-                                noLensSurfaceTint = c.surface.copy(alpha = if (c.dark) 0.50f else 0.54f),
-                                fallbackColor = c.surface.copy(alpha = 0.90f),
-                                borderTopColor = Color.White.copy(alpha = if (c.dark) 0.24f else 0.55f),
-                                borderBottomColor = Color.White.copy(alpha = if (c.dark) 0.06f else 0.20f),
-                                shadowRadius = 18.dp,
-                                shadowColor = Color.Black.copy(alpha = if (c.dark) 0.24f else 0.12f),
-                                highlightAlpha = 0.50f,
-                                activeOverlay = if (searchSelected) c.accent.copy(alpha = if (c.dark) 0.06f else 0.04f) else Color.Transparent,
-                            )
+                            .glassSurface(shape = PillShape, backdrop = backdrop, shadowRadius = 18.dp, activeOverlay = if (searchSelected) c.accent.copy(alpha = if (c.dark) 0.06f else 0.04f) else Color.Transparent)
                             .then(
                                 if (!searchSelected) {
                                     Modifier.clickable { onSearch?.invoke() }
@@ -477,19 +528,7 @@ fun GlassNavigationRail(
             Box(
                 Modifier
                     .size(56.dp)
-                    .liquidGlassSurface(
-                        shape = PillShape,
-                        backdrop = backdrop,
-                        surfaceTint = if (c.dark) Color.Black.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.08f),
-                        noLensSurfaceTint = c.surface.copy(alpha = if (c.dark) 0.50f else 0.54f),
-                        fallbackColor = c.surface.copy(alpha = 0.90f),
-                        borderTopColor = Color.White.copy(alpha = if (c.dark) 0.24f else 0.55f),
-                        borderBottomColor = Color.White.copy(alpha = if (c.dark) 0.06f else 0.20f),
-                        shadowRadius = 14.dp,
-                        shadowColor = Color.Black.copy(alpha = if (c.dark) 0.24f else 0.12f),
-                        highlightAlpha = 0.50f,
-                        activeOverlay = if (searchSelected) c.text.copy(alpha = if (c.dark) 0.14f else 0.10f) else Color.Transparent,
-                    )
+                    .glassSurface(shape = PillShape, backdrop = backdrop, shadowRadius = 14.dp, activeOverlay = if (searchSelected) c.text.copy(alpha = if (c.dark) 0.14f else 0.10f) else Color.Transparent)
                     .clickable(onClick = onSearch),
                 contentAlignment = Alignment.Center,
             ) {
@@ -500,18 +539,7 @@ fun GlassNavigationRail(
         Column(
             Modifier
                 .fillMaxWidth()
-                .liquidGlassSurface(
-                    shape = RailShape,
-                    backdrop = backdrop,
-                    surfaceTint = if (c.dark) Color.Black.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.08f),
-                    noLensSurfaceTint = c.surface.copy(alpha = if (c.dark) 0.50f else 0.54f),
-                    fallbackColor = c.surface.copy(alpha = 0.90f),
-                    borderTopColor = Color.White.copy(alpha = if (c.dark) 0.24f else 0.55f),
-                    borderBottomColor = Color.White.copy(alpha = if (c.dark) 0.06f else 0.20f),
-                    shadowRadius = 14.dp,
-                    shadowColor = Color.Black.copy(alpha = if (c.dark) 0.24f else 0.12f),
-                    highlightAlpha = 0.50f,
-                )
+                .glassSurface(shape = RailShape, backdrop = backdrop, shadowRadius = 14.dp)
                 .padding(6.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(6.dp),

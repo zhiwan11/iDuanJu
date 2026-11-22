@@ -24,6 +24,7 @@ import app.iduanju.ui.category.CategoryScreen
 import app.iduanju.ui.components.GlassNavigationRail
 import app.iduanju.ui.components.GlassTabBar
 import app.iduanju.ui.components.LayoutMetrics
+import app.iduanju.ui.components.LocalRootBackdrop
 import app.iduanju.ui.components.LocalLayoutMetrics
 import app.iduanju.ui.components.SearchDockState
 import app.iduanju.ui.detail.DetailScreen
@@ -102,6 +103,8 @@ fun RootScreen(initialRoute: String? = null) {
         androidx.compose.runtime.CompositionLocalProvider(
             LocalNavigate provides navigate,
             LocalLayoutMetrics provides metrics,
+            // Root backdrop is only active while the NavHost is recorded into it (chrome nav visible).
+            LocalRootBackdrop provides (if (showChromeNav) backdrop else null),
         ) {
             Row(Modifier.fillMaxSize()) {
                 if (showChromeNav && metrics.useRail) {
@@ -112,9 +115,11 @@ fun RootScreen(initialRoute: String? = null) {
                         searchSelected = route == "search",
                         onSearch = onSelectSearch,
                         searchIcon = searchIcon,
-                        backdrop = backdrop,
+                        backdrop = LocalRootBackdrop.current,
                     )
                 }
+                // NavHost content is drawn INSIDE layerBackdrop(backdrop): never hand it the root backdrop (feedback loop).
+                androidx.compose.runtime.CompositionLocalProvider(LocalRootBackdrop provides null) {
                 NavHost(
                     nav,
                     startDestination = "home",
@@ -241,6 +246,7 @@ fun RootScreen(initialRoute: String? = null) {
                         onSwitchSeries = { sid -> nav.navigate("player/$sid/0") { popUpTo("player/{sid}/{ep}") { inclusive = true } } },
                     )
                 }
+            }
             }
             }
         }

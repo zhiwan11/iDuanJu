@@ -31,6 +31,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.rounded.ArrowBackIos
+import com.kyant.backdrop.backdrops.layerBackdrop
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.PlayArrow
@@ -110,7 +112,15 @@ fun DetailScreen(seriesId: String, onBack: () -> Unit, onPlay: (String, Int) -> 
 
     val metrics = LocalLayoutMetrics.current
     val useTwoPane = metrics.tier == SizeTier.Expanded && d != null
+    // Local backdrop of the page content: the floating back button and play bar are siblings drawn on top of it,
+    // so they can sample real content (the root backdrop can't be used here: this page lives inside it).
+    val bgColor = c.bg
+    val pageBackdrop = com.kyant.backdrop.backdrops.rememberLayerBackdrop {
+        drawRect(bgColor)
+        drawContent()
+    }
     Box(Modifier.fillMaxSize().background(c.bg), contentAlignment = Alignment.TopCenter) {
+      Box(Modifier.fillMaxSize().then(Modifier.layerBackdrop(pageBackdrop)), contentAlignment = Alignment.TopCenter) {
         if (useTwoPane) {
             val dd = d!!
             Row(
@@ -183,15 +193,25 @@ fun DetailScreen(seriesId: String, onBack: () -> Unit, onPlay: (String, Int) -> 
                 }
             }
         }
+      }
         // pinned nav (`.pin` + `.nav`)
         Box(Modifier.fillMaxWidth().dsPinned(pinned || useTwoPane)) {
             DSNavBar(d?.title ?: "", Modifier.statusBarsPadding().padding(bottom = 6.dp), titleAlpha = animateFloatAsState(if (pinned || useTwoPane) 1f else 0f, label = "t").value,
-                leading = { BackButton(if (pinned || useTwoPane) Tone.Glass else Tone.Overlay, onBack) })
+                leading = {
+                    val onHero = !(pinned || useTwoPane)
+                    // over the hero: dark glass + white glyph; pinned: theme glass
+                    GlassIconButton(
+                        Icons.AutoMirrored.Rounded.ArrowBackIos, "返回",
+                        backdrop = pageBackdrop, size = 36.dp, iconSize = 18.dp,
+                        dark = if (onHero) true else c.dark, fallbackAlpha = if (onHero) 0.30f else 0.70f,
+                        onClick = onBack,
+                    )
+                })
         }
         // floating play bar (`.playbar`)
         AnimatedVisibility(!useTwoPane && d?.episodes?.isNotEmpty() == true && actionsOut, Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(horizontal = 16.dp).padding(bottom = 4.dp),
             enter = slideInVertically(DS.panel()) { it } + fadeIn(), exit = slideOutVertically(DS.panel()) { it } + fadeOut()) {
-            Row(Modifier.fillMaxWidth().dsBar(32.dp).padding(8.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(Modifier.fillMaxWidth().glassSurface(RoundedCornerShape(32.dp), backdrop = pageBackdrop, shadowRadius = 20.dp).padding(8.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 PillButton(playTitle, Modifier.weight(1f), icon = Icons.Filled.PlayArrow, tone = PillTone.Ink) { onPlay(seriesId, startEp) }
                 d?.let { Heart(seriesId, it, 48.dp) }
             }
