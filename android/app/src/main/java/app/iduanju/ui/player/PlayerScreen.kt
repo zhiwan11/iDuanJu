@@ -89,7 +89,13 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
     var danmaku by remember { mutableStateOf(true) }
     var quality by remember { mutableStateOf<String?>(null) }
     var fillMode by remember { mutableStateOf(PlayerPrefs.getFillMode(ctx)) }
+    var ambientMode by remember { mutableStateOf(PlayerPrefs.getAmbientMode(ctx)) }
     var enhanceLevel by remember { mutableIntStateOf(PlayerPrefs.getEnhanceLevel(ctx)) }
+    var textureView by remember { mutableStateOf<android.view.TextureView?>(null) }
+    var ambientTop by remember { mutableStateOf(Color.Black) }
+    var ambientBottom by remember { mutableStateOf(Color.Black) }
+    var ambientLeft by remember { mutableStateOf(Color.Black) }
+    var ambientRight by remember { mutableStateOf(Color.Black) }
     /** 0 = off, -1 = after current episode, >0 = minutes countdown. */
     var sleepMode by remember { mutableIntStateOf(0) }
     var sleepEndMs by remember { mutableLongStateOf(0L) }
@@ -157,6 +163,33 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
 
     LaunchedEffect(player, enhanceLevel) {
         applyVideoEnhance(player, enhanceLevel)
+    }
+    LaunchedEffect(seriesId, epIndex) {
+        ambientTop = Color.Black
+        ambientBottom = Color.Black
+        ambientLeft = Color.Black
+        ambientRight = Color.Black
+    }
+    LaunchedEffect(ambientMode, fillMode, inPip, playing, textureView) {
+        if (!ambientMode || fillMode || inPip || !playing) return@LaunchedEffect
+        val tv = textureView ?: return@LaunchedEffect
+        while (isActive) {
+            val bmp = if (tv.isAvailable) runCatching { tv.getBitmap(16, 16) }.getOrNull() else null
+            if (bmp != null) {
+                val sampled = withContext(Dispatchers.Default) {
+                    try {
+                        computeAmbientEdgeColors(bmp)
+                    } finally {
+                        bmp.recycle()
+                    }
+                }
+                ambientTop = sampled.top
+                ambientBottom = sampled.bottom
+                ambientLeft = sampled.left
+                ambientRight = sampled.right
+            }
+            delay(320)
+        }
     }
 
     val activeQueue by rememberUpdatedState(queue)
@@ -378,6 +411,13 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
     val showPadSplit = !inPip && metrics.isTablet && landscape && metrics.widthDp >= 840 && isPortraitMedia && detail != null && padDrawerOpen
     Row(Modifier.fillMaxSize().background(Color.Black)) {
     Box(Modifier.weight(1f).fillMaxHeight().background(Color.Black)) {
+        AmbientGlowLayer(
+            topColor = ambientTop,
+            bottomColor = ambientBottom,
+            leftColor = ambientLeft,
+            rightColor = ambientRight,
+            visible = ambientMode && !fillMode && !inPip,
+        )
         AndroidView(
             factory = {
                 (android.view.LayoutInflater.from(it).inflate(app.iduanju.R.layout.player_texture_view, null) as PlayerView).apply {
@@ -385,10 +425,14 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                     setShutterBackgroundColor(android.graphics.Color.BLACK)
                     layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
                     this.player = player
+                }.also { pv ->
+                    textureView = pv.videoSurfaceView as? android.view.TextureView
                 }
             },
             update = { view ->
                 view.resizeMode = if (fillMode) AspectRatioFrameLayout.RESIZE_MODE_ZOOM else AspectRatioFrameLayout.RESIZE_MODE_FIT
+                val tv = view.videoSurfaceView as? android.view.TextureView
+                if (tv !== textureView) textureView = tv
                 if (app.iduanju.BuildConfig.DEBUG) {
                     // Inspect Media3's actual SurfaceView, not the Compose/PlayerView wrapper.
                     val controls = showChrome
@@ -643,6 +687,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                     "more" -> {
                         MoreSettingsPanel(
                             fillMode = fillMode,
+                            ambientMode = ambientMode,
                             enhanceLevel = enhanceLevel,
                             sleepMode = sleepMode,
                             sleepEndMs = sleepEndMs,
@@ -653,6 +698,11 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                                 fillMode = fill
                                 PlayerPrefs.setFillMode(ctx, fill)
                                 seekHint = if (fill) "画面：铺满裁剪" else "画面：完整适应"
+                            },
+                            onAmbientMode = { on ->
+                                ambientMode = on
+                                PlayerPrefs.setAmbientMode(ctx, on)
+                                seekHint = if (on) "氛围光晕：已开启" else "氛围光晕：已关闭"
                             },
                             onEnhance = { lvl ->
                                 enhanceLevel = lvl
@@ -918,6 +968,7 @@ private const val ACTION_PIP_NEXT = "app.iduanju.action.PIP_NEXT"
 @Composable
 private fun MoreSettingsPanel(
     fillMode: Boolean,
+    ambientMode: Boolean,
     enhanceLevel: Int,
     sleepMode: Int,
     sleepEndMs: Long,
@@ -925,6 +976,7 @@ private fun MoreSettingsPanel(
     showAutoNext: Boolean,
     pc: IdjColors,
     onFillMode: (Boolean) -> Unit,
+    onAmbientMode: (Boolean) -> Unit,
     onEnhance: (Int) -> Unit,
     onSleep: (Int) -> Unit,
     onAutoNext: (Boolean) -> Unit,
@@ -946,6 +998,15 @@ private fun MoreSettingsPanel(
         selected = fillMode,
         pc = pc,
         onSelect = onFillMode,
+    )
+    Spacer(Modifier.height(10.dp))
+
+    MoreOptionRow(
+        label = "黑边氛围光晕",
+        options = listOf("开启" to true, "关闭" to false),
+        selected = ambientMode,
+        pc = pc,
+        onSelect = onAmbientMode,
     )
     Spacer(Modifier.height(10.dp))
 
@@ -1015,5 +1076,131 @@ private fun <T> MoreOptionRow(
                 )
             }
         }
+    }
+}
+
+private data class AmbientEdgeColors(
+    val top: Color = Color.Black,
+    val bottom: Color = Color.Black,
+    val left: Color = Color.Black,
+    val right: Color = Color.Black,
+)
+
+private fun computeAmbientEdgeColors(bmp: android.graphics.Bitmap): AmbientEdgeColors {
+    val w = bmp.width
+    val h = bmp.height
+    if (w <= 0 || h <= 0) return AmbientEdgeColors()
+    val pixels = IntArray(w * h)
+    bmp.getPixels(pixels, 0, w, 0, 0, w, h)
+    val stripY = (h / 6).coerceIn(1, 3)
+    val stripX = (w / 6).coerceIn(1, 3)
+
+    fun averageRegion(xStart: Int, xEnd: Int, yStart: Int, yEnd: Int): Color {
+        var rSum = 0L
+        var gSum = 0L
+        var bSum = 0L
+        var count = 0
+        for (y in yStart until yEnd) {
+            val rowOffset = y * w
+            for (x in xStart until xEnd) {
+                val px = pixels[rowOffset + x]
+                rSum += (px shr 16) and 0xFF
+                gSum += (px shr 8) and 0xFF
+                bSum += px and 0xFF
+                count++
+            }
+        }
+        if (count == 0) return Color.Black
+        val r = (rSum / count).toInt()
+        val g = (gSum / count).toInt()
+        val b = (bSum / count).toInt()
+        val hsv = FloatArray(3)
+        android.graphics.Color.RGBToHSV(r, g, b, hsv)
+        if (hsv[1] > 0.04f) {
+            hsv[1] = (hsv[1] * 1.25f).coerceIn(0f, 0.82f)
+        }
+        hsv[2] = if (hsv[2] < 0.04f) 0f else hsv[2].coerceIn(0.10f, 0.72f)
+        return Color(android.graphics.Color.HSVToColor(hsv))
+    }
+
+    return AmbientEdgeColors(
+        top = averageRegion(0, w, 0, stripY),
+        bottom = averageRegion(0, w, h - stripY, h),
+        left = averageRegion(0, stripX, 0, h),
+        right = averageRegion(w - stripX, w, 0, h),
+    )
+}
+
+@Composable
+private fun AmbientGlowLayer(
+    topColor: Color,
+    bottomColor: Color,
+    leftColor: Color,
+    rightColor: Color,
+    visible: Boolean = true,
+    modifier: Modifier = Modifier,
+) {
+    val layerAlpha by androidx.compose.animation.core.animateFloatAsState(
+        targetValue = if (visible) 1f else 0f,
+        animationSpec = androidx.compose.animation.core.tween(450),
+        label = "ambientVisible",
+    )
+    if (layerAlpha <= 0.005f) return
+    val animTop by androidx.compose.animation.animateColorAsState(topColor, androidx.compose.animation.core.tween(650), label = "ambTop")
+    val animBottom by androidx.compose.animation.animateColorAsState(bottomColor, androidx.compose.animation.core.tween(650), label = "ambBottom")
+    val animLeft by androidx.compose.animation.animateColorAsState(leftColor, androidx.compose.animation.core.tween(650), label = "ambLeft")
+    val animRight by androidx.compose.animation.animateColorAsState(rightColor, androidx.compose.animation.core.tween(650), label = "ambRight")
+
+    androidx.compose.foundation.Canvas(modifier.fillMaxSize()) {
+        val w = size.width
+        val h = size.height
+        if (w <= 0f || h <= 0f) return@Canvas
+        val edgeAlpha = 0.42f * layerAlpha
+        drawRect(
+            brush = Brush.verticalGradient(
+                0f to animTop.copy(alpha = edgeAlpha),
+                0.38f to Color.Transparent,
+                startY = 0f,
+                endY = h,
+            ),
+        )
+        drawRect(
+            brush = Brush.verticalGradient(
+                0.62f to Color.Transparent,
+                1f to animBottom.copy(alpha = edgeAlpha),
+                startY = 0f,
+                endY = h,
+            ),
+        )
+        drawRect(
+            brush = Brush.horizontalGradient(
+                0f to animLeft.copy(alpha = edgeAlpha * 0.9f),
+                0.35f to Color.Transparent,
+                startX = 0f,
+                endX = w,
+            ),
+        )
+        drawRect(
+            brush = Brush.horizontalGradient(
+                0.65f to Color.Transparent,
+                1f to animRight.copy(alpha = edgeAlpha * 0.9f),
+                startX = 0f,
+                endX = w,
+            ),
+        )
+        drawRect(
+            brush = Brush.radialGradient(
+                colors = listOf(animTop.copy(alpha = edgeAlpha * 0.55f), Color.Transparent),
+                center = androidx.compose.ui.geometry.Offset(w * 0.5f, 0f),
+                radius = maxOf(w, h) * 0.58f,
+            ),
+        )
+        drawRect(
+            brush = Brush.radialGradient(
+                colors = listOf(animBottom.copy(alpha = edgeAlpha * 0.55f), Color.Transparent),
+                center = androidx.compose.ui.geometry.Offset(w * 0.5f, h),
+                radius = maxOf(w, h) * 0.58f,
+            ),
+        )
     }
 }

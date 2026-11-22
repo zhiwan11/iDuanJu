@@ -18,7 +18,8 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
-import dev.chrisbanes.haze.hazeSource
+import com.kyant.backdrop.backdrops.layerBackdrop
+import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import app.iduanju.ui.category.CategoryScreen
 import app.iduanju.ui.components.GlassNavigationRail
 import app.iduanju.ui.components.GlassTabBar
@@ -46,8 +47,12 @@ fun RootScreen(initialRoute: String? = null) {
     val route = back?.destination?.route ?: "home"
     LaunchedEffect(route) { when (route) { "home" -> tab = 0; "tvbox" -> tab = 1; "category" -> tab = 2; "profile" -> tab = 3 } }
     val atRoot = route in setOf("home", "tvbox", "search", "category", "profile")
-    /** Backdrop for the floating tab bar's blur (Haze): everything the NavHost draws. */
-    val haze = androidx.compose.runtime.remember { dev.chrisbanes.haze.HazeState() }
+    /** Backdrop for the floating liquid-glass navigation bar: everything the NavHost draws. */
+    val bgColor = IdjThemeColors.bg
+    val backdrop = rememberLayerBackdrop {
+        drawRect(bgColor)
+        drawContent()
+    }
     val cfg = androidx.compose.ui.platform.LocalConfiguration.current
 
     BoxWithConstraints(Modifier.fillMaxSize()) {
@@ -105,13 +110,13 @@ fun RootScreen(initialRoute: String? = null) {
                         searchSelected = route == "search",
                         onSearch = onSelectSearch,
                         searchIcon = searchIcon,
-                        haze = haze,
+                        backdrop = backdrop,
                     )
                 }
                 NavHost(
                     nav,
                     startDestination = "home",
-                    modifier = Modifier.weight(1f).fillMaxHeight().then(if (showChromeNav) Modifier.hazeSource(haze) else Modifier),
+                    modifier = Modifier.weight(1f).fillMaxHeight().then(if (showChromeNav) Modifier.layerBackdrop(backdrop) else Modifier),
                 ) {
                 composable("home") { HomeScreen(onOpenDetail = { nav.navigate("detail/$it") }, onSearch = { nav.navigate("search") }, onPlay = { nav.navigate("player/$it/0") }, onOpenManga = { nav.navigate("manga/" + android.net.Uri.encode(it)) }, onImmersiveChanged = { novelImmersive = it }) }
                 composable("tvbox") {
@@ -240,7 +245,7 @@ fun RootScreen(initialRoute: String? = null) {
                 searchSelected = route == "search",
                 onSearch = onSelectSearch,
                 searchIcon = searchIcon,
-                haze = haze,
+                backdrop = backdrop,
                 modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 4.dp),
             )
         }

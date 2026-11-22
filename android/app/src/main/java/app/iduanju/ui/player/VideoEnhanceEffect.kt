@@ -136,12 +136,13 @@ class CasSharpenEffect(private val level: Int) : GlEffect {
     }
 }
 
-/** Persistent player preferences (playback speed, enhance level, fill mode). */
+/** Persistent player preferences (playback speed, enhance level, fill mode, ambient mode). */
 object PlayerPrefs {
     private const val PREF_NAME = "idj_player_prefs"
     private const val KEY_SPEED = "playback_speed"
     private const val KEY_ENHANCE = "enhance_level"
     private const val KEY_FILL = "fill_mode"
+    private const val KEY_AMBIENT = "ambient_mode"
 
     fun getSpeed(ctx: Context): Float =
         ctx.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE).getFloat(KEY_SPEED, 1f).coerceIn(0.5f, 3f)
@@ -162,6 +163,13 @@ object PlayerPrefs {
 
     fun setFillMode(ctx: Context, fill: Boolean) {
         ctx.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE).edit().putBoolean(KEY_FILL, fill).apply()
+    }
+
+    fun getAmbientMode(ctx: Context): Boolean =
+        ctx.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE).getBoolean(KEY_AMBIENT, true)
+
+    fun setAmbientMode(ctx: Context, on: Boolean) {
+        ctx.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE).edit().putBoolean(KEY_AMBIENT, on).apply()
     }
 }
 

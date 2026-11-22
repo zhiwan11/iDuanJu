@@ -255,6 +255,7 @@ private fun DetailBody(
     onPlay: (String, Int) -> Unit, onOpenSeries: (String) -> Unit, playTitle: String, startEp: Int, onActions: (Float) -> Unit,
 ) {
     val c = IdjThemeColors
+    val go = app.iduanju.ui.LocalNavigate.current
     val ranges = EpisodeGroups.ranges(d.episodes.size)
     val g = if (group in ranges.indices) group else 0
     Stats(d, Modifier.padding(top = 18.dp))
@@ -273,7 +274,31 @@ private fun DetailBody(
         }
     }
     if (d.cast.isEmpty() && d.actors.isNotEmpty()) {
-        Text("主演：" + d.actors.joinToString(" / "), color = c.secondary, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 20.dp).padding(top = 12.dp))
+        val actors = d.actors.filter { it.isNotBlank() }
+        if (actors.isNotEmpty()) {
+            LazyRow(
+                Modifier.padding(top = 12.dp),
+                contentPadding = PaddingValues(horizontal = 20.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                item { Text("主演", color = c.secondary, fontSize = 12.sp) }
+                items(actors) { actorName ->
+                    Box(
+                        Modifier
+                            .height(26.dp)
+                            .clip(CircleShape)
+                            .background(c.glass)
+                            .border(0.6.dp, c.hairline, CircleShape)
+                            .clickable { go("actorSearch/${android.net.Uri.encode(actorName)}") }
+                            .padding(horizontal = 10.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(actorName, color = c.text, fontSize = 12.sp, maxLines = 1)
+                    }
+                }
+            }
+        }
     }
     if (d.desc.isNotEmpty()) Intro(d.desc)
 
@@ -310,7 +335,25 @@ private fun DetailBody(
         SectionHeader2("演员", inset = 20.dp, modifier = Modifier.padding(top = 24.dp))
         LazyRow(Modifier.padding(top = 12.dp), contentPadding = PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(14.dp)) {
             items(d.cast) { p ->
-                Column(Modifier.width(64.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                Column(
+                    Modifier
+                        .width(64.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .clickable(enabled = p.id.isNotBlank() || p.name.isNotBlank()) {
+                            if (p.id.isNotBlank()) {
+                                go(
+                                    "actor/${android.net.Uri.encode(p.id)}" +
+                                        "?name=${android.net.Uri.encode(p.name)}" +
+                                        "&avatar=${android.net.Uri.encode(p.avatar)}" +
+                                        "&role=${android.net.Uri.encode(p.role)}" +
+                                        "&intro=${android.net.Uri.encode(p.intro)}",
+                                )
+                            } else if (p.name.isNotBlank()) {
+                                go("actorSearch/${android.net.Uri.encode(p.name)}")
+                            }
+                        },
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
                     Box(Modifier.size(56.dp).clip(CircleShape).background(Brush.linearGradient(listOf(c.accent.copy(0.5f), c.accentWarm.copy(0.5f)))), contentAlignment = Alignment.Center) {
                         Text(p.name.take(1), color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
                         if (p.avatar.isNotEmpty()) AsyncImage(p.avatar, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
