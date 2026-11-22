@@ -26,6 +26,15 @@ enum class MangaTapLayout(val key: String, val label: String) {
     companion object { fun of(k: String?) = entries.firstOrNull { it.key == k } ?: LR }
 }
 
+/** 可达阅读器 翻页效果 for the horizontal paged modes (左翻 / 日漫 / 双页). */
+enum class MangaPageAnim(val label: String) {
+    CURL("仿真翻页"),
+    COVER("覆盖"),
+    SLIDE("平滑"),
+    FADE("淡入");
+    companion object { fun of(k: String?) = entries.firstOrNull { it.name == k } ?: CURL }
+}
+
 /** Reader preferences (Compose-observable, persisted to the shared "idj" prefs under `manga.reader.*`). */
 object MangaReaderPrefs {
     private val sp by lazy { IdjApp.instance.getSharedPreferences("idj", Context.MODE_PRIVATE) }
@@ -47,14 +56,26 @@ object MangaReaderPrefs {
     var splitWide by mutableStateOf(b("splitWide", false))
     var invert by mutableStateOf(b("invert", false))
     var grayscale by mutableStateOf(b("gray", false))
+    /** 漫画超分：0 关闭 · 1 标准（即时 GPU 着色器）· 2 增强（离线 Real-ESRGAN 神经网络）. */
+    var superResLevel by mutableIntStateOf(i("superRes", 0).coerceIn(0, 2))
+
+    // 沉浸氛围（雨天窗景 / 列车车窗 / 新年烟火 / 雪夜）+ 环境音效
+    var atmosphere by mutableStateOf(MangaAtmosphere.entries.firstOrNull { it.name == s("atmosphere") } ?: MangaAtmosphere.OFF)
+    var atmosphereSound by mutableStateOf(b("atmoSound", true))
+    var atmosphereVolume by mutableFloatStateOf(f("atmoVolume", 0.55f).coerceIn(0f, 1f))
 
     // 翻页 / 手势
     var tapLayout by mutableStateOf(MangaTapLayout.of(s("tap")))
     var tapInvert by mutableStateOf(b("tapInvert", false))
     var volumeKeys by mutableStateOf(b("volume", true))
-    var pageAnim by mutableStateOf(b("pageAnim", true))
+    /** 翻页动画开关 (the old `pageAnim` boolean key): off = tap / volume-key turns jump instantly. */
+    var turnAnim by mutableStateOf(b("pageAnim", true))
+    /** 翻页效果 for paged modes; default 仿真翻页. */
+    var pageAnim by mutableStateOf(MangaPageAnim.of(s("pageAnimFx")))
     /** 自动阅读速度 0..1：条漫 = 滚动速度，翻页 = 翻页间隔。 */
     var autoSpeed by mutableFloatStateOf(f("autoSpeed", 0.35f))
+    /** 翻页音效 (可达阅读器 page-flip.wav); also plays whenever 沉浸氛围 环境音效 is on. */
+    var pageFlipSound by mutableStateOf(b("flipSound", false))
 
     // 阅读设置
     var keepScreenOn by mutableStateOf(b("keepOn", true))
@@ -79,7 +100,13 @@ object MangaReaderPrefs {
     fun updateTapLayout(v: MangaTapLayout) { tapLayout = v; put("tap", v.key) }
     fun updateTapInvert(v: Boolean) { tapInvert = v; put("tapInvert", v) }
     fun updateVolumeKeys(v: Boolean) { volumeKeys = v; put("volume", v) }
-    fun updatePageAnim(v: Boolean) { pageAnim = v; put("pageAnim", v) }
+    fun updateTurnAnim(v: Boolean) { turnAnim = v; put("pageAnim", v) }
+    fun updatePageAnim(v: MangaPageAnim) { pageAnim = v; put("pageAnimFx", v.name) }
+    fun updateSuperResLevel(v: Int) { superResLevel = v.coerceIn(0, 2); put("superRes", superResLevel) }
+    fun updateAtmosphere(v: MangaAtmosphere) { atmosphere = v; put("atmosphere", v.name) }
+    fun updateAtmosphereSound(v: Boolean) { atmosphereSound = v; put("atmoSound", v) }
+    fun updateAtmosphereVolume(v: Float) { atmosphereVolume = v.coerceIn(0f, 1f); put("atmoVolume", atmosphereVolume) }
+    fun updatePageFlipSound(v: Boolean) { pageFlipSound = v; put("flipSound", v) }
     fun updateAutoSpeed(v: Float) { autoSpeed = v.coerceIn(0f, 1f); put("autoSpeed", autoSpeed) }
     fun updateKeepScreenOn(v: Boolean) { keepScreenOn = v; put("keepOn", v) }
     fun updateShowSystemBar(v: Boolean) { showSystemBar = v; put("sysBar", v) }

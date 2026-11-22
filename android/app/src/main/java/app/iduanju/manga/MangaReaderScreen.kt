@@ -10,6 +10,8 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
+import android.graphics.drawable.BitmapDrawable
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -43,6 +45,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.key.KeyEventType
@@ -63,6 +66,9 @@ import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.findViewTreeLifecycleOwner
 import app.iduanju.IdjApp
 import app.iduanju.core.manga.MangaDetail
 import app.iduanju.ui.components.glassPill
@@ -74,8 +80,10 @@ import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import coil.imageLoader
 import coil.request.CachePolicy
 import coil.request.ImageRequest
+import coil.request.SuccessResult
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filterIsInstance
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -93,7 +101,14 @@ private enum class ReaderPanel(val label: String) { CATALOG("目录"), IMAGE("�
 private enum class TapAction { PREV, NEXT, MENU }
 
 /** Live handles of whichever reading surface is composed, so taps / volume keys / 自动阅读 / the scrubber can drive it. */
-private class ReaderNav { var list: LazyListState? = null; var pager: PagerState? = null }
+private class ReaderNav {
+    var list: LazyListState? = null
+    var pager: PagerState? = null
+    /** 仿真翻页 / 覆盖 / 淡入 viewer (平滑 uses [pager]). */
+    var book: BookPagerState? = null
+    val pagedPage: Int? get() = book?.currentPage ?: pager?.currentPage
+    val pagedCount: Int? get() = book?.pageCount ?: pager?.pageCount
+}
 
 private tailrec fun Context.findActivity(): Activity? = when (this) { is Activity -> this; is ContextWrapper -> baseContext.findActivity(); else -> null }
 
@@ -157,8 +172,10 @@ fun MangaReaderScreen(id: String, startIndex: Int, startPage: Int, onBack: () ->
     suspend fun seek(page: Int) {
         if (pages.isEmpty()) return
         val t = page.coerceIn(0, pages.lastIndex)
-        if (mode == MangaReadMode.WEBTOON) nav.list?.scrollToItem(t)
-        else nav.pager?.let { pg -> slots.indexOfFirst { t in it.pages }.takeIf { it >= 0 }?.let { pg.scrollToPage(it) } }
+        if (mode == MangaReadMode.WEBTOON) { nav.list?.scrollToItem(t); return }
+        val slot = slots.indexOfFirst { t in it.pages }.takeIf { it >= 0 } ?: return
+        val book = nav.book
+        if (book != null) book.jumpTo(slot) else nav.pager?.scrollToPage(slot)
     }
     suspend fun turn(forward: Boolean) {
         if (pages.isEmpty()) return
@@ -167,14 +184,21 @@ fun MangaReaderScreen(id: String, startIndex: Int, startPage: Int, onBack: () ->
             if (forward && !l.canScrollForward) { goChapter(index + 1); return }
             if (!forward && !l.canScrollBackward) { goChapter(index - 1, last = true); return }
             val step = zoom.size.height * 0.85f / zoom.scale * if (forward) 1 else -1
-            if (P.pageAnim) l.animateScrollBy(step) else l.scrollBy(step)
+            if (P.turnAnim) l.animateScrollBy(step) else l.scrollBy(step)
         } else {
+            nav.book?.let { book ->
+                // 仿真翻页 / 覆盖 / 淡入: animated 340 ms turn; past either end changes chapter
+                if (!book.turn(scope, forward, animate = P.turnAnim)) {
+                    if (forward) goChapter(index + 1) else goChapter(index - 1, last = true)
+                }
+                return
+            }
             val pg = nav.pager ?: return
             val target = pg.currentPage + if (forward) 1 else -1
             when {
                 target >= pg.pageCount -> goChapter(index + 1)
                 target < 0 -> goChapter(index - 1, last = true)
-                P.pageAnim -> pg.animateScrollToPage(target)
+                P.turnAnim -> pg.animateScrollToPage(target)
                 else -> pg.scrollToPage(target)
             }
         }
@@ -212,6 +236,32 @@ fun MangaReaderScreen(id: String, startIndex: Int, startPage: Int, onBack: () ->
     LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
     LaunchedEffect(panel, chrome) { runCatching { focus.requestFocus() } }
 
+    // 沉浸氛围 环境音效: one player for the reader's lifetime; paused with the activity, released on exit.
+    val ambientAudio = remember { MangaAmbientAudioPlayer() }
+    DisposableEffect(ambientAudio) {
+        ambientAudio.attachContext(ctx)
+        onDispose { ambientAudio.release() }
+    }
+    /** 可达 page-flip.wav on every paged turn when 翻页音效 or the 沉浸氛围 环境音效 is on. */
+    fun pageFlipSound() {
+        if (P.pageFlipSound || (P.atmosphere != MangaAtmosphere.OFF && P.atmosphereSound)) ambientAudio.playPageFlip()
+    }
+    LaunchedEffect(P.atmosphere, P.atmosphereSound, P.atmosphereVolume) {
+        ambientAudio.setState(P.atmosphere, P.atmosphereSound, P.atmosphereVolume)
+    }
+    val lifecycle = view.findViewTreeLifecycleOwner()?.lifecycle
+    DisposableEffect(lifecycle) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_PAUSE -> ambientAudio.pause()
+                Lifecycle.Event.ON_RESUME -> ambientAudio.setState(P.atmosphere, P.atmosphereSound, P.atmosphereVolume)
+                else -> {}
+            }
+        }
+        lifecycle?.addObserver(observer)
+        onDispose { lifecycle?.removeObserver(observer) }
+    }
+
     // 屏幕常亮
     DisposableEffect(P.keepScreenOn) { view.keepScreenOn = P.keepScreenOn; onDispose { view.keepScreenOn = false } }
     // 沉浸式：hide the system bars with the HUD unless 显示系统状态栏 is on.
@@ -243,8 +293,9 @@ fun MangaReaderScreen(id: String, startIndex: Int, startPage: Int, onBack: () ->
         } else {
             while (isActive) {
                 delay((12000 - 10000 * P.autoSpeed).toLong())
-                val pg = nav.pager ?: break
-                if (pg.currentPage + 1 >= pg.pageCount && index + 1 >= d.chapters.size) { autoRead = false; break }
+                val pgNow = nav.pagedPage ?: break
+                val pgCount = nav.pagedCount ?: break
+                if (pgNow + 1 >= pgCount && index + 1 >= d.chapters.size) { autoRead = false; break }
                 turn(true)
             }
         }
@@ -289,7 +340,7 @@ fun MangaReaderScreen(id: String, startIndex: Int, startPage: Int, onBack: () ->
                     key(index, mode) {
                         if (mode == MangaReadMode.WEBTOON) {
                             val list = rememberLazyListState(initialFirstVisibleItemIndex = (if (resume < 0) pages.lastIndex else resume).coerceIn(0, pages.lastIndex))
-                            DisposableEffect(list) { nav.list = list; nav.pager = null; onDispose { if (nav.list === list) nav.list = null } }
+                            DisposableEffect(list) { nav.list = list; nav.pager = null; nav.book = null; onDispose { if (nav.list === list) nav.list = null } }
                             LaunchedEffect(list) { snapshotFlow { list.firstVisibleItemIndex }.collect { current = it.coerceAtMost(pages.lastIndex) } }
                             LaunchedEffect(list) { list.interactionSource.interactions.filterIsInstance<DragInteraction.Start>().collect { chrome = false; panel = null } }
                             LazyColumn(Modifier.fillMaxSize(), state = list, verticalArrangement = Arrangement.spacedBy(if (P.webtoonGap) 6.dp else 0.dp)) {
@@ -298,12 +349,33 @@ fun MangaReaderScreen(id: String, startIndex: Int, startPage: Int, onBack: () ->
                                 }
                                 item(key = "end") { ChapterEnd(d, index) { goChapter(it) } }
                             }
+                        } else if (P.pageAnim != MangaPageAnim.SLIDE) {
+                            // 仿真翻页 / 覆盖 / 淡入
+                            val initial = remember { val target = if (resume < 0) pages.lastIndex else resume; slots.indexOfFirst { target in it.pages }.coerceAtLeast(0) }
+                            val slotsNow by rememberUpdatedState(slots)
+                            val book = rememberBookPagerState(initial) { slotsNow.size + 1 }
+                            DisposableEffect(book) { nav.book = book; nav.pager = null; nav.list = null; onDispose { if (nav.book === book) nav.book = null } }
+                            LaunchedEffect(book) { snapshotFlow { book.currentPage }.collect { pg -> slotsNow.getOrNull(pg)?.let { current = it.pages.first() }; zoom.reset() } }
+                            LaunchedEffect(book) { snapshotFlow { book.currentPage }.drop(1).collect { pageFlipSound() } }
+                            LaunchedEffect(book) { snapshotFlow { book.dragStarts }.collect { if (it > 0) { chrome = false; panel = null } } }
+                            // Keep the reader on the same picture when a wide page is discovered and the slots re-flow.
+                            LaunchedEffect(slots) {
+                                if (book.currentPage >= slots.size || book.isTurning) return@LaunchedEffect
+                                val t = slots.indexOfFirst { current in it.pages }
+                                if (t >= 0 && t != book.currentPage && slots.getOrNull(book.currentPage)?.pages?.contains(current) != true) book.jumpTo(t)
+                            }
+                            BookPageCurlViewer(book, P.pageAnim, rtl, enabled = !zoomed, paper = if (P.invert) Color(0xFF1C1C20) else Color(0xFFF3F0EA)) { pg ->
+                                val slot = slots.getOrNull(pg)
+                                if (slot == null) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { ChapterEnd(d, index) { goChapter(it) } }
+                                else SlotView(slot, pages, p.imageHeaders, rtl, filter) { i, w, h -> if (slot.half == 0) wide[i] = w > h * 1.05f }
+                            }
                         } else {
                             val initial = remember { val target = if (resume < 0) pages.lastIndex else resume; slots.indexOfFirst { target in it.pages }.coerceAtLeast(0) }
                             val pager = rememberPagerState(initialPage = initial) { slots.size + 1 }
                             val slotsNow by rememberUpdatedState(slots)
-                            DisposableEffect(pager) { nav.pager = pager; nav.list = null; onDispose { if (nav.pager === pager) nav.pager = null } }
+                            DisposableEffect(pager) { nav.pager = pager; nav.list = null; nav.book = null; onDispose { if (nav.pager === pager) nav.pager = null } }
                             LaunchedEffect(pager) { snapshotFlow { pager.currentPage }.collect { pg -> slotsNow.getOrNull(pg)?.let { current = it.pages.first() } } }
+                            LaunchedEffect(pager) { snapshotFlow { pager.currentPage }.drop(1).collect { pageFlipSound() } }
                             LaunchedEffect(pager) { pager.interactionSource.interactions.filterIsInstance<DragInteraction.Start>().collect { chrome = false; panel = null } }
                             LaunchedEffect(pager) { snapshotFlow { pager.settledPage }.collect { zoom.reset() } }
                             // Keep the reader on the same picture when a wide page is discovered and the slots re-flow.
@@ -323,6 +395,8 @@ fun MangaReaderScreen(id: String, startIndex: Int, startPage: Int, onBack: () ->
                 // 护眼 / 亮度 overlays sit over the pages but under the HUD.
                 if (P.warm > 0.01f) Box(Modifier.fillMaxSize().background(Color(0xFFFF9A2E).copy(alpha = P.warm * 0.32f)))
                 if (P.brightness < 0.99f) Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = (1f - P.brightness) * 0.85f)))
+                // 沉浸氛围: draw-only, inside the backdrop so the glass HUD refracts the rain / snow too.
+                MangaAtmosphereOverlay(P.atmosphere)
             }
         }
 
@@ -373,7 +447,7 @@ fun MangaReaderScreen(id: String, startIndex: Int, startPage: Int, onBack: () ->
                         when (pn) {
                             ReaderPanel.CATALOG -> CatalogPanel(d, index) { panel = null; goChapter(it) }
                             ReaderPanel.IMAGE -> ImagePanel()
-                            ReaderPanel.TURN -> TurnPanel(mode, autoRead, ::setMode) { on -> autoRead = on; if (on) { panel = null; chrome = false } }
+                            ReaderPanel.TURN -> TurnPanel(mode, autoRead, ::setMode, setPageAnim = { a -> if (a != P.pageAnim) { resume = current; zoom.reset(); P.updatePageAnim(a) } }) { on -> autoRead = on; if (on) { panel = null; chrome = false } }
                             ReaderPanel.SETTINGS -> SettingsPanel()
                         }
                     }
@@ -484,16 +558,35 @@ internal fun ReaderImage(
     var retry by remember(url) { mutableIntStateOf(0) }
     val crop = MangaReaderPrefs.autoCrop && !thumb
     val sizeCb by rememberUpdatedState(onSize)
+    fun request() = ImageRequest.Builder(ctx).data(url).apply { headers.forEach { (k, v) -> addHeader(k, v) } }
+        .transformations(buildList { if (crop) add(AutoCropTransformation(sidesOnly = webtoon)); if (half != 0) add(HalfCropTransformation(right = half == 2)) })
     val req = remember(url, retry, crop, half, webtoon, thumb) {
-        ImageRequest.Builder(ctx).data(url).apply { headers.forEach { (k, v) -> addHeader(k, v) } }
-            .transformations(buildList { if (crop) add(AutoCropTransformation(sidesOnly = webtoon)); if (half != 0) add(HalfCropTransformation(right = half == 2)) })
-            .apply { if (thumb) size(240) }
+        request().apply { if (thumb) size(240) }
             .listener(onSuccess = { _, r -> sizeCb?.invoke(r.drawable.intrinsicWidth, r.drawable.intrinsicHeight) })
             .build()
     }
+    val contentScale = if (webtoon) ContentScale.FillWidth else if (thumb) ContentScale.Crop else ContentScale.Fit
+    // 漫画超分 on the real pages (all modes); never on scrubber thumbnails. 1 标准 = instant AGSL shader;
+    // 2 增强 = Real-ESRGAN ×4 page from MangaAiUpscaler, previewed with the 标准 shader until it lands.
+    val srLevel = if (thumb) 0 else MangaReaderPrefs.superResLevel
+    val aiKey = "$url|$crop|$half|$webtoon"
+    var aiPage by remember(aiKey, srLevel) { mutableStateOf(if (srLevel == 2) MangaAiUpscaler.getCached(aiKey) else null) }
+    LaunchedEffect(aiKey, srLevel) {
+        if (srLevel != 2 || aiPage != null) return@LaunchedEffect
+        // Software decode of the same (cropped) page; leaving composition — fast scrolling / flipping — cancels it.
+        val result = ctx.imageLoader.execute(request().allowHardware(false).build())
+        val source = ((result as? SuccessResult)?.drawable as? BitmapDrawable)?.bitmap ?: return@LaunchedEffect
+        aiPage = MangaAiUpscaler.upscale(ctx, aiKey, source)
+    }
+    aiPage?.let { page ->
+        LaunchedEffect(page) { sizeCb?.invoke(page.width, page.height) }
+        Image(page.asImageBitmap(), null, modifier, alignment = alignment, contentScale = contentScale, colorFilter = filter)
+        return
+    }
+    val srModifier = if (srLevel == 0) modifier else modifier.mangaSuperRes(1)
     SubcomposeAsyncImage(
-        req, null, modifier,
-        contentScale = if (webtoon) ContentScale.FillWidth else if (thumb) ContentScale.Crop else ContentScale.Fit,
+        req, null, srModifier,
+        contentScale = contentScale,
         alignment = alignment, colorFilter = filter,
         loading = {
             Box(if (webtoon) Modifier.fillMaxWidth().height(420.dp) else Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -618,11 +711,24 @@ private fun ImagePanel() {
         PanelSwitch("宽页切分", P.splitWide, "横向跨页拆成两页（左右翻页模式）", enabled = P.mode == MangaReadMode.LTR || P.mode == MangaReadMode.RTL) { P.updateSplitWide(it) }
         PanelSwitch("反色（夜间）", P.invert) { P.updateInvert(it) }
         PanelSwitch("灰度", P.grayscale) { P.updateGrayscale(it) }
+        PanelTitle("漫画超分")
+        PanelSegments(listOf(0, 1, 2), P.superResLevel, { when (it) { 1 -> "标准"; 2 -> "增强"; else -> "关闭" } }) { P.updateSuperResLevel(it) }
+        Text(when (P.superResLevel) {
+            1 -> "极速超分：GPU 线稿锐化 + 网点抗振铃，零延迟省电（Android 13+）"
+            2 -> "AI 精修：离线 Real-ESRGAN AnimeVideo v3 神经网络 ×4，逐页处理"
+            else -> "标准 = 极速 GPU 锐化 · 增强 = 离线 AI 神经网络精修"
+        }, color = Color.White.copy(0.45f), fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp, start = 2.dp))
+        PanelTitle("沉浸氛围")
+        PanelSegments(MangaAtmosphere.entries, P.atmosphere, { it.label }) { P.updateAtmosphere(it) }
+        if (P.atmosphere != MangaAtmosphere.OFF) {
+            PanelSwitch("环境音效", P.atmosphereSound, if (P.atmosphereSound) "开" else "关") { P.updateAtmosphereSound(it) }
+            if (P.atmosphereSound) PanelSlider("音量", P.atmosphereVolume, "${(P.atmosphereVolume * 100).roundToInt()}%") { P.updateAtmosphereVolume(it) }
+        }
     }
 }
 
 @Composable
-private fun TurnPanel(mode: MangaReadMode, autoRead: Boolean, setMode: (MangaReadMode) -> Unit, setAuto: (Boolean) -> Unit) {
+private fun TurnPanel(mode: MangaReadMode, autoRead: Boolean, setMode: (MangaReadMode) -> Unit, setPageAnim: (MangaPageAnim) -> Unit, setAuto: (Boolean) -> Unit) {
     val P = MangaReaderPrefs
     Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(4.dp)) {
         PanelTitle("阅读模式")
@@ -640,7 +746,12 @@ private fun TurnPanel(mode: MangaReadMode, autoRead: Boolean, setMode: (MangaRea
         TapZonePreview(P.tapLayout, P.tapInvert xor (mode == MangaReadMode.RTL || (mode == MangaReadMode.DUAL && P.dualRtl)))
         PanelSwitch("左右反转", P.tapInvert, "左手单手阅读") { P.updateTapInvert(it) }
         PanelSwitch("音量键翻页", P.volumeKeys, "音量下 = 下一页，音量上 = 上一页") { P.updateVolumeKeys(it) }
-        PanelSwitch("翻页动画", P.pageAnim) { P.updatePageAnim(it) }
+        if (mode.paged) {
+            PanelTitle("翻页效果")
+            PanelSegments(MangaPageAnim.entries, P.pageAnim, { it.label }, setPageAnim)
+        }
+        PanelSwitch("翻页动画", P.turnAnim, "关闭后点击 / 音量键直接换页") { P.updateTurnAnim(it) }
+        if (mode.paged) PanelSwitch("翻页音效", P.pageFlipSound, "可达阅读器原声纸张翻页声") { P.updatePageFlipSound(it) }
         PanelTitle("自动阅读")
         PanelSwitch(if (autoRead) "自动阅读中" else "开始自动阅读", autoRead, if (mode == MangaReadMode.WEBTOON) "匀速向下滚动" else "定时翻页，呼出菜单时暂停") { setAuto(it) }
         val sec = 12f - 10f * P.autoSpeed
