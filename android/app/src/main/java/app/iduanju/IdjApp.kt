@@ -29,11 +29,29 @@ class IdjApp : Application(), coil.ImageLoaderFactory {
     lateinit var updater: app.iduanju.update.AppUpdater
         private set
 
-    /** Covers: 黄果 CDNs obfuscate images (AES / XOR) — decoded in an OkHttp interceptor. */
+    /** Tuned Coil ImageLoader: generous memory/disk cache, hardware bitmaps, ignore short CDN cache headers. */
     override fun newImageLoader(): coil.ImageLoader = coil.ImageLoader.Builder(this)
-        .okHttpClient { okhttp3.OkHttpClient.Builder().addInterceptor(app.iduanju.huangguo.CoverDecryptInterceptor).build() }
+        .okHttpClient {
+            okhttp3.OkHttpClient.Builder()
+                .connectionPool(okhttp3.ConnectionPool(8, 5, java.util.concurrent.TimeUnit.MINUTES))
+                .build()
+        }
+        .memoryCache {
+            coil.memory.MemoryCache.Builder(this)
+                .maxSizePercent(0.25)
+                .build()
+        }
+        .diskCache {
+            coil.disk.DiskCache.Builder()
+                .directory(cacheDir.resolve("coil_covers"))
+                .maxSizeBytes(150L * 1024 * 1024)
+                .build()
+        }
         .components { add(app.iduanju.plugin.PluginImageFetcher.Factory()) }
-        .crossfade(true).build()
+        .respectCacheHeaders(false)
+        .allowHardware(true)
+        .crossfade(150)
+        .build()
 
     override fun onCreate() {
         super.onCreate()

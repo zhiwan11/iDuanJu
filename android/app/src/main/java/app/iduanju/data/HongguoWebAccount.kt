@@ -53,6 +53,9 @@ class HongguoWebAccount(ctx: Context) {
     var syncing by mutableStateOf(false)
         private set
 
+    var lastSyncNote by mutableStateOf<String?>(null)
+        private set
+
     val isLoggedIn: Boolean get() = profile != null
 
     init {
@@ -186,7 +189,12 @@ class HongguoWebAccount(ctx: Context) {
         scope.launch {
             try {
                 val cookie = cookies() ?: return@launch
-                val sessionTag = fetchSessionTag(seriesId, cookie) ?: return@launch
+                val sessionTag = fetchSessionTag(seriesId, vid, cookie)
+                if (sessionTag == null) {
+                    Log.w(TAG, "reportProgressAsync: missing pcHistorySessionTag for $seriesId/$vid")
+                    withContext(Dispatchers.Main + NonCancellable) { lastSyncNote = "未获取到网页同步会话，请尝试重新登录" }
+                    return@launch
+                }
 
                 val payload = JSONObject()
                     .put("book_id", seriesId)
@@ -204,16 +212,28 @@ class HongguoWebAccount(ctx: Context) {
                     .header("Cookie", cookie)
                     .header("User-Agent", PC_USER_AGENT)
                     .header("Origin", WEB_ORIGIN)
-                    .header("Referer", "$WEB_ORIGIN/player/$seriesId")
+                    .header("Referer", "$WEB_ORIGIN/player/$seriesId/$vid")
                     .header("X-PC-History-Session", sessionTag)
                     .post(payload.toRequestBody(JSON_MEDIA_TYPE))
                     .build()
 
                 http.newCall(req).execute().use { resp ->
                     val respBody = resp.body?.string().orEmpty()
-                    val ok = runCatching { JSONObject(respBody).optBoolean("isSuccess") }.getOrDefault(false)
-                    if (resp.code == 401 || resp.code == 403 || !ok) {
-                        sessionTags.remove(seriesId)
+                    val json = runCatching { JSONObject(respBody) }.getOrNull()
+                    val ok = json?.optBoolean("isSuccess") == true
+                    Log.i(TAG, "watch-history HTTP ${resp.code} ok=$ok body=${respBody.take(160)}")
+                    if (ok) {
+                        withContext(Dispatchers.Main + NonCancellable) {
+                            lastSyncNote = "已同步第 $episodeNumber 集到红果"
+                        }
+                    } else {
+                        if (resp.code == 401 || resp.code == 403 || !ok) {
+                            sessionTags.remove(seriesId)
+                        }
+                        val reason = json?.optString("reason")?.takeIf { it.isNotBlank() } ?: "HTTP ${resp.code}"
+                        withContext(Dispatchers.Main + NonCancellable) {
+                            lastSyncNote = "同步未生效（$reason）"
+                        }
                     }
                 }
             } catch (e: Exception) {
@@ -222,29 +242,35 @@ class HongguoWebAccount(ctx: Context) {
         }
     }
 
-    private fun fetchSessionTag(seriesId: String, cookie: String): String? {
+    private fun fetchSessionTag(seriesId: String, vid: String, cookie: String): String? {
         val now = System.currentTimeMillis()
         val cached = sessionTags[seriesId]
         if (cached != null && now - cached.second < SESSION_TAG_TTL_MS) {
             return cached.first
         }
 
-        val req = Request.Builder()
-            .url("$WEB_ORIGIN/player/$seriesId")
-            .header("Cookie", cookie)
-            .header("User-Agent", PC_USER_AGENT)
-            .header("Referer", "$WEB_ORIGIN/")
-            .get()
-            .build()
+        for (pageUrl in listOf("$WEB_ORIGIN/player/$seriesId/$vid", "$WEB_ORIGIN/player/$seriesId")) {
+            val req = Request.Builder()
+                .url(pageUrl)
+                .header("Cookie", cookie)
+                .header("User-Agent", PC_USER_AGENT)
+                .header("Referer", "$WEB_ORIGIN/")
+                .get()
+                .build()
 
-        return http.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) return@use null
-            val html = resp.body?.string().orEmpty()
-            val tag = TAG_RE_PLAIN.find(html)?.groupValues?.getOrNull(1)
-                ?: TAG_RE_ESCAPED.find(html)?.groupValues?.getOrNull(1)
-            tag?.takeIf { it.isNotBlank() }?.also {
-                sessionTags[seriesId] = it to System.currentTimeMillis()
+            val tag = runCatching {
+                http.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return@use null
+                    val html = resp.body?.string().orEmpty()
+                    TAG_RE_PLAIN.find(html)?.groupValues?.getOrNull(1)
+                        ?: TAG_RE_ESCAPED.find(html)?.groupValues?.getOrNull(1)
+                }
+            }.getOrNull()
+            if (!tag.isNullOrBlank()) {
+                sessionTags[seriesId] = tag to System.currentTimeMillis()
+                return tag
             }
         }
+        return null
     }
 }

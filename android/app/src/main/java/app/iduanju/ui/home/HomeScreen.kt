@@ -156,7 +156,8 @@ fun HomeScreen(onOpenDetail: (String) -> Unit, onSearch: () -> Unit = {}, onPlay
     LaunchedEffect(immersive) { onImmersiveChanged(immersive) }
     DisposableEffect(Unit) { onDispose { onImmersiveChanged(false) } }
     LaunchedEffect(pager.currentPage) { feedScroll = 0f }
-    val pinned = with(androidx.compose.ui.platform.LocalDensity.current) { feedScroll > 8.dp.toPx() }
+    val density = androidx.compose.ui.platform.LocalDensity.current
+    val pinned by remember(density) { derivedStateOf { feedScroll > with(density) { 8.dp.toPx() } } }
 
     Box(Modifier.fillMaxSize().background(c.bg)) {
         AmbientGlow(visible = !pinned)
@@ -221,11 +222,17 @@ fun HomeScreen(onOpenDetail: (String) -> Unit, onSearch: () -> Unit = {}, onPlay
  */
 @Composable
 private fun BlurBackdrop(url: String?, modifier: Modifier, radius: androidx.compose.ui.unit.Dp, alpha: Float) {
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    val req = remember(url) {
+        coil.request.ImageRequest.Builder(ctx)
+            .data(url)
+            .size(48, 64)
+            .memoryCacheKey("blur:$url")
+            .build()
+    }
     if (android.os.Build.VERSION.SDK_INT >= 31) {
-        AsyncImage(url, null, modifier.blur(radius), contentScale = ContentScale.Crop, alpha = alpha)
+        AsyncImage(req, null, modifier.blur((radius / 2).coerceAtMost(12.dp)), contentScale = ContentScale.Crop, alpha = alpha)
     } else {
-        val ctx = androidx.compose.ui.platform.LocalContext.current
-        val req = remember(url) { coil.request.ImageRequest.Builder(ctx).data(url).size(16, 22).memoryCacheKey("blur:$url").build() }
         AsyncImage(req, null, modifier, contentScale = ContentScale.Crop, alpha = alpha, filterQuality = androidx.compose.ui.graphics.FilterQuality.High)
     }
 }

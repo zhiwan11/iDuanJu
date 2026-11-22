@@ -205,10 +205,17 @@ private fun DetailHero(d: HGSeriesDetail?, sid: String) {
     Box(Modifier.fillMaxWidth().height(300.dp)) {
         // `.bd`: the poster blurred 30 dp past the edges; API < 31 falls back to a tiny upscaled thumbnail.
         Box(Modifier.fillMaxSize().clipToBounds()) {
-            if (android.os.Build.VERSION.SDK_INT >= 31) AsyncImage(d?.cover, null, Modifier.fillMaxSize().scale(1.35f).blur(30.dp), contentScale = ContentScale.Crop)
-            else {
-                val ctx = androidx.compose.ui.platform.LocalContext.current
-                val req = remember(d?.cover) { coil.request.ImageRequest.Builder(ctx).data(d?.cover).size(16, 22).build() }
+            val ctx = androidx.compose.ui.platform.LocalContext.current
+            val req = remember(d?.cover) {
+                coil.request.ImageRequest.Builder(ctx)
+                    .data(d?.cover)
+                    .size(48, 64)
+                    .memoryCacheKey("detail-blur:${d?.cover}")
+                    .build()
+            }
+            if (android.os.Build.VERSION.SDK_INT >= 31) {
+                AsyncImage(req, null, Modifier.fillMaxSize().scale(1.25f).blur(12.dp), contentScale = ContentScale.Crop)
+            } else {
                 AsyncImage(req, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
             }
         }

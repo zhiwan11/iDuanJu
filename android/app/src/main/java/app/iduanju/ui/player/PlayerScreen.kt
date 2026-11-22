@@ -80,8 +80,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
     var pos by remember { mutableLongStateOf(0L) }
     var dur by remember { mutableLongStateOf(0L) }
     var buffered by remember { mutableLongStateOf(0L) }
-    var watchedMs by remember { mutableLongStateOf(0L) }
-    LaunchedEffect(seriesId, epIndex) { watchedMs = 0L }
+    val watchedMs = remember(seriesId, epIndex) { longArrayOf(0L) }
     var speed by remember { mutableFloatStateOf(1f) }
     var holdSpeed by remember { mutableStateOf(false) }
     var seekHint by remember { mutableStateOf<String?>(null) }
@@ -222,14 +221,19 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
     LaunchedEffect(player) {
         var tick = 0
         while (isActive) {
-            pos = player.currentPosition; dur = player.duration.coerceAtLeast(0); buffered = player.bufferedPosition
-            playing = player.isPlaying
-            if (playing) watchedMs += 250L
-            app.iduanju.ui.UiEvidence.playerPositionMs = pos; app.iduanju.ui.UiEvidence.playerPlaying = playing
-            if (queue == null && ++tick % 20 == 0 && playing) detail?.let { d ->
+            val curPos = player.currentPosition
+            val curDur = player.duration.coerceAtLeast(0)
+            val curPlaying = player.isPlaying
+            if (curPlaying) watchedMs[0] += 250L
+            // Only mutate Compose UI states when controls are visible or play state/duration changed
+            if (showChrome || curPlaying != playing || curDur != dur) {
+                pos = curPos; dur = curDur; buffered = player.bufferedPosition; playing = curPlaying
+            }
+            app.iduanju.ui.UiEvidence.playerPositionMs = curPos; app.iduanju.ui.UiEvidence.playerPlaying = curPlaying
+            if (queue == null && ++tick % 20 == 0 && curPlaying) detail?.let { d ->
                 d.episodes.getOrNull(epIndex)?.let { ep ->
-                    lib.record(WatchProgress(seriesId, d.title, d.cover, epIndex, ep.ep, pos / 1000.0, dur / 1000.0, System.currentTimeMillis()))
-                    IdjApp.instance.hgWebAccount.reportProgressAsync(seriesId, ep.vid, ep.ep, pos, watchedMs.coerceAtLeast(1500L), force = false)
+                    lib.record(WatchProgress(seriesId, d.title, d.cover, epIndex, ep.ep, curPos / 1000.0, curDur / 1000.0, System.currentTimeMillis()))
+                    IdjApp.instance.hgWebAccount.reportProgressAsync(seriesId, ep.vid, ep.ep, curPos, watchedMs[0].coerceAtLeast(1500L), force = false)
                 }
             }
             delay(250)
@@ -242,8 +246,10 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
             activity?.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
             activity?.window?.let { w -> androidx.core.view.WindowCompat.getInsetsController(w, w.decorView).show(androidx.core.view.WindowInsetsCompat.Type.systemBars()) }
             if (queue == null) detail?.let { d -> d.episodes.getOrNull(epIndex)?.let { ep ->
-                lib.record(WatchProgress(seriesId, d.title, d.cover, epIndex, ep.ep, pos / 1000.0, dur / 1000.0, System.currentTimeMillis()))
-                if (watchedMs >= 1000L) IdjApp.instance.hgWebAccount.reportProgressAsync(seriesId, ep.vid, ep.ep, pos, watchedMs, force = true)
+                val finalPos = runCatching { player.currentPosition }.getOrDefault(pos)
+                val finalDur = runCatching { player.duration.coerceAtLeast(0) }.getOrDefault(dur)
+                lib.record(WatchProgress(seriesId, d.title, d.cover, epIndex, ep.ep, finalPos / 1000.0, finalDur / 1000.0, System.currentTimeMillis()))
+                if (watchedMs[0] >= 1000L) IdjApp.instance.hgWebAccount.reportProgressAsync(seriesId, ep.vid, ep.ep, finalPos, watchedMs[0], force = true)
             } }
         }
     }

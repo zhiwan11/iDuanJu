@@ -97,7 +97,7 @@ fun ProfileScreen(onOpenDetail: (String) -> Unit = {}) {
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
                             Text("红果账号 · ${hgProfile.nickname}", color = c.text, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Text("已登录 · 看剧进度自动同步到红果", color = c.secondary, fontSize = 12.sp, lineHeight = 16.sp)
+                            Text(ia.hgWebAccount.lastSyncNote ?: "已登录 · 看剧进度自动同步到红果", color = c.secondary, fontSize = 12.sp, lineHeight = 16.sp)
                         }
                         Text("退出", color = c.secondary, fontSize = 14.sp, modifier = Modifier.padding(start = 8.dp))
                     }

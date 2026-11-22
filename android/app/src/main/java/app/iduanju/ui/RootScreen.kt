@@ -108,7 +108,11 @@ fun RootScreen(initialRoute: String? = null) {
                         haze = haze,
                     )
                 }
-                NavHost(nav, startDestination = "home", modifier = Modifier.weight(1f).fillMaxHeight().hazeSource(haze)) {
+                NavHost(
+                    nav,
+                    startDestination = "home",
+                    modifier = Modifier.weight(1f).fillMaxHeight().then(if (showChromeNav) Modifier.hazeSource(haze) else Modifier),
+                ) {
                 composable("home") { HomeScreen(onOpenDetail = { nav.navigate("detail/$it") }, onSearch = { nav.navigate("search") }, onPlay = { nav.navigate("player/$it/0") }, onOpenManga = { nav.navigate("manga/" + android.net.Uri.encode(it)) }, onImmersiveChanged = { novelImmersive = it }) }
                 composable("tvbox") {
                     app.iduanju.tvbox.TVBoxHubScreen(
