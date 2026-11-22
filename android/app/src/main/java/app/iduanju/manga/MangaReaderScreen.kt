@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.os.BatteryManager
+import android.os.Build
 import android.view.KeyEvent as AndroidKeyEvent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
@@ -45,6 +46,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -60,6 +62,7 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -85,6 +88,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filterIsInstance
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -96,6 +100,8 @@ import kotlin.math.roundToInt
 private val HudCard = Color(0xFF232327)
 private val HudShape = RoundedCornerShape(24.dp)
 private val HudDim = Color.White.copy(0.62f)
+/** Text colour for loading / error / 本话完 drawn on the page background (dark on 白色 / 纹理 / light 跟随系统). */
+private val LocalPageInk = compositionLocalOf { Color.White }
 
 private enum class ReaderPanel(val label: String) { CATALOG("目录"), IMAGE("画面"), TURN("翻页"), SETTINGS("设置") }
 private enum class TapAction { PREV, NEXT, MENU }
@@ -158,7 +164,19 @@ fun MangaReaderScreen(id: String, startIndex: Int, startPage: Int, onBack: () ->
     val chapter = d.chapters[index]
     val mode = P.mode
     val rtl = mode == MangaReadMode.RTL || (mode == MangaReadMode.DUAL && P.dualRtl)
-    val filter = remember(P.invert, P.grayscale) { readerColorFilter(P.invert, P.grayscale) }
+    // 标准 below Android 13: no AGSL, so the ink / paper levels ride on the page colour matrix instead.
+    val inkFallback = Build.VERSION.SDK_INT < 33 && P.superResLevel >= 1
+    val filter = remember(P.invert, P.grayscale, inkFallback) { readerColorFilter(P.invert, P.grayscale, inkFallback) }
+    // 图片背景
+    val darkTheme = IdjThemeColors.dark
+    val pageBg = P.pageBg
+    val pageColor = readerPageColor(pageBg, darkTheme, P.paperStyle)
+    val pageInk = if (readerPageIsLight(pageBg, darkTheme)) Color(0xFF26262A) else Color.White
+    val curlPaper = when {
+        P.invert -> Color(0xFF1C1C20)
+        pageBg == MangaPageBg.TEXTURE -> Color(P.paperStyle.tint)
+        else -> Color(0xFFF3F0EA)
+    }
     val slots by remember(pages, mode, P.splitWide, P.dualCoverOffset) {
         derivedStateOf { buildReaderSlots(pages.size, mode, wide, P.splitWide && mode != MangaReadMode.DUAL, P.dualCoverOffset) }
     }
@@ -330,6 +348,7 @@ fun MangaReaderScreen(id: String, startIndex: Int, startPage: Int, onBack: () ->
             Box(
                 Modifier.fillMaxSize()
                     .layerBackdrop(backdrop)
+                    .background(pageColor)
                     .onSizeChanged { zoom.size = it }
                     .readerGestures(zoom,
                         onTap = ::onTap,
@@ -337,6 +356,7 @@ fun MangaReaderScreen(id: String, startIndex: Int, startPage: Int, onBack: () ->
                         onOverflowY = { dy -> nav.list?.dispatchRawDelta(-dy / zoom.scale) })
             ) {
                 Box(Modifier.fillMaxSize().graphicsLayer { scaleX = zoom.scale; scaleY = zoom.scale; translationX = zoom.offset.x; translationY = zoom.offset.y }) {
+                    CompositionLocalProvider(LocalPageInk provides pageInk) {
                     key(index, mode) {
                         if (mode == MangaReadMode.WEBTOON) {
                             val list = rememberLazyListState(initialFirstVisibleItemIndex = (if (resume < 0) pages.lastIndex else resume).coerceIn(0, pages.lastIndex))
@@ -345,7 +365,9 @@ fun MangaReaderScreen(id: String, startIndex: Int, startPage: Int, onBack: () ->
                             LaunchedEffect(list) { list.interactionSource.interactions.filterIsInstance<DragInteraction.Start>().collect { chrome = false; panel = null } }
                             LazyColumn(Modifier.fillMaxSize(), state = list, verticalArrangement = Arrangement.spacedBy(if (P.webtoonGap) 6.dp else 0.dp)) {
                                 itemsIndexed(pages, key = { i, u -> "$i$u" }) { i, u ->
-                                    ReaderImage(u, p.imageHeaders, Modifier.fillMaxWidth(), webtoon = true, filter = filter, pageNo = i + 1)
+                                    ReaderPageFrame(pageBg, Modifier.fillMaxWidth()) {
+                                        ReaderImage(u, p.imageHeaders, Modifier.fillMaxWidth(), webtoon = true, filter = filter, pageNo = i + 1)
+                                    }
                                 }
                                 item(key = "end") { ChapterEnd(d, index) { goChapter(it) } }
                             }
@@ -364,10 +386,12 @@ fun MangaReaderScreen(id: String, startIndex: Int, startPage: Int, onBack: () ->
                                 val t = slots.indexOfFirst { current in it.pages }
                                 if (t >= 0 && t != book.currentPage && slots.getOrNull(book.currentPage)?.pages?.contains(current) != true) book.jumpTo(t)
                             }
-                            BookPageCurlViewer(book, P.pageAnim, rtl, enabled = !zoomed, paper = if (P.invert) Color(0xFF1C1C20) else Color(0xFFF3F0EA)) { pg ->
+                            BookPageCurlViewer(book, P.pageAnim, rtl, enabled = !zoomed, paper = curlPaper, pageBackground = pageColor) { pg ->
                                 val slot = slots.getOrNull(pg)
-                                if (slot == null) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { ChapterEnd(d, index) { goChapter(it) } }
-                                else SlotView(slot, pages, p.imageHeaders, rtl, filter) { i, w, h -> if (slot.half == 0) wide[i] = w > h * 1.05f }
+                                ReaderPageFrame(pageBg, Modifier.fillMaxSize(), immersiveUrl = slot?.let { pages[it.pages.first()] }, headers = p.imageHeaders) {
+                                    if (slot == null) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { ChapterEnd(d, index) { goChapter(it) } }
+                                    else SlotView(slot, pages, p.imageHeaders, rtl, filter) { i, w, h -> if (slot.half == 0) wide[i] = w > h * 1.05f }
+                                }
                             }
                         } else {
                             val initial = remember { val target = if (resume < 0) pages.lastIndex else resume; slots.indexOfFirst { target in it.pages }.coerceAtLeast(0) }
@@ -386,10 +410,15 @@ fun MangaReaderScreen(id: String, startIndex: Int, startPage: Int, onBack: () ->
                             }
                             HorizontalPager(pager, Modifier.fillMaxSize(), reverseLayout = rtl, userScrollEnabled = !zoomed, beyondViewportPageCount = 1) { pg ->
                                 val slot = slots.getOrNull(pg)
-                                if (slot == null) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { ChapterEnd(d, index) { goChapter(it) } }
-                                else SlotView(slot, pages, p.imageHeaders, rtl, filter) { i, w, h -> if (slot.half == 0) wide[i] = w > h * 1.05f }
+                                CompositionLocalProvider(LocalReaderPageActive provides (pg == pager.currentPage)) {
+                                    ReaderPageFrame(pageBg, Modifier.fillMaxSize().background(pageColor), immersiveUrl = slot?.let { pages[it.pages.first()] }, headers = p.imageHeaders) {
+                                        if (slot == null) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { ChapterEnd(d, index) { goChapter(it) } }
+                                        else SlotView(slot, pages, p.imageHeaders, rtl, filter) { i, w, h -> if (slot.half == 0) wide[i] = w > h * 1.05f }
+                                    }
+                                }
                             }
                         }
+                    }
                     }
                 }
                 // 护眼 / 亮度 overlays sit over the pages but under the HUD.
@@ -558,48 +587,68 @@ internal fun ReaderImage(
     var retry by remember(url) { mutableIntStateOf(0) }
     val crop = MangaReaderPrefs.autoCrop && !thumb
     val sizeCb by rememberUpdatedState(onSize)
+    val ink = LocalPageInk.current
+    /** Decoded page size (what is actually drawn) — the 标准 pass sizes its kernel from the on-screen magnification. */
+    var contentSize by remember(url, half, crop) { mutableStateOf(IntSize.Zero) }
+    /** The page's on-screen box — 增强 never shrinks a page below it. */
+    var boxSize by remember { mutableStateOf(IntSize.Zero) }
     fun request() = ImageRequest.Builder(ctx).data(url).apply { headers.forEach { (k, v) -> addHeader(k, v) } }
         .transformations(buildList { if (crop) add(AutoCropTransformation(sidesOnly = webtoon)); if (half != 0) add(HalfCropTransformation(right = half == 2)) })
     val req = remember(url, retry, crop, half, webtoon, thumb) {
         request().apply { if (thumb) size(240) }
-            .listener(onSuccess = { _, r -> sizeCb?.invoke(r.drawable.intrinsicWidth, r.drawable.intrinsicHeight) })
+            .listener(onSuccess = { _, r ->
+                contentSize = IntSize(r.drawable.intrinsicWidth, r.drawable.intrinsicHeight)
+                sizeCb?.invoke(r.drawable.intrinsicWidth, r.drawable.intrinsicHeight)
+            })
             .build()
     }
     val contentScale = if (webtoon) ContentScale.FillWidth else if (thumb) ContentScale.Crop else ContentScale.Fit
-    // 漫画超分 on the real pages (all modes); never on scrubber thumbnails. 1 标准 = instant AGSL shader;
-    // 2 增强 = Real-ESRGAN ×4 page from MangaAiUpscaler, previewed with the 标准 shader until it lands.
+    // 漫画超分 on the real pages (all modes); never on scrubber thumbnails. 1 标准 = instant AGSL pass;
+    // 2 增强 = native-resolution Real-ESRGAN page from MangaAiUpscaler, previewed with the 标准 pass until it lands.
     val srLevel = if (thumb) 0 else MangaReaderPrefs.superResLevel
     val aiKey = "$url|$crop|$half|$webtoon"
     var aiPage by remember(aiKey, srLevel) { mutableStateOf(if (srLevel == 2) MangaAiUpscaler.getCached(aiKey) else null) }
+    val active by rememberUpdatedState(LocalReaderPageActive.current)
     LaunchedEffect(aiKey, srLevel) {
         if (srLevel != 2 || aiPage != null) return@LaunchedEffect
-        // Software decode of the same (cropped) page; leaving composition — fast scrolling / flipping — cancels it.
-        val result = ctx.imageLoader.execute(request().allowHardware(false).build())
+        // The page on screen goes first; a preloaded neighbour (the next page) waits until it becomes visible or the
+        // upscaler has gone idle, so reading ahead is prefetched without ever delaying the current page.
+        snapshotFlow { boxSize.width > 0 }.first { it }
+        if (!active) {
+            delay(500)
+            snapshotFlow { active || !MangaAiUpscaler.busy }.first { it }
+        }
+        // Full-resolution software decode (Size.ORIGINAL, no hardware bitmap) of the same (cropped) page; leaving
+        // composition — fast scrolling / flipping — cancels it.
+        val result = ctx.imageLoader.execute(request().size(coil.size.Size.ORIGINAL).allowHardware(false).build())
         val source = ((result as? SuccessResult)?.drawable as? BitmapDrawable)?.bitmap ?: return@LaunchedEffect
-        aiPage = MangaAiUpscaler.upscale(ctx, aiKey, source)
+        aiPage = MangaAiUpscaler.upscale(ctx, aiKey, source, boxSize.width, if (webtoon) 0 else boxSize.height, fillWidth = webtoon)
     }
+    val measured = modifier.onSizeChanged { boxSize = it }
     aiPage?.let { page ->
         LaunchedEffect(page) { sizeCb?.invoke(page.width, page.height) }
-        Image(page.asImageBitmap(), null, modifier, alignment = alignment, contentScale = contentScale, colorFilter = filter)
+        // Mipmapped + high filter quality: the big page is minified on screen without aliasing.
+        Image(page.asImageBitmap(), null, measured, alignment = alignment, contentScale = contentScale, colorFilter = filter, filterQuality = FilterQuality.High)
         return
     }
-    val srModifier = if (srLevel == 0) modifier else modifier.mangaSuperRes(1)
+    val srModifier = if (srLevel == 0) measured else measured.mangaSuperRes(1, contentSize, fillWidth = webtoon)
     SubcomposeAsyncImage(
         req, null, srModifier,
         contentScale = contentScale,
         alignment = alignment, colorFilter = filter,
+        filterQuality = if (thumb) FilterQuality.Low else FilterQuality.High,
         loading = {
             Box(if (webtoon) Modifier.fillMaxWidth().height(420.dp) else Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 if (thumb) Box(Modifier.fillMaxSize().background(HudCard))
                 else Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    CircularProgressIndicator(color = Color.White.copy(0.7f), strokeWidth = 2.dp, modifier = Modifier.size(26.dp))
-                    if (pageNo > 0) Text("$pageNo", color = Color.White.copy(0.35f), fontSize = 28.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp))
+                    CircularProgressIndicator(color = ink.copy(0.7f), strokeWidth = 2.dp, modifier = Modifier.size(26.dp))
+                    if (pageNo > 0) Text("$pageNo", color = ink.copy(0.35f), fontSize = 28.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp))
                 }
             }
         },
         error = {
             Box((if (webtoon) Modifier.fillMaxWidth().height(300.dp) else Modifier.fillMaxSize()).clickable { retry++ }, contentAlignment = Alignment.Center) {
-                Text(if (thumb) "×" else "第 $pageNo 页加载失败，点我重试", color = Color.White.copy(0.6f), fontSize = 13.sp)
+                Text(if (thumb) "×" else "第 $pageNo 页加载失败，点我重试", color = ink.copy(0.6f), fontSize = 13.sp)
             }
         },
     )
@@ -608,11 +657,12 @@ internal fun ReaderImage(
 @Composable
 private fun ChapterEnd(d: MangaDetail, index: Int, go: (Int) -> Unit) {
     Column(Modifier.fillMaxWidth().heightIn(min = 260.dp).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(14.dp, Alignment.CenterVertically)) {
-        Text("本话完", color = Color.White.copy(0.75f), fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-        Text(d.chapters[index].title, color = Color.White.copy(0.45f), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        val ink = LocalPageInk.current
+        Text("本话完", color = ink.copy(0.75f), fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+        Text(d.chapters[index].title, color = ink.copy(0.45f), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
         if (index + 1 < d.chapters.size) Button({ go(index + 1) }, colors = ButtonDefaults.buttonColors(containerColor = IdjThemeColors.accent, contentColor = Color.White)) {
             Text("下一话：" + d.chapters[index + 1].title, maxLines = 1, overflow = TextOverflow.Ellipsis)
-        } else Text("已是最新一话", color = Color.White.copy(0.5f), fontSize = 12.sp)
+        } else Text("已是最新一话", color = ink.copy(0.5f), fontSize = 12.sp)
     }
 }
 
@@ -705,6 +755,7 @@ private fun ImagePanel() {
     val P = MangaReaderPrefs
     Column(Modifier.verticalScroll(rememberScrollState())) {
         PanelTitle("画面")
+        PageBackgroundRow()
         PanelSlider("亮度", P.brightness, "${(P.brightness * 100).roundToInt()}%", 0.15f..1f) { P.updateBrightness(it) }
         PanelSlider("护眼暖色", P.warm, "${(P.warm * 100).roundToInt()}%") { P.updateWarm(it) }
         PanelSwitch("自动裁白边", P.autoCrop, "去除页面四周的白边 / 黑边") { P.updateAutoCrop(it) }
@@ -714,8 +765,8 @@ private fun ImagePanel() {
         PanelTitle("漫画超分")
         PanelSegments(listOf(0, 1, 2), P.superResLevel, { when (it) { 1 -> "标准"; 2 -> "增强"; else -> "关闭" } }) { P.updateSuperResLevel(it) }
         Text(when (P.superResLevel) {
-            1 -> "极速超分：GPU 线稿锐化 + 网点抗振铃，零延迟省电（Android 13+）"
-            2 -> "AI 精修：离线 Real-ESRGAN AnimeVideo v3 神经网络 ×4，逐页处理"
+            1 -> if (Build.VERSION.SDK_INT >= 33) "极速超分：按放大倍率自适应的 GPU 线稿锐化 + 墨色加深 / 气泡净白，无光晕零延迟" else "极速超分：墨色加深 / 气泡净白（Android 13+ 另含 GPU 线稿锐化）"
+            2 -> "AI 精修：Real-ESRGAN 原分辨率分块超分 + 反投影保真，绝不缩小原图；当前页优先，先以「标准」预览"
             else -> "标准 = 极速 GPU 锐化 · 增强 = 离线 AI 神经网络精修"
         }, color = Color.White.copy(0.45f), fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp, start = 2.dp))
         PanelTitle("沉浸氛围")
@@ -723,6 +774,42 @@ private fun ImagePanel() {
         if (P.atmosphere != MangaAtmosphere.OFF) {
             PanelSwitch("环境音效", P.atmosphereSound, if (P.atmosphereSound) "开" else "关") { P.updateAtmosphereSound(it) }
             if (P.atmosphereSound) PanelSlider("音量", P.atmosphereVolume, "${(P.atmosphereVolume * 100).roundToInt()}%") { P.updateAtmosphereVolume(it) }
+        }
+    }
+}
+
+/** 可达「图片背景」: a value row with a check-marked popup (跟随系统 / 白色 / 黑色 / 沉浸式 / 纹理); 纹理 adds 样式 + 透明度. */
+@Composable
+private fun PageBackgroundRow() {
+    val P = MangaReaderPrefs
+    Column(Modifier.fillMaxWidth().padding(bottom = 4.dp)) {
+        Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text("图片背景", color = Color.White, fontSize = 14.sp, modifier = Modifier.weight(1f))
+            Box {
+                var open by remember { mutableStateOf(false) }
+                Row(Modifier.clip(RoundedCornerShape(10.dp)).clickable { open = true }.padding(horizontal = 8.dp, vertical = 6.dp).testTag("manga.reader.pageBg"),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    Text(P.pageBg.label, color = IdjThemeColors.accent, fontSize = 14.sp)
+                    Icon(Icons.Filled.UnfoldMore, null, tint = IdjThemeColors.accent, modifier = Modifier.size(16.dp))
+                }
+                DropdownMenu(open, { open = false }) {
+                    MangaPageBg.entries.forEach { bg ->
+                        DropdownMenuItem(text = { Text(bg.label) }, onClick = { open = false; P.updatePageBg(bg) },
+                            leadingIcon = { if (bg == P.pageBg) Icon(Icons.Filled.Check, null) else Spacer(Modifier.size(24.dp)) })
+                    }
+                }
+            }
+        }
+        Text(when (P.pageBg) {
+            MangaPageBg.SYSTEM -> "浅色模式白底，深色模式黑底"
+            MangaPageBg.WHITE -> "纯白页边"
+            MangaPageBg.BLACK -> "纯黑页边（OLED 省电）"
+            MangaPageBg.IMMERSIVE -> "以当前页面模糊铺满页边，色彩无缝延展"
+            MangaPageBg.TEXTURE -> "纸张纹理覆盖页面与页边，如同印刷在纸上"
+        }, color = Color.White.copy(0.45f), fontSize = 11.sp, modifier = Modifier.padding(start = 2.dp, bottom = 4.dp))
+        if (P.pageBg == MangaPageBg.TEXTURE) {
+            PanelSegments(MangaPaperStyle.entries, P.paperStyle, { it.label }) { P.updatePaperStyle(it) }
+            PanelSlider("透明度", P.textureOpacity, "${(P.textureOpacity * 100).roundToInt()}%") { P.updateTextureOpacity(it) }
         }
     }
 }

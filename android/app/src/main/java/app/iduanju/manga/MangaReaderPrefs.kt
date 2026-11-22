@@ -35,6 +35,24 @@ enum class MangaPageAnim(val label: String) {
     companion object { fun of(k: String?) = entries.firstOrNull { it.name == k } ?: CURL }
 }
 
+/** 可达阅读器「图片背景」: what fills the margins around a fitted page (and, for 纹理, the paper the page is printed on). */
+enum class MangaPageBg(val label: String) {
+    SYSTEM("跟随系统"),
+    WHITE("白色"),
+    BLACK("黑色"),
+    IMMERSIVE("沉浸式"),
+    TEXTURE("纹理");
+    companion object { fun of(k: String?) = entries.firstOrNull { it.name == k } ?: BLACK }
+}
+
+/** 纹理 paper styles (可达 纹理设置 · 样式). */
+enum class MangaPaperStyle(val label: String, val tint: Long) {
+    CLASSIC("经典", 0xFFF1EADB),
+    WARM("暖黄", 0xFFEBDDBF),
+    RICE("宣纸", 0xFFF5F2EA);
+    companion object { fun of(k: String?) = entries.firstOrNull { it.name == k } ?: CLASSIC }
+}
+
 /** Reader preferences (Compose-observable, persisted to the shared "idj" prefs under `manga.reader.*`). */
 object MangaReaderPrefs {
     private val sp by lazy { IdjApp.instance.getSharedPreferences("idj", Context.MODE_PRIVATE) }
@@ -56,6 +74,10 @@ object MangaReaderPrefs {
     var splitWide by mutableStateOf(b("splitWide", false))
     var invert by mutableStateOf(b("invert", false))
     var grayscale by mutableStateOf(b("gray", false))
+    /** 图片背景 + 纹理 样式 / 透明度. */
+    var pageBg by mutableStateOf(MangaPageBg.of(s("pageBg")))
+    var paperStyle by mutableStateOf(MangaPaperStyle.of(s("paperStyle")))
+    var textureOpacity by mutableFloatStateOf(f("textureOpacity", 0.7f).coerceIn(0f, 1f))
     /** 漫画超分：0 关闭 · 1 标准（即时 GPU 着色器）· 2 增强（离线 Real-ESRGAN 神经网络）. */
     var superResLevel by mutableIntStateOf(i("superRes", 0).coerceIn(0, 2))
 
@@ -102,6 +124,9 @@ object MangaReaderPrefs {
     fun updateVolumeKeys(v: Boolean) { volumeKeys = v; put("volume", v) }
     fun updateTurnAnim(v: Boolean) { turnAnim = v; put("pageAnim", v) }
     fun updatePageAnim(v: MangaPageAnim) { pageAnim = v; put("pageAnimFx", v.name) }
+    fun updatePageBg(v: MangaPageBg) { pageBg = v; put("pageBg", v.name) }
+    fun updatePaperStyle(v: MangaPaperStyle) { paperStyle = v; put("paperStyle", v.name) }
+    fun updateTextureOpacity(v: Float) { textureOpacity = v.coerceIn(0f, 1f); put("textureOpacity", textureOpacity) }
     fun updateSuperResLevel(v: Int) { superResLevel = v.coerceIn(0, 2); put("superRes", superResLevel) }
     fun updateAtmosphere(v: MangaAtmosphere) { atmosphere = v; put("atmosphere", v.name) }
     fun updateAtmosphereSound(v: Boolean) { atmosphereSound = v; put("atmoSound", v) }

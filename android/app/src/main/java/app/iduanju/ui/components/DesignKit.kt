@@ -217,11 +217,18 @@ fun <T> SegmentedTabs(items: List<T>, selected: T, label: (T) -> String, onSelec
     val idx = items.indexOf(selected).coerceAtLeast(0)
     val trackShape = RoundedCornerShape(14.dp)
     val thumbShape = RoundedCornerShape(11.dp)
-    val track = if (liquid) {
+    // Dark mode: the track *darkens* what is behind it (smoked glass) with only a hairline sheen and rim — stacking
+    // white fills / sheens / rims here used to add up to a milky-white bar on the dark page.
+    val track = if (c.dark) {
         Modifier.clip(trackShape)
-            .background(if (c.dark) Color.White.copy(alpha = 0.05f) else Color.Black.copy(alpha = 0.035f))
-            .background(liquidSheenBrush(c.dark))
-            .border(1.dp, liquidRimBrush(c.dark), trackShape)
+            .background(Color.Black.copy(alpha = if (liquid) 0.26f else 0.32f))
+            .background(Brush.verticalGradient(0f to Color.White.copy(alpha = 0.05f), 0.35f to Color.Transparent))
+            .border(0.8.dp, Brush.verticalGradient(listOf(Color.White.copy(alpha = 0.14f), Color.White.copy(alpha = 0.03f))), trackShape)
+    } else if (liquid) {
+        Modifier.clip(trackShape)
+            .background(Color.Black.copy(alpha = 0.035f))
+            .background(liquidSheenBrush(false))
+            .border(1.dp, liquidRimBrush(false), trackShape)
     } else {
         Modifier.clip(trackShape).background(c.glass).border(1.dp, c.hairline, trackShape)
     }
@@ -230,7 +237,15 @@ fun <T> SegmentedTabs(items: List<T>, selected: T, label: (T) -> String, onSelec
         val x by animateDpAsState(w * idx, DS.select(), label = "seg")
         Box(Modifier.offset(x = x).width(w).fillMaxHeight()
             .then(if (!c.dark) Modifier.shadow(if (liquid) 2.dp else 3.dp, thumbShape, ambientColor = c.shadowThumb, spotColor = c.shadowThumb) else Modifier)
-            .then(if (liquid) Modifier.glassPill(thumbShape, selected = true, neutralSelected = true) else Modifier.clip(thumbShape).background(c.thumb)))
+            .then(when {
+                // a clear glass lens with a crisp top highlight — never a frosted white slab
+                c.dark -> Modifier.clip(thumbShape)
+                    .background(Color.White.copy(alpha = 0.10f))
+                    .background(Brush.verticalGradient(0f to Color.White.copy(alpha = 0.12f), 0.5f to Color.Transparent))
+                    .border(0.8.dp, Brush.verticalGradient(listOf(Color.White.copy(alpha = 0.34f), Color.White.copy(alpha = 0.06f))), thumbShape)
+                liquid -> Modifier.glassPill(thumbShape, selected = true, neutralSelected = true)
+                else -> Modifier.clip(thumbShape).background(c.thumb)
+            }))
         Row(Modifier.fillMaxSize()) {
             items.forEachIndexed { i, it ->
                 val on = i == idx
@@ -320,16 +335,25 @@ fun CapsuleButton(title: String, icon: ImageVector? = null, trailing: ImageVecto
     }
 }
 
-enum class PillTone { Accent, Ink, White }
+/** [Play]: the primary 播放 action — the same saturated brand-blue capsule in light and dark (never theme-inverted). */
+enum class PillTone { Accent, Ink, White, Play }
 
-/** `.btn`: 48 dp accent / ink / white capsule (32 dp small). */
+private val PlayGradient = Brush.linearGradient(listOf(Color(0xFF4A90FF), Color(0xFF2B62EC)))
+
+/** `.btn`: 48 dp accent / ink / white / play capsule (32 dp small). */
 @Composable
 fun PillButton(title: String, modifier: Modifier = Modifier, icon: ImageVector? = null, tone: PillTone = PillTone.Accent, small: Boolean = false,
                height: Dp? = null, enabled: Boolean = true, onClick: () -> Unit) {
     val c = IdjThemeColors
-    val bg = when (tone) { PillTone.Accent -> c.accent; PillTone.Ink -> c.text; PillTone.White -> Color.White }
-    val fg = when (tone) { PillTone.Accent -> c.onAccent; PillTone.Ink -> c.bg; PillTone.White -> Color(0xFF111317) }
-    Row(modifier.height(height ?: if (small) 32.dp else 48.dp).clip(CircleShape).background(bg).pressClick(0.98f, enabled, title, onClick)
+    val bg = when (tone) { PillTone.Accent -> c.accent; PillTone.Ink -> c.text; PillTone.White -> Color.White; PillTone.Play -> Color(0xFF3577F5) }
+    val fg = when (tone) { PillTone.Accent -> c.onAccent; PillTone.Ink -> c.bg; PillTone.White -> Color(0xFF111317); PillTone.Play -> Color.White }
+    val fill = if (tone == PillTone.Play) Modifier
+        .shadow(if (c.dark) 0.dp else 10.dp, CircleShape, ambientColor = Color(0xFF2B62EC), spotColor = Color(0xFF2B62EC))
+        .clip(CircleShape).background(PlayGradient)
+        // crisp glass rim: bright on top, fading out toward the bottom
+        .border(1.dp, Brush.verticalGradient(listOf(Color.White.copy(alpha = 0.32f), Color.White.copy(alpha = 0.04f))), CircleShape)
+    else Modifier.clip(CircleShape).background(bg)
+    Row(modifier.height(height ?: if (small) 32.dp else 48.dp).then(fill).pressClick(0.98f, enabled, title, onClick)
         .padding(horizontal = if (small) 14.dp else 22.dp), verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterHorizontally)) {
         if (icon != null) Icon(icon, null, Modifier.size(if (small) 14.dp else 18.dp), tint = fg)

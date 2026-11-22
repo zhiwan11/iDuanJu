@@ -154,7 +154,7 @@ fun DetailScreen(seriesId: String, onBack: () -> Unit, onPlay: (String, Int) -> 
                     val meta = listOfNotNull(if (dd.episodeLabel.isEmpty()) eps else DS.spaced(dd.episodeLabel), dd.author.ifEmpty { null }).joinToString(" · ")
                     if (meta.isNotEmpty()) Text(meta, color = c.secondary, fontSize = 13.sp)
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        PillButton(playTitle, Modifier.weight(1f), icon = Icons.Filled.PlayArrow, tone = PillTone.Ink) { onPlay(seriesId, startEp) }
+                        PillButton(playTitle, Modifier.weight(1f), icon = Icons.Filled.PlayArrow, tone = PillTone.Play) { onPlay(seriesId, startEp) }
                         Heart(seriesId, dd, 48.dp)
                     }
                 }
@@ -212,7 +212,7 @@ fun DetailScreen(seriesId: String, onBack: () -> Unit, onPlay: (String, Int) -> 
         AnimatedVisibility(!useTwoPane && d?.episodes?.isNotEmpty() == true && actionsOut, Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(horizontal = 16.dp).padding(bottom = 4.dp),
             enter = slideInVertically(DS.panel()) { it } + fadeIn(), exit = slideOutVertically(DS.panel()) { it } + fadeOut()) {
             Row(Modifier.fillMaxWidth().glassSurface(RoundedCornerShape(32.dp), backdrop = pageBackdrop, shadowRadius = 20.dp).padding(8.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                PillButton(playTitle, Modifier.weight(1f), icon = Icons.Filled.PlayArrow, tone = PillTone.Ink) { onPlay(seriesId, startEp) }
+                PillButton(playTitle, Modifier.weight(1f), icon = Icons.Filled.PlayArrow, tone = PillTone.Play) { onPlay(seriesId, startEp) }
                 d?.let { Heart(seriesId, it, 48.dp) }
             }
         }
@@ -281,7 +281,7 @@ private fun DetailBody(
     Stats(d, Modifier.padding(top = 18.dp))
     Row(Modifier.padding(horizontal = 20.dp).padding(top = 16.dp).onGloballyPositioned { onActions(it.boundsInRoot().bottom) },
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-        PillButton(playTitle, Modifier.weight(1f), icon = Icons.Filled.PlayArrow, tone = PillTone.Ink, height = 50.dp, enabled = d.episodes.isNotEmpty()) { onPlay(sid, startEp) }
+        PillButton(playTitle, Modifier.weight(1f), icon = Icons.Filled.PlayArrow, tone = PillTone.Play, height = 50.dp, enabled = d.episodes.isNotEmpty()) { onPlay(sid, startEp) }
         Heart(sid, d, 50.dp)
     }
     if (d.tags.isNotEmpty()) {
