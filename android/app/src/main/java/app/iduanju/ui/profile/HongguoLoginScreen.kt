@@ -101,9 +101,12 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 private const val BASE_LOGIN_STYLE_CSS =
-    "* { -webkit-backdrop-filter: none !important; backdrop-filter: none !important; } " +
+    "*, *::before, *::after { animation: none !important; transition: none !important; " +
+        "-webkit-backdrop-filter: none !important; backdrop-filter: none !important; } " +
+        "video { display: none !important; } " +
         "[role=\"dialog\"], [class*=\"pc-login-dialog\"] { " +
         "-webkit-backdrop-filter: none !important; backdrop-filter: none !important; " +
         "max-height: calc(100% - 32px) !important; " +
@@ -196,6 +199,14 @@ private val BRIDGE_JS: String by lazy {
       return cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0';
     }
 
+    function isVisibleRect(el, minW, minH) {
+      if (!el) return false;
+      var cs = getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
+      var r = el.getBoundingClientRect();
+      return r.width >= minW && r.height >= minH;
+    }
+
     function findDialog() {
       return document.querySelector('[role="dialog"], [class*="pc-login-dialog"]');
     }
@@ -203,8 +214,11 @@ private val BRIDGE_JS: String by lazy {
     function setNativeValue(el, val) {
       if (!el) return;
       el.focus();
+      var lastVal = el.value;
       var setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
       setter.call(el, val);
+      var tracker = el._valueTracker;
+      if (tracker) tracker.setValue(lastVal);
       el.dispatchEvent(new Event('input', { bubbles: true }));
       el.dispatchEvent(new Event('change', { bubbles: true }));
     }
@@ -225,13 +239,20 @@ private val BRIDGE_JS: String by lazy {
       if (unchecked) unchecked.click();
     }
 
+    function isAreaCodeInput(inp) {
+      if (!inp) return true;
+      if (inp.closest('.web-login-area-code')) return true;
+      var val = (inp.value || '').trim();
+      return val.indexOf('+') === 0;
+    }
+
     function ensureSmsTab(dlg) {
       if (!dlg) return;
       var existingPhone = findPhoneInput(dlg);
       if (existingPhone && isElVisible(existingPhone)) return;
       var tabs = dlg.querySelectorAll('button, [role="tab"], [role="button"], span, div');
       for (var i = 0; i < tabs.length; i++) {
-        var t = (tabs[i].innerText || '').trim();
+        var t = (tabs[i].textContent || '').trim();
         if (t === '验证码登录' || t === '手机登录' || t === '手机号登录') {
           tabs[i].click();
           break;
@@ -241,11 +262,14 @@ private val BRIDGE_JS: String by lazy {
 
     function findPhoneInput(dlg) {
       if (!dlg) return null;
-      var direct = dlg.querySelector('input[type="tel"], input[placeholder*="手机号"], input[name*="mobile"], input[name*="phone"]');
-      if (direct) return direct;
+      var preferred = dlg.querySelectorAll('.web-login-mobile-code__mobile-input-wrapper input, input[placeholder*="手机"], input[type="tel"], input[name*="mobile"], input[name*="phone"]');
+      for (var p = 0; p < preferred.length; p++) {
+        if (!isAreaCodeInput(preferred[p])) return preferred[p];
+      }
       var inputs = dlg.querySelectorAll('input');
       for (var i = 0; i < inputs.length; i++) {
         var inp = inputs[i];
+        if (isAreaCodeInput(inp)) continue;
         var type = (inp.type || 'text').toLowerCase();
         var ph = inp.placeholder || '';
         if (type !== 'checkbox' && type !== 'hidden' && ph.indexOf('验证码') < 0) return inp;
@@ -261,6 +285,7 @@ private val BRIDGE_JS: String by lazy {
       var inputs = dlg.querySelectorAll('input');
       for (var i = 0; i < inputs.length; i++) {
         var inp = inputs[i];
+        if (isAreaCodeInput(inp)) continue;
         var type = (inp.type || 'text').toLowerCase();
         if (inp !== phoneInp && type !== 'checkbox' && type !== 'hidden') return inp;
       }
@@ -269,12 +294,12 @@ private val BRIDGE_JS: String by lazy {
 
     function findSmsBtn(dlg) {
       if (!dlg) return null;
-      var btn = dlg.querySelector('.web-login-button-input button');
+      var btn = dlg.querySelector('.web-login-button-input button, .web-login-button-input [role="button"], .web-login-button-input span');
       if (btn) return btn;
-      var btns = dlg.querySelectorAll('button, [role="button"]');
+      var btns = dlg.querySelectorAll('button, [role="button"], span');
       for (var i = 0; i < btns.length; i++) {
-        var bt = (btns[i].innerText || '').trim();
-        if (bt.indexOf('验证码') >= 0 || bt.indexOf('重新发送') >= 0 || bt.indexOf('重新获取') >= 0 || /^\d+\s*[s秒]$/i.test(bt)) {
+        var bt = (btns[i].textContent || '').trim();
+        if (bt.indexOf('获取验证码') >= 0 || bt.indexOf('重新发送') >= 0 || bt.indexOf('重新获取') >= 0 || /^\d+\s*[s秒]$/i.test(bt)) {
           return btns[i];
         }
       }
@@ -288,10 +313,72 @@ private val BRIDGE_JS: String by lazy {
       for (var i = 0; i < btns.length; i++) {
         var b = btns[i];
         if (b === smsBtn) continue;
-        var t = (b.innerText || '').replace(/\s+/g, '');
+        var t = (b.textContent || '').replace(/\s+/g, '');
         if (t === '登录/注册' || t === '登录' || t === '立即登录') return b;
       }
       return dlg.querySelector('button[type="submit"]');
+    }
+
+    function detectCaptcha() {
+      var iframes = document.querySelectorAll('iframe');
+      for (var i = 0; i < iframes.length; i++) {
+        if (isVisibleRect(iframes[i], 150, 150)) return true;
+      }
+      var capEls = document.querySelectorAll('[class*="captcha"], [id*="captcha"], [class*="turing"], [class*="secsdk"], [class*="verify-bar"], [class*="vc-"]');
+      for (var ci = 0; ci < capEls.length; ci++) {
+        if (isVisibleRect(capEls[ci], 120, 80)) return true;
+      }
+      if (document.body && (document.body.textContent || '').indexOf('请完成下列验证') >= 0) {
+        return true;
+      }
+      return false;
+    }
+
+    function pushSmsState(dlg) {
+      var hasCaptcha = detectCaptcha();
+      var countdownText = '获取验证码';
+      var errorText = '';
+      if (dlg) {
+        var smsBtn = findSmsBtn(dlg);
+        if (smsBtn) {
+          var bt = (smsBtn.textContent || '').trim();
+          if (bt) countdownText = bt;
+        }
+        var errEl = dlg.querySelector('.web-login-error, [class*="web-login-error"], [class*="error-msg"], [class*="error-tip"]');
+        if (errEl) {
+          var et = (errEl.textContent || '').trim();
+          if (et && isElVisible(errEl)) errorText = et;
+        }
+      }
+      var smsKey = countdownText + '|' + errorText + '|' + hasCaptcha;
+      if (smsKey !== window.__idjLastSmsKey) {
+        window.__idjLastSmsKey = smsKey;
+        if (window.IdjNativeLogin && window.IdjNativeLogin.onSmsState) {
+          window.IdjNativeLogin.onSmsState(countdownText, errorText, hasCaptcha);
+        }
+      }
+      return hasCaptcha;
+    }
+
+    function triggerClick(el) {
+      if (!el) return;
+      var r = el.getBoundingClientRect();
+      var cx = r.left + r.width / 2;
+      var cy = r.top + r.height / 2;
+      var opts = { bubbles: true, cancelable: true, clientX: cx, clientY: cy, view: window };
+      el.dispatchEvent(new MouseEvent('pointerdown', opts));
+      el.dispatchEvent(new MouseEvent('mousedown', opts));
+      el.dispatchEvent(new MouseEvent('pointerup', opts));
+      el.dispatchEvent(new MouseEvent('mouseup', opts));
+      el.click();
+    }
+
+    function diag(msg) {
+      try {
+        if (window.IdjNativeLogin && window.IdjNativeLogin.logDiag) {
+          window.IdjNativeLogin.logDiag(String(msg));
+        }
+      } catch (e) {}
     }
 
     window.__idjActions = {
@@ -312,6 +399,7 @@ private val BRIDGE_JS: String by lazy {
       sendSms: function(phone) {
         var dlg = findDialog();
         if (!dlg) {
+          diag('sendSms dlg=null');
           if (window.IdjNativeLogin) {
             window.IdjNativeLogin.onSmsState('获取验证码', '登录服务正在初始化，请稍候重试', false);
           }
@@ -324,9 +412,21 @@ private val BRIDGE_JS: String by lazy {
           ensureAgreement(dlg);
           setTimeout(function() {
             var btn = findSmsBtn(dlg);
-            if (btn) btn.click();
-          }, 80);
-        }, 40);
+            diag('sendSms phoneInp=' + (phoneInp ? 'found(' + (phoneInp.placeholder || phoneInp.name || phoneInp.type) + ')' : 'null') +
+                 ' smsBtn=' + (btn ? (btn.tagName + ':' + (btn.textContent || '').trim()) : 'null') +
+                 ' disabled=' + (btn ? (!!btn.disabled || btn.getAttribute('aria-disabled') === 'true') : 'n/a') +
+                 ' hasCaptcha=' + detectCaptcha());
+            if (btn) triggerClick(btn);
+            setTimeout(function() {
+              var cap1 = pushSmsState(dlg);
+              diag('sendSms +400ms hasCaptcha=' + cap1);
+            }, 400);
+            setTimeout(function() {
+              var cap2 = pushSmsState(dlg);
+              diag('sendSms +1100ms hasCaptcha=' + cap2);
+            }, 1100);
+          }, 100);
+        }, 60);
       },
       submitSms: function(phone, code) {
         var dlg = findDialog();
@@ -345,9 +445,9 @@ private val BRIDGE_JS: String by lazy {
           ensureAgreement(dlg);
           setTimeout(function() {
             var sub = findSubmitBtn(dlg);
-            if (sub) sub.click();
+            if (sub) triggerClick(sub);
           }, 100);
-        }, 40);
+        }, 60);
       },
       cancelCaptcha: function() {
         var closeBtn = document.querySelector('[class*="captcha"] [class*="close"], #captcha_container [class*="close"], [aria-label="关闭"]');
@@ -359,14 +459,6 @@ private val BRIDGE_JS: String by lazy {
         return 'reloaded';
       }
     };
-
-    function diag(msg) {
-      try {
-        if (window.IdjNativeLogin && window.IdjNativeLogin.logDiag) {
-          window.IdjNativeLogin.logDiag(String(msg));
-        }
-      } catch (e) {}
-    }
 
     var vpEl = document.querySelector('meta[name="viewport"]');
     diag('init iw=' + window.innerWidth + ' ih=' + window.innerHeight + ' vp=' + (vpEl ? vpEl.getAttribute('content') : 'none'));
@@ -392,7 +484,7 @@ private val BRIDGE_JS: String by lazy {
             var btns = document.querySelectorAll(selectors[s]);
             for (var i = 0; i < btns.length; i++) {
               var el = btns[i];
-              if ((el.innerText || '').trim() === '登录') {
+              if ((el.textContent || '').trim() === '登录') {
                 el.click();
                 clicked = true;
                 break;
@@ -443,7 +535,7 @@ private val BRIDGE_JS: String by lazy {
             }
           }
 
-          var dlgText = dlg.innerText || '';
+          var dlgText = dlg.textContent || '';
           var mask = dlg.querySelector('.web-login-scan-code__content__qrcode-wrapper__mask, [class*="qrcode-wrapper__mask"]');
           if (dlgText.indexOf('已扫描') >= 0 || dlgText.indexOf('请在手机') >= 0) {
             qrStatus = 'scanned';
@@ -463,44 +555,10 @@ private val BRIDGE_JS: String by lazy {
           }
         }
 
-        // 4. Detect ByteDance slider/image CAPTCHA
-        var hasCaptcha = false;
-        var capEls = document.querySelectorAll('iframe[src*="captcha"], div[class*="captcha_verify"], #captcha_container, [class*="captcha-verify"], [class*="secsdk-captcha"]');
-        for (var ci = 0; ci < capEls.length; ci++) {
-          if (isElVisible(capEls[ci])) {
-            hasCaptcha = true;
-            break;
-          }
-        }
-        if (!hasCaptcha && document.body && (document.body.innerText || '').indexOf('请完成下列验证') >= 0) {
-          hasCaptcha = true;
-        }
-
-        // 5. Read SMS countdown & error text
-        var countdownText = '获取验证码';
-        var errorText = '';
-        if (dlg) {
-          var smsBtn = findSmsBtn(dlg);
-          if (smsBtn) {
-            var bt = (smsBtn.innerText || '').trim();
-            if (bt) countdownText = bt;
-          }
-          var errEl = dlg.querySelector('.web-login-error, [class*="web-login-error"], [class*="error-msg"], [class*="error-tip"]');
-          if (errEl) {
-            var et = (errEl.innerText || '').trim();
-            if (et && isElVisible(errEl)) errorText = et;
-          }
-        }
-
-        var smsKey = countdownText + '|' + errorText + '|' + hasCaptcha;
-        if (smsKey !== window.__idjLastSmsKey) {
-          window.__idjLastSmsKey = smsKey;
-          if (window.IdjNativeLogin && window.IdjNativeLogin.onSmsState) {
-            window.IdjNativeLogin.onSmsState(countdownText, errorText, hasCaptcha);
-          }
-        }
+        // 4 & 5. Detect CAPTCHA + Read SMS countdown & error text
+        pushSmsState(dlg);
       } catch (e) {}
-    }, 700);
+    }, 1200);
   } catch (e) {}
 })();
 """.trimIndent()
@@ -586,6 +644,7 @@ fun HongguoLoginScreen(onBack: () -> Unit) {
     // QR state
     var qrBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var qrStatus by remember { mutableStateOf("loading") }
+    val qrSeq = remember { AtomicLong(0L) }
     var savingQr by remember { mutableStateOf(false) }
     var saveNotice by remember { mutableStateOf<String?>(null) }
     var saveError by remember { mutableStateOf(false) }
@@ -759,7 +818,7 @@ fun HongguoLoginScreen(onBack: () -> Unit) {
                     .padding(top = if (captchaVisible) 52.dp else 0.dp),
                 factory = { ctx ->
                     WebView(ctx).apply {
-                        setLayerType(View.LAYER_TYPE_SOFTWARE, null)
+                        visibility = View.INVISIBLE
                         setOnTouchListener { _, _ -> !currentCaptchaVisible }
                         settings.apply {
                             javaScriptEnabled = true
@@ -778,9 +837,17 @@ fun HongguoLoginScreen(onBack: () -> Unit) {
                         addJavascriptInterface(
                             IdjNativeLoginBridge(
                                 onQr = { dataUrl, status ->
-                                    mainHandler.post {
+                                    val seq = qrSeq.incrementAndGet()
+                                    scope.launch {
+                                        val decoded = if (dataUrl.isNotBlank()) {
+                                            withContext(Dispatchers.Default) {
+                                                decodeDataUrlBitmap(dataUrl)
+                                            }
+                                        } else {
+                                            null
+                                        }
+                                        if (seq != qrSeq.get()) return@launch
                                         qrStatus = status
-                                        val decoded = decodeDataUrlBitmap(dataUrl)
                                         if (decoded != null) {
                                             qrBitmap = decoded
                                         } else if (status == "loading" && dataUrl.isBlank()) {
@@ -843,6 +910,7 @@ fun HongguoLoginScreen(onBack: () -> Unit) {
                     }
                 },
                 update = { wv ->
+                    wv.visibility = if (captchaVisible) View.VISIBLE else View.INVISIBLE
                     wv.isFocusable = captchaVisible
                     wv.isFocusableInTouchMode = captchaVisible
                 },
