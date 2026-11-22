@@ -274,8 +274,19 @@ object PlayerPrefs {
     fun getFillMode(ctx: Context): Boolean = prefs(ctx).getBoolean("fill_mode", false)
     fun setFillMode(ctx: Context, fill: Boolean) = prefs(ctx).edit().putBoolean("fill_mode", fill).apply()
 
-    fun getAmbientMode(ctx: Context): Boolean = prefs(ctx).getBoolean("ambient_mode", true)
-    fun setAmbientMode(ctx: Context, on: Boolean) = prefs(ctx).edit().putBoolean("ambient_mode", on).apply()
+    fun getAmbientLevel(ctx: Context): Int {
+        val p = prefs(ctx)
+        if (p.contains("ambient_level")) return p.getInt("ambient_level", 2).coerceIn(0, 4)
+        return if (p.getBoolean("ambient_mode", true)) 2 else 0
+    }
+
+    fun setAmbientLevel(ctx: Context, level: Int) {
+        val clamped = level.coerceIn(0, 4)
+        prefs(ctx).edit().putInt("ambient_level", clamped).putBoolean("ambient_mode", clamped > 0).apply()
+    }
+
+    fun getAmbientMode(ctx: Context): Boolean = getAmbientLevel(ctx) > 0
+    fun setAmbientMode(ctx: Context, on: Boolean) = setAmbientLevel(ctx, if (on) 2 else 0)
 }
 
 @OptIn(UnstableApi::class)

@@ -54,6 +54,8 @@ import app.iduanju.core.hongguo.HGRankSub
 import app.iduanju.core.hongguo.HGSeries
 import app.iduanju.ui.theme.IdjThemeColors
 import coil.compose.AsyncImage
+import com.kyant.backdrop.backdrops.layerBackdrop
+import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -159,15 +161,23 @@ fun HomeScreen(onOpenDetail: (String) -> Unit, onSearch: () -> Unit = {}, onPlay
     val density = androidx.compose.ui.platform.LocalDensity.current
     val pinned by remember(density) { derivedStateOf { feedScroll > with(density) { 8.dp.toPx() } } }
 
+    // Local backdrop of what sits behind the header: page colour + ambient glow. The header is a sibling drawn on top
+    // of this layer, so its search capsule gets real drawBackdrop lens refraction (LIQUID) / blur (FROSTED). The
+    // root backdrop can't be used here: this page lives inside it and would sample itself.
+    val bgColor = c.bg
+    val homeBackdrop = rememberLayerBackdrop {
+        drawRect(bgColor)
+        drawContent()
+    }
     Box(Modifier.fillMaxSize().background(c.bg)) {
-        AmbientGlow(visible = !pinned)
+        Box(Modifier.fillMaxSize().layerBackdrop(homeBackdrop)) { AmbientGlow(visible = !pinned) }
         Column(Modifier.fillMaxSize().then(if (immersive) Modifier else Modifier.statusBarsPadding())) {
             // header: search + filter capsule
             if (!immersive) Column(Modifier.dsPinned(pinned).padding(top = 6.dp)) {
                 Row(
                     Modifier.padding(horizontal = 16.dp).fillMaxWidth().height(46.dp)
                         // same glass material as the dock / detail chrome (follows 我的 → 玻璃质感)
-                        .glassSurface(RoundedCornerShape(50), shadowRadius = 0.dp, fallbackAlpha = if (c.dark) 0.60f else 0.80f),
+                        .glassSurface(RoundedCornerShape(50), backdrop = homeBackdrop, shadowRadius = 0.dp, fallbackAlpha = if (c.dark) 0.60f else 0.80f),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Row(Modifier.weight(1f).fillMaxHeight().clickable(onClick = onSearch).padding(start = 16.dp).semantics { contentDescription = "home.search" },
@@ -253,7 +263,7 @@ private fun ChannelSheet(pages: List<Any>, labels: List<String>, current: Int, o
     ModalBottomSheet(onDismiss, sheetState = state, containerColor = c.surface, dragHandle = { BottomSheetDefaults.DragHandle(color = c.text.copy(0.25f)) }) {
         Box(Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
             Text("频道", color = c.text, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.align(Alignment.Center))
-            Box(Modifier.align(Alignment.CenterEnd).clip(RoundedCornerShape(50)).background(c.text.copy(0.1f)).clickable(onClick = onDismiss).padding(horizontal = 16.dp, vertical = 8.dp)) {
+            Box(Modifier.align(Alignment.CenterEnd).glassPill(RoundedCornerShape(50)).clickable(onClick = onDismiss).padding(horizontal = 16.dp, vertical = 8.dp)) {
                 Text("完成", color = c.accent, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
             }
         }
@@ -275,7 +285,7 @@ private fun ChannelSheet(pages: List<Any>, labels: List<String>, current: Int, o
                         row.forEachIndexed { j, t ->
                             val si = subs.indexOf(t)
                             val on = pi == current && (HomeSubSel.map[labels[pi]] ?: 0) == si
-                            Box(Modifier.weight(1f).height(44.dp).clip(RoundedCornerShape(10.dp)).background(if (on) c.accent.copy(0.16f) else c.text.copy(0.07f))
+                            Box(Modifier.weight(1f).height(44.dp).glassPill(RoundedCornerShape(10.dp), selected = on)
                                     .clickable { onPick(pi, if (p is HomeSource && p != HomeSource.huangguo) si else null) }, contentAlignment = Alignment.Center) {
                                 Text(t, color = if (on) c.accent else c.text, fontSize = 15.sp, maxLines = 1)
                             }
@@ -464,10 +474,13 @@ private fun PosterHero(board: String, picks: List<HGSeries>, index: Int, setInde
                             // Explicit 48 dp hit slot; the spec's 32 dp white pill stays visually compact.
                             Box(Modifier.height(touchHeight).width(ctaWidth).testTag("home.hero.cta.$i")
                                 .pressClick(0.98f, label = ctaLabel) { onOpen(s.seriesId) }, contentAlignment = Alignment.Center) {
-                                Row(Modifier.fillMaxWidth().height(visualButtonHeight).testTag("home.hero.pill.$i").clip(CircleShape).background(Color.White).padding(horizontal = pillPadding),
+                                // Glass CTA over the blurred hero, following 我的 → 液态玻璃 / 毛玻璃.
+                                Row(Modifier.fillMaxWidth().height(visualButtonHeight).testTag("home.hero.pill.$i")
+                                    .glassSurface(CircleShape, dark = true, shadowRadius = 6.dp, fallbackAlpha = 0.70f, activeOverlay = Color.White.copy(alpha = 0.10f))
+                                    .padding(horizontal = pillPadding),
                                     verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(iconGap)) {
-                                    Icon(Icons.Filled.PlayArrow, null, Modifier.size(iconSize), tint = Color(0xFF111317))
-                                    Text(ctaLabel, Modifier.weight(1f).testTag("home.hero.ctaText.$i"), color = Color(0xFF111317), style = buttonStyle, maxLines = 1, softWrap = false)
+                                    Icon(Icons.Filled.PlayArrow, null, Modifier.size(iconSize), tint = Color.White)
+                                    Text(ctaLabel, Modifier.weight(1f).testTag("home.hero.ctaText.$i"), color = Color.White, style = buttonStyle, maxLines = 1, softWrap = false)
                                 }
                             }
                         }
@@ -614,7 +627,8 @@ internal fun ContinueRow(list: List<app.iduanju.data.WatchProgress>, onOpen: (St
         LazyRow(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 2.dp),
             horizontalArrangement = Arrangement.spacedBy(if (metrics.tier == SizeTier.Compact) 10.dp else 14.dp)) {
             items(list.take(10), key = { it.seriesId }) { p ->
-                Row(Modifier.width(metrics.continueCardWidth).dsCard(18.dp).pressClick(0.98f, label = p.title) { onOpen(p.seriesId) }
+                Row(Modifier.width(metrics.continueCardWidth).glassSurface(RoundedCornerShape(18.dp), shadowRadius = 12.dp)
+                    .pressClick(0.98f, label = p.title) { onOpen(p.seriesId) }
                     .padding(start = 10.dp, end = 12.dp, top = 10.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Box(Modifier.size(52.dp, 69.dp).clip(RoundedCornerShape(8.dp)).background(c.glass)) {

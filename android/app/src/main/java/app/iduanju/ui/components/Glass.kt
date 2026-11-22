@@ -22,6 +22,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
@@ -89,6 +90,7 @@ enum class GlassStyle(val label: String) { LIQUID("液态玻璃"), FROSTED("毛�
 object GlassStylePref {
     private const val PREFS = "idj"
     private const val KEY = "ui.glass.style"
+    private const val KEY_STRENGTH = "ui.glass.strength"
     private val prefs by lazy {
         runCatching { app.iduanju.IdjApp.instance.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE) }.getOrNull()
     }
@@ -103,7 +105,26 @@ object GlassStylePref {
         style = newStyle
         prefs?.edit()?.putString(KEY, newStyle.name)?.apply()
     }
+
+    /**
+     * LIQUID 通透度 0..1 (我的 → 外观): 0 = densest tint / most readable, 1 = crystal-clear glass with the strongest lens
+     * refraction. Every LIQUID surface and capsule interpolates continuously from it.
+     */
+    var strength: Float by mutableFloatStateOf(prefs?.getFloat(KEY_STRENGTH, 0.72f)?.coerceIn(0f, 1f) ?: 0.72f)
+        private set
+
+    fun updateStrength(v: Float) {
+        val c = v.coerceIn(0f, 1f)
+        strength = c
+        prefs?.edit()?.putFloat(KEY_STRENGTH, c)?.apply()
+    }
 }
+
+/** Linear blend from the 不透明 end ([low], strength 0) to the 通透 end ([high], strength 1). */
+private fun glassLerp(low: Float, high: Float, s: Float) = low + (high - low) * s
+
+/** Opacity multiplier for LIQUID capsule fills: 1 at the default 72 %, denser below, sheerer above. */
+private fun liquidFillScale(s: Float) = 1f + (0.72f - s) * 1.25f
 
 /**
  * Backdrop recorded from the root NavHost content. Only valid for overlays drawn OUTSIDE the
@@ -113,8 +134,10 @@ object GlassStylePref {
 val LocalRootBackdrop = compositionLocalOf<Backdrop?> { null }
 
 /** Colours shared by every glass surface so LIQUID / FROSTED look identical everywhere in the app. */
-private class GlassPalette(dark: Boolean) {
-    val liquidTint = if (dark) Color.Black.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.08f)
+private class GlassPalette(private val dark: Boolean) {
+    private val liquidBase = if (dark) Color.Black else Color.White
+    /** Lens-path tint: 0.58 / 0.56 at 通透度 0 → 0.05 / 0.03 at 100 %. */
+    fun liquidTint(s: Float) = liquidBase.copy(alpha = if (dark) glassLerp(0.58f, 0.05f, s) else glassLerp(0.56f, 0.03f, s))
     val frostTint = if (dark) Color(0xFF1C1E24).copy(alpha = 0.72f) else Color.White.copy(alpha = 0.68f)
     val frostFallback = if (dark) Color(0xFF1C1E24).copy(alpha = 0.84f) else Color.White.copy(alpha = 0.90f)
     val rimTop = Color.White.copy(alpha = if (dark) 0.26f else 0.60f)
@@ -130,7 +153,8 @@ private class GlassPalette(dark: Boolean) {
  * - [backdrop] != null on API 31+: real backdrop sampling. LIQUID (API 33+) = refractive lens + sheer tint + specular
  *   highlight; FROSTED = 18 dp blur, high-readability tint and a 0.7 dp hairline.
  * - otherwise: a static surface that visually matches the selected style (sheer fill + specular rim for LIQUID,
- *   denser frosted fill + soft hairline for FROSTED). [fallbackAlpha] is the LIQUID fallback fill opacity.
+ *   denser frosted fill + soft hairline for FROSTED). [fallbackAlpha] scales the sheer LIQUID fallback fill
+ *   (x0.36 → 0.18..0.44 dark, x0.28 → 0.14..0.36 light); FROSTED always uses its high-readability fill.
  *
  * [dark] forces the dark palette (player chrome); [base] is the surface colour of LIQUID fallbacks.
  */
@@ -146,11 +170,12 @@ fun Modifier.glassSurface(
     highlightAlpha: Float = 0.50f,
 ): Modifier {
     val frosted = GlassStylePref.style == GlassStyle.FROSTED
+    val s = GlassStylePref.strength
     val p = remember(dark) { GlassPalette(dark) }
     val canBlur = backdrop != null && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S
     val hasLens = canBlur && !frosted && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU
     val shadowColor = p.shadow
-    val noLensTint = base.copy(alpha = if (dark) 0.50f else 0.54f)
+    val noLensTint = base.copy(alpha = ((if (dark) 0.50f else 0.54f) * liquidFillScale(s)).coerceIn(0.10f, 0.90f))
     val edge = if (frosted) {
         Modifier.border(0.7.dp, p.frostBorder, shape)
     } else {
@@ -164,10 +189,10 @@ fun Modifier.glassSurface(
                 effects = {
                     vibrancy()
                     if (hasLens) {
-                        blur(1.5f.dp.toPx())
+                        blur(glassLerp(12f, 1f, s).dp.toPx())
                         lens(
-                            refractionHeight = 12f.dp.toPx(),
-                            refractionAmount = 26f.dp.toPx(),
+                            refractionHeight = glassLerp(8f, 14f, s).dp.toPx(),
+                            refractionAmount = glassLerp(12f, 32f, s).dp.toPx(),
                             depthEffect = true,
                             chromaticAberration = true,
                         )
@@ -198,7 +223,7 @@ fun Modifier.glassSurface(
                     drawRect(
                         when {
                             frosted -> p.frostTint
-                            hasLens -> p.liquidTint
+                            hasLens -> p.liquidTint(s)
                             else -> noLensTint
                         },
                     )
@@ -208,20 +233,94 @@ fun Modifier.glassSurface(
             .then(if (!hasLens) edge else Modifier)
     } else {
         this
-            .shadow(shadowRadius, shape, ambientColor = shadowColor, spotColor = shadowColor)
+            // A sheer LIQUID fill lets an elevation shadow show through and grey the glass, so it gets half the depth.
+            .shadow(if (frosted) shadowRadius else shadowRadius * 0.5f, shape, ambientColor = shadowColor, spotColor = shadowColor)
             .clip(shape)
             .then(
                 if (frosted) {
+                    // high-readability frosted fill (0.84 dark / 0.90 light) + matte hairline
                     Modifier.background(p.frostFallback)
                 } else {
-                    // sheer fill + soft top specular sheen, like a lens catching light
+                    // crystal-clear sheer glass + liquid-lens specular: bright top rim sheen -> clear centre -> bottom caustic
+                    // 通透度 sets the density (0.68 / 0.72 at 0 → 0.16 / 0.12 at 100 %); [fallbackAlpha] scales it per surface.
+                    val sheer = if (dark) glassLerp(0.68f, 0.16f, s) else glassLerp(0.72f, 0.12f, s)
+                    val liquidAlpha = (sheer * fallbackAlpha / 0.90f).coerceIn(0.06f, 0.80f)
                     Modifier
-                        .background(base.copy(alpha = fallbackAlpha))
-                        .background(Brush.verticalGradient(0f to p.sheen, 0.55f to Color.Transparent))
+                        .background(base.copy(alpha = liquidAlpha))
+                        .background(
+                            Brush.verticalGradient(
+                                0f to Color.White.copy(alpha = if (dark) 0.22f else 0.55f),
+                                0.42f to Color.Transparent,
+                                0.74f to Color.Transparent,
+                                1f to Color.White.copy(alpha = if (dark) 0.10f else 0.28f),
+                            ),
+                        )
                 },
             )
             .then(if (activeOverlay.alpha > 0f) Modifier.background(activeOverlay) else Modifier)
-            .then(edge)
+            .then(if (frosted) edge else Modifier.border(1.dp, Brush.verticalGradient(listOf(p.rimTop, p.rimBottom)), shape))
+    }
+}
+
+/**
+ * Top->bottom specular rim of a Liquid Glass capsule. With [accent] the rim glows in that colour (selected chips).
+ * Light mode fades into a faint dark hairline so a white rim still reads on a light page.
+ */
+fun liquidRimBrush(dark: Boolean, accent: Color? = null): Brush = when {
+    accent != null -> Brush.verticalGradient(listOf(accent.copy(alpha = 0.90f), accent.copy(alpha = 0.32f)))
+    dark -> Brush.verticalGradient(listOf(Color.White.copy(alpha = 0.36f), Color.White.copy(alpha = 0.06f)))
+    else -> Brush.verticalGradient(listOf(Color.White.copy(alpha = 0.95f), Color.Black.copy(alpha = 0.10f)))
+}
+
+/** Liquid-lens specular sheen: bright top highlight -> clear centre -> soft bottom caustic. */
+fun liquidSheenBrush(dark: Boolean, strong: Boolean = false): Brush = Brush.verticalGradient(
+    0f to Color.White.copy(alpha = if (dark) (if (strong) 0.24f else 0.14f) else (if (strong) 0.62f else 0.46f)),
+    0.48f to Color.Transparent,
+    0.80f to Color.Transparent,
+    1f to Color.White.copy(alpha = if (dark) 0.08f else 0.22f),
+)
+
+/**
+ * Inner capsule material (chips, option pills, segment thumbs, tab indicators) driven by [GlassStylePref], so the
+ * capsules inside a glass surface always match it.
+ *
+ * - LIQUID: sheer glass fill + specular sheen + 0.8 dp top->bottom specular rim; [selected] adds an accent tint and a
+ *   glowing accent rim, or with [neutralSelected] a bright white glass thumb (segmented control / tab pill).
+ * - FROSTED: high-readability frosted fill + 0.7 dp matte hairline (accent-tinted when [selected]).
+ */
+@Composable
+fun Modifier.glassPill(
+    shape: Shape,
+    selected: Boolean = false,
+    dark: Boolean = IdjThemeColors.dark,
+    accent: Color = IdjThemeColors.accent,
+    neutralSelected: Boolean = false,
+): Modifier {
+    val liquid = GlassStylePref.style == GlassStyle.LIQUID
+    return if (liquid) {
+        val k = liquidFillScale(GlassStylePref.strength)
+        val fill = when {
+            selected && neutralSelected -> Color.White.copy(alpha = ((if (dark) 0.17f else 0.70f) * k).coerceAtMost(0.95f))
+            selected -> accent.copy(alpha = ((if (dark) 0.24f else 0.16f) * k).coerceAtMost(0.60f))
+            else -> Color.White.copy(alpha = ((if (dark) 0.06f else 0.40f) * k).coerceAtMost(0.85f))
+        }
+        this
+            .clip(shape)
+            .background(fill)
+            .background(liquidSheenBrush(dark, strong = selected))
+            .border(0.8.dp, liquidRimBrush(dark, if (selected && !neutralSelected) accent else null), shape)
+    } else {
+        val fill = when {
+            selected && neutralSelected -> if (dark) Color(0xFF3A3D45).copy(alpha = 0.94f) else Color.White
+            selected -> accent.copy(alpha = if (dark) 0.22f else 0.14f)
+            else -> if (dark) Color.White.copy(alpha = 0.09f) else Color.Black.copy(alpha = 0.05f)
+        }
+        val line = when {
+            selected && !neutralSelected -> accent.copy(alpha = 0.55f)
+            dark -> Color.White.copy(alpha = 0.10f)
+            else -> Color.Black.copy(alpha = 0.07f)
+        }
+        this.clip(shape).background(fill).border(0.7.dp, line, shape)
     }
 }
 
@@ -288,6 +387,7 @@ fun GlassTabBar(
     onCloseSearch: () -> Unit = {},
 ) {
     val c = IdjThemeColors
+    val liquid = GlassStylePref.style == GlassStyle.LIQUID
     val focusManager = LocalFocusManager.current
     val hasSearch = onSearch != null && searchIcon != null
     val morph by animateFloatAsState(
@@ -347,12 +447,12 @@ fun GlassTabBar(
                                     Modifier
                                         .weight(1f)
                                         .height(48.dp)
-                                        .clip(PillShape)
-                                        .background(
-                                            if (on) {
-                                                if (c.dark) Color.White.copy(alpha = 0.14f) else Color.Black.copy(alpha = 0.08f)
-                                            } else {
-                                                Color.Transparent
+                                        .then(
+                                            when {
+                                                // glossy refractive liquid pill: white sheen + specular rim gradient
+                                                on && liquid -> Modifier.glassPill(PillShape, selected = true, neutralSelected = true)
+                                                on -> Modifier.clip(PillShape).background(if (c.dark) Color.White.copy(alpha = 0.14f) else Color.Black.copy(alpha = 0.08f))
+                                                else -> Modifier.clip(PillShape)
                                             },
                                         )
                                         .clickable { onSelect(i) },
@@ -466,6 +566,7 @@ fun GlassNavigationRail(
     searchIcon: (@Composable (Boolean) -> Unit)? = null,
 ) {
     val c = IdjThemeColors
+    val liquid = GlassStylePref.style == GlassStyle.LIQUID
     Column(
         modifier
             .width(84.dp)
@@ -517,8 +618,10 @@ fun GlassNavigationRail(
                             Modifier
                                 .matchParentSize()
                                 .graphicsLayer { scaleX = 0.6f + 0.4f * pill; alpha = pill }
-                                .clip(PillShape)
-                                .background(c.text.copy(alpha = if (c.dark) 0.16f else 0.10f)),
+                                .then(
+                                    if (liquid) Modifier.glassPill(PillShape, selected = true, neutralSelected = true)
+                                    else Modifier.clip(PillShape).background(c.text.copy(alpha = if (c.dark) 0.16f else 0.10f)),
+                                ),
                         )
                         icon(on)
                     }
@@ -545,15 +648,19 @@ fun GlassChip(title: String, selected: Boolean, onClick: () -> Unit) {
     val c = IdjThemeColors
     Box(
         Modifier
-            .clip(RoundedCornerShape(percent = 50))
-            .background(if (selected) c.text else c.elevated)
-            .then(if (!selected) Modifier.border(0.6.dp, c.text.copy(0.12f), RoundedCornerShape(percent = 50)) else Modifier)
+            .glassSurface(
+                shape = PillShape,
+                activeOverlay = if (selected) c.accent.copy(alpha = if (c.dark) 0.24f else 0.16f) else Color.Transparent,
+                shadowRadius = 6.dp,
+            )
+            .then(if (selected) Modifier.border(0.8.dp, liquidRimBrush(c.dark, c.accent), PillShape) else Modifier)
+            .clip(PillShape)
             .clickable(onClick = onClick)
             .padding(horizontal = 14.dp, vertical = 8.dp),
     ) {
         Text(
             title,
-            color = if (selected) c.bg else c.secondary,
+            color = if (selected) c.accent else c.text.copy(alpha = 0.82f),
             fontSize = 14.sp,
             fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
         )

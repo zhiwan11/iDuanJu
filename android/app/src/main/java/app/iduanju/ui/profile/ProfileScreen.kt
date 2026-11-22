@@ -8,6 +8,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
@@ -15,6 +17,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -25,6 +28,7 @@ import app.iduanju.ui.theme.IdjThemeColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.math.roundToInt
 
 /**
  * iOS ProfileView: 我的 · 继续观看 · 我的收藏, then grouped link rows —
@@ -128,6 +132,20 @@ fun ProfileScreen(onOpenDetail: (String) -> Unit = {}) {
                         label = { it.label },
                         onSelect = { app.iduanju.ui.components.GlassStylePref.update(it) },
                     )
+                    if (app.iduanju.ui.components.GlassStylePref.style == app.iduanju.ui.components.GlassStyle.LIQUID) {
+                        val strength = app.iduanju.ui.components.GlassStylePref.strength
+                        Row(Modifier.fillMaxWidth().padding(top = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text("通透度", color = c.text, fontSize = 15.sp, modifier = Modifier.weight(1f))
+                            Text("${(strength * 100).roundToInt()}%", color = c.secondary, fontSize = 13.sp)
+                        }
+                        Slider(
+                            value = strength,
+                            onValueChange = { app.iduanju.ui.components.GlassStylePref.updateStrength(it) },
+                            valueRange = 0f..1f,
+                            colors = SliderDefaults.colors(thumbColor = c.accent, activeTrackColor = c.accent, inactiveTrackColor = c.text.copy(alpha = 0.12f)),
+                            modifier = Modifier.fillMaxWidth().testTag("profile.glass.strength"),
+                        )
+                    }
                 }
             }
             Group {

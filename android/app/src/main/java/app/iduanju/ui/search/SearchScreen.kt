@@ -53,6 +53,10 @@ import app.iduanju.ui.components.LocalLayoutMetrics
 import app.iduanju.ui.components.SizeTier
 import app.iduanju.ui.components.SearchDockState
 import app.iduanju.ui.components.glassSurface
+import app.iduanju.ui.components.glassPill
+import androidx.compose.ui.layout.onSizeChanged
+import com.kyant.backdrop.backdrops.layerBackdrop
+import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import app.iduanju.ui.home.HomeFmt
 import app.iduanju.ui.home.HomePosterCard
 import app.iduanju.ui.theme.IdjThemeColors
@@ -184,218 +188,238 @@ fun SearchScreen(
     }
     BackHandler(enabled = dockTyping) { leaveTyping() }
 
-    Column(Modifier.fillMaxSize().background(c.bg).statusBarsPadding()) {
-        if (dockTyping) {
-            DockTypingBar(
-                query = dockState.query,
-                onQuery = { dockState.query = it },
-                focusRequester = inputFocus,
-                onBack = { leaveTyping() },
-                onSubmit = {
-                    if (dockState.query.isNotBlank()) {
-                        focusManager.clearFocus()
-                        dockState.submit()
-                    }
-                },
-            )
-        } else if (!useBottomSearchDock) {
-            // Standalone / Tablet Rail SearchField: elevated capsule 38 high + 取消/搜索
-            Row(Modifier.padding(horizontal = 16.dp).padding(top = 6.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                // On the tablet rail the field matches the rail's 46 dp search button so both tops line up.
-                Row(Modifier.weight(1f).height(if (metrics.useRail) 46.dp else 38.dp).clip(RoundedCornerShape(50)).background(c.elevated).padding(horizontal = 14.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Filled.Search, null, tint = c.secondary, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(8.dp))
-                    Box(Modifier.weight(1f)) {
-                        if (query.isEmpty()) Text("搜索短剧 / 演员", color = c.secondary, fontSize = 15.sp)
-                        BasicTextField(query, { query = it }, singleLine = true, textStyle = TextStyle(color = c.text, fontSize = 15.sp),
-                            cursorBrush = SolidColor(c.accent), keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                            keyboardActions = KeyboardActions(onSearch = { submit() }), modifier = Modifier.fillMaxWidth())
-                    }
-                    if (query.isNotEmpty()) Icon(Icons.Filled.Cancel, "清除", tint = c.secondary, modifier = Modifier.size(16.dp).clickable { query = "" })
+    // The body is recorded into a local backdrop and the top bar floats over it, so chips and posters scroll
+    // behind the bar and its capsules get real drawBackdrop Liquid Glass refraction (LIQUID) / blur (FROSTED).
+    // Capsules INSIDE the body use glassSurface without a backdrop (a layer must never sample itself).
+    val bgColor = c.bg
+    val searchBackdrop = rememberLayerBackdrop {
+        drawRect(bgColor)
+        drawContent()
+    }
+    val density = androidx.compose.ui.platform.LocalDensity.current
+    var topBarH by remember { mutableStateOf(0.dp) }
+    Box(Modifier.fillMaxSize().background(c.bg).statusBarsPadding()) {
+        Column(Modifier.fillMaxSize().layerBackdrop(searchBackdrop)) {
+            val grid = rememberLazyGridState()
+            val bottomInsetDp = with(androidx.compose.ui.platform.LocalDensity.current) {
+                WindowInsets.navigationBars.union(WindowInsets.ime).getBottom(this).toDp()
+            }
+            val gridBottomPadding = when {
+                dockTyping -> bottomInsetDp + 16.dp // dock hidden while typing; only clear the keyboard
+                useBottomSearchDock -> bottomInsetDp + 96.dp
+                else -> 110.dp
+            }
+            val pick: (String) -> Unit = { t ->
+                focusManager.clearFocus()
+                if (dockState != null) dockState.submit(t) else submit(t)
+            }
+            // While typing (query not blank, nothing submitted yet) the page focuses on suggestions + history;
+            // 搜索发现 / 搜索实时排行 come back as soon as the query is cleared.
+            val typing = submitted.isEmpty() && query.isNotBlank()
+            val discoverGrid = rememberLazyGridState()
+            if (dockTyping) {
+                // Dock typing mode: history (empty query) or live suggestions, directly under the top input bar.
+                val q = dockState?.query.orEmpty().trim()
+                if (q.isEmpty()) {
+                    TypingHistory(
+                        history = lib.searchHistory,
+                        hot = hot,
+                        editing = editing,
+                        onEditing = { editing = it },
+                        onClear = { lib.clearSearch(); editing = false },
+                        onRemove = { lib.removeSearch(it) },
+                        topPadding = topBarH, bottomPadding = gridBottomPadding,
+                        onPick = pick,
+                    )
+                } else {
+                    SearchSuggestions(
+                        query = q,
+                        history = lib.searchHistory,
+                        hot = hot,
+                        topPadding = topBarH, bottomPadding = gridBottomPadding,
+                        onPick = pick,
+                        onOpenDetail = onOpenDetail,
+                    )
                 }
-                Spacer(Modifier.width(12.dp))
-                if (submitted.isNotEmpty()) Text("取消", color = c.text, fontSize = 15.sp, modifier = Modifier.clickable { query = ""; submitted = ""; items.clear() })
-                else Text("搜索", color = c.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.clickable { submit() })
-            }
-        } else if (submitted.isNotEmpty()) {
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(top = 10.dp, bottom = 4.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    "「$submitted」的搜索结果",
-                    color = c.text,
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.Bold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
-                )
-                Spacer(Modifier.width(10.dp))
-                Text(
-                    "返回热榜",
-                    color = c.accent,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(50))
-                        .background(c.accentSoft)
-                        .clickable { dockState?.clear() }
-                        .padding(horizontal = 12.dp, vertical = 5.dp),
-                )
-            }
-        }
-        val grid = rememberLazyGridState()
-        val bottomInsetDp = with(androidx.compose.ui.platform.LocalDensity.current) {
-            WindowInsets.navigationBars.union(WindowInsets.ime).getBottom(this).toDp()
-        }
-        val gridBottomPadding = when {
-            dockTyping -> bottomInsetDp + 16.dp // dock hidden while typing; only clear the keyboard
-            useBottomSearchDock -> bottomInsetDp + 96.dp
-            else -> 110.dp
-        }
-        val pick: (String) -> Unit = { t ->
-            focusManager.clearFocus()
-            if (dockState != null) dockState.submit(t) else submit(t)
-        }
-        // While typing (query not blank, nothing submitted yet) the page focuses on suggestions + history;
-        // 搜索发现 / 搜索实时排行 come back as soon as the query is cleared.
-        val typing = submitted.isEmpty() && query.isNotBlank()
-        val discoverGrid = rememberLazyGridState()
-        if (dockTyping) {
-            // Dock typing mode: history (empty query) or live suggestions, directly under the top input bar.
-            val q = dockState?.query.orEmpty().trim()
-            if (q.isEmpty()) {
-                TypingHistory(
-                    history = lib.searchHistory,
-                    hot = hot,
-                    editing = editing,
-                    onEditing = { editing = it },
-                    onClear = { lib.clearSearch(); editing = false },
-                    onRemove = { lib.removeSearch(it) },
-                    bottomPadding = gridBottomPadding,
-                    onPick = pick,
-                )
-            } else {
+            } else if (submitted.isEmpty()) androidx.compose.animation.Crossfade(typing && !useBottomSearchDock, label = "searchMode") { isTyping ->
+              if (isTyping) {
                 SearchSuggestions(
-                    query = q,
+                    query = query.trim(),
                     history = lib.searchHistory,
                     hot = hot,
-                    bottomPadding = gridBottomPadding,
+                    topPadding = topBarH, bottomPadding = gridBottomPadding,
                     onPick = pick,
                     onOpenDetail = onOpenDetail,
                 )
-            }
-        } else if (submitted.isEmpty()) androidx.compose.animation.Crossfade(typing && !useBottomSearchDock, label = "searchMode") { isTyping ->
-          if (isTyping) {
-            SearchSuggestions(
-                query = query.trim(),
-                history = lib.searchHistory,
-                hot = hot,
-                bottomPadding = gridBottomPadding,
-                onPick = pick,
-                onOpenDetail = onOpenDetail,
-            )
-          } else {
-            LazyVerticalGrid(
-                // Section blocks span the full width; the #N rank rows flow into 1 / 2 / 3 columns.
-                GridCells.Fixed(metrics.listCols),
-                Modifier.fillMaxSize(),
-                state = discoverGrid,
-                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 10.dp, bottom = gridBottomPadding),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                // Dock mode keeps 历史搜索 under the top input bar (typing mode), never above a bottom search bar.
-                if (!useBottomSearchDock && lib.searchHistory.isNotEmpty()) item(span = { GridItemSpan(maxLineSpan) }) {
-                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text("历史搜索", color = c.text, fontSize = 20.sp, fontWeight = FontWeight.Bold); Spacer(Modifier.weight(1f))
-                            if (editing) {
-                                Text("全部删除", color = c.accent, fontSize = 15.sp, modifier = Modifier.clickable { lib.clearSearch(); editing = false })
-                                Spacer(Modifier.width(16.dp)); Text("完成", color = c.text, fontSize = 15.sp, modifier = Modifier.clickable { editing = false })
-                            } else Icon(Icons.Filled.Delete, "编辑", tint = c.secondary, modifier = Modifier.size(20.dp).clickable { editing = true })
-                        }
-                        // iOS ChipFlow: one horizontally scrolling row
-                        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            lib.searchHistory.forEach { t ->
-                                Chip(t, null, editing) {
-                                    if (editing) lib.removeSearch(t)
-                                    else if (dockState != null) dockState.submit(t)
-                                    else submit(t)
+              } else {
+                LazyVerticalGrid(
+                    // Section blocks span the full width; the #N rank rows flow into 1 / 2 / 3 columns.
+                    GridCells.Fixed(metrics.listCols),
+                    Modifier.fillMaxSize(),
+                    state = discoverGrid,
+                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 10.dp + topBarH, bottom = gridBottomPadding),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    // Dock mode keeps 历史搜索 under the top input bar (typing mode), never above a bottom search bar.
+                    if (!useBottomSearchDock && lib.searchHistory.isNotEmpty()) item(span = { GridItemSpan(maxLineSpan) }) {
+                        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("历史搜索", color = c.text, fontSize = 20.sp, fontWeight = FontWeight.Bold); Spacer(Modifier.weight(1f))
+                                if (editing) {
+                                    Text("全部删除", color = c.accent, fontSize = 15.sp, modifier = Modifier.clickable { lib.clearSearch(); editing = false })
+                                    Spacer(Modifier.width(16.dp)); Text("完成", color = c.text, fontSize = 15.sp, modifier = Modifier.clickable { editing = false })
+                                } else Icon(Icons.Filled.Delete, "编辑", tint = c.secondary, modifier = Modifier.size(20.dp).clickable { editing = true })
+                            }
+                            // iOS ChipFlow: one horizontally scrolling row
+                            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                lib.searchHistory.forEach { t ->
+                                    Chip(t, null, editing) {
+                                        if (editing) lib.removeSearch(t)
+                                        else if (dockState != null) dockState.submit(t)
+                                        else submit(t)
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                val discover = if (hot.size > 3) hot.drop(3).map { it.title }.shuffled(java.util.Random(seed + 1L)).take(8) else emptyList()
-                if (discover.isNotEmpty()) item(span = { GridItemSpan(maxLineSpan) }) {
-                    Column(Modifier.padding(top = 6.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text("搜索发现", color = c.text, fontSize = 20.sp, fontWeight = FontWeight.Bold); Spacer(Modifier.weight(1f))
-                            Icon(Icons.Filled.Refresh, "换一批", tint = c.secondary, modifier = Modifier.size(20.dp).clickable { seed++ })
-                        }
-                        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            discover.forEachIndexed { i, t ->
-                                Chip(t, if (i == 0) "热" else if (i == 1) "荐" else null, false) {
-                                    if (dockState != null) dockState.submit(t) else submit(t)
+                    val discover = if (hot.size > 3) hot.drop(3).map { it.title }.shuffled(java.util.Random(seed + 1L)).take(8) else emptyList()
+                    if (discover.isNotEmpty()) item(span = { GridItemSpan(maxLineSpan) }) {
+                        Column(Modifier.padding(top = 6.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("搜索发现", color = c.text, fontSize = 20.sp, fontWeight = FontWeight.Bold); Spacer(Modifier.weight(1f))
+                                Icon(Icons.Filled.Refresh, "换一批", tint = c.secondary, modifier = Modifier.size(20.dp).clickable { seed++ })
+                            }
+                            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                discover.forEachIndexed { i, t ->
+                                    Chip(t, if (i == 0) "热" else if (i == 1) "荐" else null, false) {
+                                        if (dockState != null) dockState.submit(t) else submit(t)
+                                    }
                                 }
                             }
                         }
                     }
+                    // Tablets show 4 / 5 hero rank cards so each card stays poster-sized instead of 400 dp wide.
+                    val topCount = when (metrics.tier) { SizeTier.Compact -> 3; SizeTier.Medium -> 4; SizeTier.Expanded -> 5 }
+                    val gap = if (metrics.tier == SizeTier.Compact) 8.dp else 12.dp
+                    item(span = { GridItemSpan(maxLineSpan) }) {
+                        Column(Modifier.padding(top = 6.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            Text("搜索实时排行", color = c.text, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                            when {
+                                hot.isEmpty() && hotErr != null -> Text(hotErr!!, color = c.secondary, fontSize = 13.sp)
+                                hot.isEmpty() -> Row(horizontalArrangement = Arrangement.spacedBy(gap)) { repeat(topCount) { Box(Modifier.weight(1f).aspectRatio(0.6f).clip(RoundedCornerShape(12.dp)).background(c.elevated.copy(0.6f))) } }
+                                else -> Row(horizontalArrangement = Arrangement.spacedBy(gap)) { hot.take(topCount).forEachIndexed { i, s -> Box(Modifier.weight(1f)) { TopRankCard(s, i + 1, onOpenDetail) } } }
+                            }
+                        }
+                    }
+                    // #4…: full-width rows so cover / title / tags / heat / 集数 always stay on single clean lines
+                    val rest = hot.drop(topCount)
+                    items(rest.size) { i -> CompactRankRow(rest[i], i + topCount + 1, onOpenDetail) }
                 }
-                // Tablets show 4 / 5 hero rank cards so each card stays poster-sized instead of 400 dp wide.
-                val topCount = when (metrics.tier) { SizeTier.Compact -> 3; SizeTier.Medium -> 4; SizeTier.Expanded -> 5 }
-                val gap = if (metrics.tier == SizeTier.Compact) 8.dp else 12.dp
-                item(span = { GridItemSpan(maxLineSpan) }) {
-                    Column(Modifier.padding(top = 6.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Text("搜索实时排行", color = c.text, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-                        when {
-                            hot.isEmpty() && hotErr != null -> Text(hotErr!!, color = c.secondary, fontSize = 13.sp)
-                            hot.isEmpty() -> Row(horizontalArrangement = Arrangement.spacedBy(gap)) { repeat(topCount) { Box(Modifier.weight(1f).aspectRatio(0.6f).clip(RoundedCornerShape(12.dp)).background(c.elevated.copy(0.6f))) } }
-                            else -> Row(horizontalArrangement = Arrangement.spacedBy(gap)) { hot.take(topCount).forEachIndexed { i, s -> Box(Modifier.weight(1f)) { TopRankCard(s, i + 1, onOpenDetail) } } }
+              }
+            } else {
+                Spacer(Modifier.height(topBarH))
+                if (sources.size > 1) Row(Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(20.dp)) {
+                    sources.forEach { (id, name) ->
+                        val on = id == source
+                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.clickable { if (!on) { source = id; cursor = null; items.clear(); loadMore(true) } }) {
+                            Text(name, color = if (on) c.text else c.secondary, fontSize = if (on) 17.sp else 15.sp, fontWeight = if (on) FontWeight.Bold else FontWeight.Normal)
+                            Box(Modifier.padding(top = 3.dp).size(16.dp, 3.dp).clip(RoundedCornerShape(50)).background(if (on) c.accent else Color.Transparent))
                         }
                     }
                 }
-                // #4…: full-width rows so cover / title / tags / heat / 集数 always stay on single clean lines
-                val rest = hot.drop(topCount)
-                items(rest.size) { i -> CompactRankRow(rest[i], i + topCount + 1, onOpenDetail) }
-            }
-          }
-        } else {
-            if (sources.size > 1) Row(Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(20.dp)) {
-                sources.forEach { (id, name) ->
-                    val on = id == source
-                    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.clickable { if (!on) { source = id; cursor = null; items.clear(); loadMore(true) } }) {
-                        Text(name, color = if (on) c.text else c.secondary, fontSize = if (on) 17.sp else 15.sp, fontWeight = if (on) FontWeight.Bold else FontWeight.Normal)
-                        Box(Modifier.padding(top = 3.dp).size(16.dp, 3.dp).clip(RoundedCornerShape(50)).background(if (on) c.accent else Color.Transparent))
+                LaunchedEffect(grid, items.size) {
+                    snapshotFlow { grid.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0 }.collect { last ->
+                        if (hasMore && !loading && last >= items.size - 4) loadMore(false)
                     }
                 }
-            }
-            LaunchedEffect(grid, items.size) {
-                snapshotFlow { grid.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0 }.collect { last ->
-                    if (hasMore && !loading && last >= items.size - 4) loadMore(false)
-                }
-            }
-            LazyVerticalGrid(
-                GridCells.Fixed(metrics.posterCols),
-                Modifier.fillMaxSize(),
-                state = grid,
-                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = gridBottomPadding),
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp),
-            ) {
-                items(items, key = { it.seriesId + it.title }) { s -> HomePosterCard(s, onOpenDetail) }
-                item(span = { GridItemSpan(maxLineSpan) }) {
-                    Box(Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) {
-                        when {
-                            loading -> CircularProgressIndicator(color = c.secondary, strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
-                            verify != null -> app.iduanju.huangguo.VerifyRequiredState(verify!!) { loadMore(items.isEmpty()) }
-                            err != null -> Text("$err · 点击重试", color = c.secondary, fontSize = 13.sp, modifier = Modifier.clickable { loadMore(items.isEmpty()) })
-                            items.isEmpty() -> Text("没有找到「$submitted」", color = c.secondary, fontSize = 14.sp)
-                            !hasMore -> Text("没有更多了", color = c.secondary, fontSize = 12.sp)
+                LazyVerticalGrid(
+                    GridCells.Fixed(metrics.posterCols),
+                    Modifier.fillMaxSize(),
+                    state = grid,
+                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = gridBottomPadding),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    items(items, key = { it.seriesId + it.title }) { s -> HomePosterCard(s, onOpenDetail) }
+                    item(span = { GridItemSpan(maxLineSpan) }) {
+                        Box(Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) {
+                            when {
+                                loading -> CircularProgressIndicator(color = c.secondary, strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
+                                verify != null -> app.iduanju.huangguo.VerifyRequiredState(verify!!) { loadMore(items.isEmpty()) }
+                                err != null -> Text("$err · 点击重试", color = c.secondary, fontSize = 13.sp, modifier = Modifier.clickable { loadMore(items.isEmpty()) })
+                                items.isEmpty() -> Text("没有找到「$submitted」", color = c.secondary, fontSize = 14.sp)
+                                !hasMore -> Text("没有更多了", color = c.secondary, fontSize = 12.sp)
+                            }
                         }
                     }
+                }
+            }
+        }
+        // scroll-edge fade under the floating bar so plain text (取消 / 搜索 / 结果标题) stays legible over content
+        if (topBarH > 0.dp) Box(
+            Modifier.fillMaxWidth().height(topBarH + 14.dp)
+                .background(Brush.verticalGradient(0f to c.bg.copy(alpha = 0.94f), 0.62f to c.bg.copy(alpha = 0.70f), 1f to c.bg.copy(alpha = 0f))),
+        )
+        Column(Modifier.fillMaxWidth().onSizeChanged { topBarH = with(density) { it.height.toDp() } }) {
+            if (dockTyping) {
+                DockTypingBar(
+                    query = dockState.query,
+                    onQuery = { dockState.query = it },
+                    focusRequester = inputFocus,
+                    backdrop = searchBackdrop,
+                    onBack = { leaveTyping() },
+                    onSubmit = {
+                        if (dockState.query.isNotBlank()) {
+                            focusManager.clearFocus()
+                            dockState.submit()
+                        }
+                    },
+                )
+            } else if (!useBottomSearchDock) {
+                // Standalone / Tablet Rail SearchField: elevated capsule 38 high + 取消/搜索
+                Row(Modifier.padding(horizontal = 16.dp).padding(top = 6.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    // On the tablet rail the field matches the rail's 46 dp search button so both tops line up.
+                    Row(Modifier.weight(1f).height(if (metrics.useRail) 46.dp else 38.dp).glassSurface(RoundedCornerShape(50), backdrop = searchBackdrop, shadowRadius = 6.dp).padding(horizontal = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Filled.Search, null, tint = c.secondary, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Box(Modifier.weight(1f)) {
+                            if (query.isEmpty()) Text("搜索短剧 / 演员", color = c.secondary, fontSize = 15.sp)
+                            BasicTextField(query, { query = it }, singleLine = true, textStyle = TextStyle(color = c.text, fontSize = 15.sp),
+                                cursorBrush = SolidColor(c.accent), keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                                keyboardActions = KeyboardActions(onSearch = { submit() }), modifier = Modifier.fillMaxWidth())
+                        }
+                        if (query.isNotEmpty()) Icon(Icons.Filled.Cancel, "清除", tint = c.secondary, modifier = Modifier.size(16.dp).clickable { query = "" })
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    if (submitted.isNotEmpty()) Text("取消", color = c.text, fontSize = 15.sp, modifier = Modifier.clickable { query = ""; submitted = ""; items.clear() })
+                    else Text("搜索", color = c.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.clickable { submit() })
+                }
+            } else if (submitted.isNotEmpty()) {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(top = 10.dp, bottom = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "「$submitted」的搜索结果",
+                        color = c.text,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Spacer(Modifier.width(10.dp))
+                    Text(
+                        "返回热榜",
+                        color = c.accent,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier
+                            .glassPill(RoundedCornerShape(50), selected = true)
+                            .clickable { dockState?.clear() }
+                            .padding(horizontal = 12.dp, vertical = 5.dp),
+                    )
                 }
             }
         }
@@ -408,6 +432,7 @@ private fun DockTypingBar(
     query: String,
     onQuery: (String) -> Unit,
     focusRequester: androidx.compose.ui.focus.FocusRequester,
+    backdrop: com.kyant.backdrop.Backdrop? = null,
     onBack: () -> Unit,
     onSubmit: () -> Unit,
 ) {
@@ -418,12 +443,13 @@ private fun DockTypingBar(
     ) {
         app.iduanju.ui.components.GlassIconButton(
             Icons.AutoMirrored.Filled.ArrowBack, "返回",
+            backdrop = backdrop,
             size = 46.dp, iconSize = 22.dp, onClick = onBack,
         )
         Spacer(Modifier.width(10.dp))
         Row(
             Modifier.weight(1f).height(46.dp)
-                .glassSurface(RoundedCornerShape(50), shadowRadius = 10.dp, activeOverlay = c.accent.copy(alpha = if (c.dark) 0.06f else 0.04f))
+                .glassSurface(RoundedCornerShape(50), backdrop = backdrop, shadowRadius = 10.dp, activeOverlay = c.accent.copy(alpha = if (c.dark) 0.06f else 0.04f))
                 .padding(horizontal = 14.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -467,13 +493,14 @@ private fun TypingHistory(
     onEditing: (Boolean) -> Unit,
     onClear: () -> Unit,
     onRemove: (String) -> Unit,
+    topPadding: androidx.compose.ui.unit.Dp = 0.dp,
     bottomPadding: androidx.compose.ui.unit.Dp,
     onPick: (String) -> Unit,
 ) {
     val c = IdjThemeColors
     LazyColumn(
         Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 6.dp, bottom = bottomPadding),
+        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 6.dp + topPadding, bottom = bottomPadding),
         verticalArrangement = Arrangement.spacedBy(18.dp),
     ) {
         if (history.isNotEmpty()) item(key = "history") {
@@ -505,7 +532,7 @@ private fun TypingHistory(
 @Composable
 private fun Chip(t: String, accent: String?, removable: Boolean, onClick: () -> Unit) {
     val c = IdjThemeColors
-    Row(Modifier.glassSurface(RoundedCornerShape(50), shadowRadius = 0.dp).clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 8.dp),
+    Row(Modifier.glassSurface(RoundedCornerShape(50), shadowRadius = 4.dp).clip(RoundedCornerShape(50)).clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically) {
         Text(t, color = c.text, fontSize = 15.sp, maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 220.dp))
         if (accent != null) Text(" ·$accent", color = c.accentWarm, fontSize = 15.sp)
@@ -523,6 +550,7 @@ private fun SearchSuggestions(
     query: String,
     history: List<String>,
     hot: List<HGSeries>,
+    topPadding: androidx.compose.ui.unit.Dp = 0.dp,
     bottomPadding: androidx.compose.ui.unit.Dp,
     onPick: (String) -> Unit,
     onOpenDetail: (String) -> Unit,
@@ -533,7 +561,7 @@ private fun SearchSuggestions(
     val hotHits = remember(query, hot) { hot.filter { it.title.contains(query, ignoreCase = true) }.take(8) }
     LazyColumn(
         Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 6.dp, bottom = bottomPadding),
+        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 6.dp + topPadding, bottom = bottomPadding),
     ) {
         item(key = "q") { SuggestionRow(Icons.Filled.Search, buildQueryLabel(query, c.accent), c.accent) { onPick(query) } }
         items(historyHits, key = { "h:$it" }) { t ->

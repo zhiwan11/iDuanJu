@@ -208,17 +208,29 @@ fun <T> UnderlineTabs(items: List<T>, selected: T, label: (T) -> String, small: 
 }
 
 // MARK: level 2 — segmented control (`.seg`): 40 dp, radius 14, padding 3, thumb radius 11
+// LIQUID: sheer glass track with a specular rim + glossy refractive thumb; FROSTED: frosted track + solid thumb.
 
 @Composable
 fun <T> SegmentedTabs(items: List<T>, selected: T, label: (T) -> String, onSelect: (T) -> Unit, modifier: Modifier = Modifier) {
     val c = IdjThemeColors
+    val liquid = GlassStylePref.style == GlassStyle.LIQUID
     val idx = items.indexOf(selected).coerceAtLeast(0)
-    BoxWithConstraints(modifier.fillMaxWidth().height(40.dp).clip(RoundedCornerShape(14.dp)).background(c.glass).border(1.dp, c.hairline, RoundedCornerShape(14.dp)).padding(3.dp)) {
+    val trackShape = RoundedCornerShape(14.dp)
+    val thumbShape = RoundedCornerShape(11.dp)
+    val track = if (liquid) {
+        Modifier.clip(trackShape)
+            .background(if (c.dark) Color.White.copy(alpha = 0.05f) else Color.Black.copy(alpha = 0.035f))
+            .background(liquidSheenBrush(c.dark))
+            .border(1.dp, liquidRimBrush(c.dark), trackShape)
+    } else {
+        Modifier.clip(trackShape).background(c.glass).border(1.dp, c.hairline, trackShape)
+    }
+    BoxWithConstraints(modifier.fillMaxWidth().height(40.dp).then(track).padding(3.dp)) {
         val w = maxWidth / items.size.coerceAtLeast(1)
         val x by animateDpAsState(w * idx, DS.select(), label = "seg")
         Box(Modifier.offset(x = x).width(w).fillMaxHeight()
-            .then(if (!c.dark) Modifier.shadow(3.dp, RoundedCornerShape(11.dp), ambientColor = c.shadowThumb, spotColor = c.shadowThumb) else Modifier)
-            .clip(RoundedCornerShape(11.dp)).background(c.thumb))
+            .then(if (!c.dark) Modifier.shadow(if (liquid) 2.dp else 3.dp, thumbShape, ambientColor = c.shadowThumb, spotColor = c.shadowThumb) else Modifier)
+            .then(if (liquid) Modifier.glassPill(thumbShape, selected = true, neutralSelected = true) else Modifier.clip(thumbShape).background(c.thumb)))
         Row(Modifier.fillMaxSize()) {
             items.forEachIndexed { i, it ->
                 val on = i == idx

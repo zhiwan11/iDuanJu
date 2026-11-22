@@ -9,7 +9,8 @@ import org.json.JSONObject
 
 /** iOS MangaStore: favourites, 继续阅读 (recent) and per-title progress. Offline chapters are not ported. */
 class MangaStore(ctx: Context) {
-    data class Progress(val item: MangaItem, val chapterId: String, val chapterTitle: String, val page: Int, val pages: Int, val at: Long)
+    /** [index] is the 0-based chapter position (−1 for progress saved before it was recorded) → 「读至第 X 话」. */
+    data class Progress(val item: MangaItem, val chapterId: String, val chapterTitle: String, val page: Int, val pages: Int, val at: Long, val index: Int = -1)
     private val sp = ctx.getSharedPreferences("idj", Context.MODE_PRIVATE)
     val favorites = mutableStateListOf<MangaItem>()
     val progress = mutableStateMapOf<String, Progress>()
@@ -29,14 +30,18 @@ class MangaStore(ctx: Context) {
     init {
         runCatching { val a = JSONArray(sp.getString("stv.manga.favorites", "[]")); for (i in 0 until a.length()) favorites.add(MangaItem.from(a.getJSONObject(i))) }
         runCatching { val a = JSONArray(sp.getString("stv.manga.progress", "[]")); for (i in 0 until a.length()) a.getJSONObject(i).let { o ->
-            val it = MangaItem.from(o.getJSONObject("item")); progress[it.id] = Progress(it, o.optString("chapterId"), o.optString("chapterTitle"), o.optInt("page"), o.optInt("pages"), o.optLong("at")) } }
+            val it = MangaItem.from(o.getJSONObject("item")); progress[it.id] = Progress(it, o.optString("chapterId"), o.optString("chapterTitle"), o.optInt("page"), o.optInt("pages"), o.optLong("at"), o.optInt("index", -1)) } }
     }
     val recent get() = progress.values.sortedByDescending { it.at }
     fun isFavorite(m: MangaItem) = favorites.any { it.id == m.id }
     fun toggleFavorite(m: MangaItem) { if (isFavorite(m)) favorites.removeAll { it.id == m.id } else favorites.add(0, m); sp.edit().putString("stv.manga.favorites", JSONArray(favorites.map { it.json() }).toString()).apply() }
     fun record(m: MangaItem, c: MangaChapter, page: Int, of: Int) {
-        progress[m.id] = Progress(m, c.chapterId, c.title, page, of, System.currentTimeMillis())
-        sp.edit().putString("stv.manga.progress", JSONArray(recent.take(100).map { p -> JSONObject().put("item", p.item.json()).put("chapterId", p.chapterId).put("chapterTitle", p.chapterTitle).put("page", p.page).put("pages", p.pages).put("at", p.at) }).toString()).apply()
+        progress[m.id] = Progress(m, c.chapterId, c.title, page, of, System.currentTimeMillis(), c.index)
+        persistProgress()
+    }
+    fun removeProgress(id: String) { if (progress.remove(id) != null) persistProgress() }
+    private fun persistProgress() {
+        sp.edit().putString("stv.manga.progress", JSONArray(recent.take(100).map { p -> JSONObject().put("item", p.item.json()).put("chapterId", p.chapterId).put("chapterTitle", p.chapterTitle).put("page", p.page).put("pages", p.pages).put("at", p.at).put("index", p.index) }).toString()).apply()
     }
     fun put(m: MangaItem): String { cache[m.id] = m; return m.id }
 }

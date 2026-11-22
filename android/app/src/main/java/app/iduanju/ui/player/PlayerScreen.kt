@@ -1,6 +1,9 @@
 package app.iduanju.ui.player
 
 import app.iduanju.ui.components.glassSurface
+import app.iduanju.ui.components.glassPill
+import app.iduanju.ui.components.GlassStyle
+import app.iduanju.ui.components.GlassStylePref
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import androidx.compose.animation.AnimatedVisibility
@@ -96,7 +99,8 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
     var danmaku by remember { mutableStateOf(true) }
     var quality by remember { mutableStateOf<String?>(null) }
     var fillMode by remember { mutableStateOf(PlayerPrefs.getFillMode(ctx)) }
-    var ambientMode by remember { mutableStateOf(PlayerPrefs.getAmbientMode(ctx)) }
+    /** 氛围模式 level: 0 关闭 · 1 柔和 · 2 标准 · 3 鲜艳 · 4 极光 (Infuse-style). */
+    var ambientLevel by remember { mutableIntStateOf(PlayerPrefs.getAmbientLevel(ctx).coerceIn(0, 4)) }
     var enhanceLevel by remember { mutableIntStateOf(PlayerPrefs.getEnhanceLevel(ctx)) }
     var sdrToHdr by remember { mutableStateOf(PlayerPrefs.getSdrToHdr(ctx)) }
     var textureView by remember { mutableStateOf<android.view.TextureView?>(null) }
@@ -105,6 +109,9 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
     var ambientLeft by remember { mutableStateOf(Color.Black) }
     var ambientRight by remember { mutableStateOf(Color.Black) }
     var ambientBitmap by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    /** Baked-in black bar fractions of the decoded frame (top / bottom), from the last ambient sample. */
+    var ambientTopInset by remember { mutableFloatStateOf(0f) }
+    var ambientBottomInset by remember { mutableFloatStateOf(0f) }
     var ambientSampleTick by remember { mutableIntStateOf(0) }
     var videoAspectRatio by remember { mutableFloatStateOf(0f) }
     /** 0 = off, -1 = after current episode, >0 = minutes countdown. */
@@ -249,18 +256,22 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
         ambientLeft = Color.Black
         ambientRight = Color.Black
         ambientBitmap = null
+        ambientTopInset = 0f
+        ambientBottomInset = 0f
     }
     val hdrAmbientLocked = isNativeHdr || (sdrToHdr && !enhanceFailed)
-    LaunchedEffect(ambientMode, fillMode, inPip, hdrAmbientLocked, playing, textureView, ambientSampleTick) {
+    LaunchedEffect(ambientLevel, fillMode, inPip, hdrAmbientLocked, playing, textureView, ambientSampleTick) {
         // Locked off whenever native HDR/DV or SDR->HDR is active.
-        if (!ambientMode || fillMode || inPip || hdrAmbientLocked) return@LaunchedEffect
+        if (ambientLevel <= 0 || fillMode || inPip || hdrAmbientLocked) return@LaunchedEffect
         val tv = textureView ?: return@LaunchedEffect
+        val level = ambientLevel
+        val interval = ambientSpec(level).sampleIntervalMs
         while (isActive) {
             val bmp = if (tv.isAvailable) runCatching { tv.getBitmap(24, 24) }.getOrNull() else null
             if (bmp != null) {
                 val sampled = withContext(Dispatchers.Default) {
                     try {
-                        computeAmbientEdgeColors(bmp)
+                        computeAmbientEdgeColors(bmp, level)
                     } finally {
                         bmp.recycle()
                     }
@@ -269,12 +280,14 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                 ambientBottom = sampled.bottom
                 ambientLeft = sampled.left
                 ambientRight = sampled.right
+                ambientTopInset = sampled.topInsetFrac
+                ambientBottomInset = sampled.bottomInsetFrac
                 if (sampled.glowBitmap != null) {
                     ambientBitmap = sampled.glowBitmap
                 }
             }
             if (!playing) break
-            delay(280L)
+            delay(interval)
         }
     }
 
@@ -554,14 +567,18 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
             animationSpec = androidx.compose.animation.core.tween(220),
             label = "videoZoom",
         )
+        // Last non-zero level, so switching 氛围模式 off fades out with the strength it had instead of jumping.
+        val ambientRender = remember { intArrayOf(2) }
+        if (ambientLevel > 0) ambientRender[0] = ambientLevel
+        val ambientVisible = ambientLevel > 0 && !fillMode && !inPip && !hdrAmbientLocked
         AmbientGlowLayer(
             topColor = ambientTop,
             bottomColor = ambientBottom,
             leftColor = ambientLeft,
             rightColor = ambientRight,
             glowBitmap = ambientBitmap,
-            videoAspectRatio = videoAspectRatio,
-            visible = ambientMode && !fillMode && !inPip && !hdrAmbientLocked,
+            level = ambientRender[0],
+            visible = ambientVisible,
         )
         AndroidView(
             factory = {
@@ -602,6 +619,18 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
             // clipToBounds first so the zoomed video never bleeds into the iPad episode drawer; the scale is read in
             // the layer block only, so the zoom animation redraws without recomposing.
             modifier = Modifier.fillMaxSize().clipToBounds().graphicsLayer { scaleX = videoScale; scaleY = videoScale },
+        )
+        // 氛围模式 edge bleed: draws over the TextureView's own opaque pixels (baked-in bars / full-height 9:16), below
+        // danmaku, gestures and the HUD. Draw-only, so every touch passes straight through to the gesture layer.
+        AmbientEdgeBleedOverlay(
+            topColor = ambientTop,
+            bottomColor = ambientBottom,
+            topInsetFrac = ambientTopInset,
+            bottomInsetFrac = ambientBottomInset,
+            videoAspectRatio = videoAspectRatio,
+            portrait = !landscape,
+            level = ambientRender[0],
+            visible = ambientVisible,
         )
         // official danmaku (红果 only), lanes under the top bar + tech strip, never into the bottom controls
         val epNow = detail?.episodes?.getOrNull(epIndex)
@@ -880,9 +909,14 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
             if (panel != null) last[0] = panel
             val shown = last[0]
             val sheetShape = RoundedCornerShape(if (centeredSheet) 28.dp else 24.dp)
+            val liquidGlass = GlassStylePref.style == GlassStyle.LIQUID
             Column(Modifier.widthIn(max = if (centeredSheet) 540.dp else 520.dp).fillMaxWidth()
                 .heightIn(max = (metrics.heightDp * if (centeredSheet) 0.80f else 0.74f).dp)
-                .glassSurface(sheetShape, dark = true, base = Color(0xFF1C1E24), shadowRadius = 20.dp, fallbackAlpha = 0.92f)
+                // LIQUID: sheer dark glass (0.52 → ~19 % fill + specular rim) plus a 30 % smoke layer so the settings
+                // text stays legible over bright video; FROSTED keeps its dense high-readability fill.
+                .glassSurface(sheetShape, dark = true, base = Color(0xFF1C1E24), shadowRadius = 20.dp,
+                    fallbackAlpha = if (liquidGlass) 0.52f else 0.92f,
+                    activeOverlay = if (liquidGlass) Color.Black.copy(alpha = 0.30f) else Color.Transparent)
                 .pointerInput(Unit) { detectTapGestures { } }
                 .verticalScroll(rememberScrollState())
                 .padding(start = if (centeredSheet) 20.dp else 16.dp, end = if (centeredSheet) 20.dp else 16.dp,
@@ -913,7 +947,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                     "more" -> {
                         MoreSettingsPanel(
                             fillMode = fillMode,
-                            ambientMode = ambientMode,
+                            ambientLevel = ambientLevel,
                             enhanceLevel = enhanceLevel,
                             sdrToHdr = sdrToHdr,
                             nativeHdrRange = nativeRange,
@@ -927,14 +961,15 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                                 PlayerPrefs.setFillMode(ctx, fill)
                                 seekHint = if (fill) "画面：铺满裁剪" else "画面：完整适应"
                             },
-                            onAmbientMode = { on ->
+                            onAmbientLevel = { lvl ->
                                 when {
-                                    isNativeHdr -> seekHint = "原生 ${tags.range} 模式下不可开启氛围光晕"
-                                    sdrToHdr -> seekHint = "HDR 模式下不可开启氛围光晕，请先关闭 SDR 转 HDR"
+                                    isNativeHdr -> seekHint = "原生 ${tags.range} 模式下不可开启氛围模式"
+                                    sdrToHdr -> seekHint = "HDR 模式下不可开启氛围模式，请先关闭 SDR 转 HDR"
                                     else -> {
-                                        ambientMode = on
-                                        PlayerPrefs.setAmbientMode(ctx, on)
-                                        seekHint = if (on) "氛围光晕：已开启" else "氛围光晕：已关闭"
+                                        val l = lvl.coerceIn(0, 4)
+                                        ambientLevel = l
+                                        PlayerPrefs.setAmbientLevel(ctx, l)
+                                        seekHint = "氛围模式：" + ambientLevelLabel(l)
                                     }
                                 }
                             },
@@ -1156,8 +1191,11 @@ private fun EpisodesPanel(d: HGSeriesDetail, epIndex: Int, pc: IdjColors, onPick
     val seasons = remember(d.relatedSeries) {
         d.relatedSeries.map { it to app.iduanju.core.hongguo.SeasonParser.seasonNo(it.title) }.distinctBy { it.second }.sortedByDescending { it.second }
     }
+    val liquid = GlassStylePref.style == GlassStyle.LIQUID
     val chip: @Composable (String, Boolean, Boolean, () -> Unit) -> Unit = { t, on, sm, f ->
-        Box(Modifier.height(if (sm) 28.dp else 32.dp).clip(RoundedCornerShape(50)).background(if (on) pc.thumb else pc.glass)
+        Box(Modifier.height(if (sm) 28.dp else 32.dp)
+            .then(if (liquid) Modifier.glassPill(RoundedCornerShape(50), selected = on, dark = true, accent = pc.accent, neutralSelected = true)
+                else Modifier.clip(RoundedCornerShape(50)).background(if (on) pc.thumb else pc.glass))
             .pressClick(onClick = f).padding(horizontal = if (sm) 12.dp else 14.dp), contentAlignment = Alignment.Center) {
             Text(t, color = if (on) pc.text else pc.secondary, fontSize = if (sm) 13.sp else 14.sp, fontWeight = if (on) FontWeight.SemiBold else FontWeight.Normal)
         }
@@ -1175,8 +1213,12 @@ private fun EpisodesPanel(d: HGSeriesDetail, epIndex: Int, pc: IdjColors, onPick
             items(sl.size) { k ->
                 val (i, ep) = sl[k]
                 val on = i == epIndex
-                Box(Modifier.height(44.dp).clip(RoundedCornerShape(12.dp)).background(if (on) pc.accentSoft else pc.glass)
-                    .then(if (on) Modifier.border(1.dp, pc.accentLine, RoundedCornerShape(12.dp)) else Modifier)
+                Box(Modifier.height(44.dp)
+                    .then(
+                        if (liquid) Modifier.glassPill(RoundedCornerShape(12.dp), selected = on, dark = true, accent = pc.accent)
+                        else Modifier.clip(RoundedCornerShape(12.dp)).background(if (on) pc.accentSoft else pc.glass)
+                            .then(if (on) Modifier.border(1.dp, pc.accentLine, RoundedCornerShape(12.dp)) else Modifier),
+                    )
                     .pressClick { onPick(i) }, contentAlignment = Alignment.Center) {
                     Text("${ep.ep}", color = if (on) pc.accent else Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                     if (on) Box(Modifier.align(Alignment.TopEnd).padding(6.dp).size(5.dp).clip(CircleShape).background(pc.accent))
@@ -1280,7 +1322,8 @@ private const val ACTION_PIP_NEXT = "app.iduanju.action.PIP_NEXT"
 @Composable
 private fun MoreSettingsPanel(
     fillMode: Boolean,
-    ambientMode: Boolean,
+    /** 0 关闭 · 1 柔和 · 2 标准 · 3 鲜艳 · 4 极光. */
+    ambientLevel: Int,
     enhanceLevel: Int,
     sdrToHdr: Boolean,
     /** Non-null ("HDR10" / "HLG" / "Dolby Vision") when the stream is already native HDR. */
@@ -1291,7 +1334,7 @@ private fun MoreSettingsPanel(
     showAutoNext: Boolean,
     pc: IdjColors,
     onFillMode: (Boolean) -> Unit,
-    onAmbientMode: (Boolean) -> Unit,
+    onAmbientLevel: (Int) -> Unit,
     onEnhance: (Int) -> Unit,
     onSdrToHdr: (Boolean) -> Unit,
     onSleep: (Int) -> Unit,
@@ -1320,15 +1363,15 @@ private fun MoreSettingsPanel(
     val hdrLocked = nativeHdrRange != null || sdrToHdr
     MoreOptionRow(
         label = when {
-            nativeHdrRange != null -> "黑边氛围光晕 (原生 $nativeHdrRange 已锁定关闭)"
-            sdrToHdr -> "黑边氛围光晕 (SDR 转 HDR 开启时已锁定关闭)"
-            else -> "黑边氛围光晕"
+            nativeHdrRange != null -> "氛围模式 (原生 $nativeHdrRange 已锁定关闭)"
+            sdrToHdr -> "氛围模式 (SDR 转 HDR 开启时已锁定关闭)"
+            else -> "氛围模式"
         },
-        options = listOf("开启" to true, "关闭" to false),
-        selected = if (hdrLocked) false else ambientMode,
+        options = listOf("关闭" to 0, "柔和" to 1, "标准" to 2, "鲜艳" to 3, "极光" to 4),
+        selected = if (hdrLocked) 0 else ambientLevel,
         enabled = !hdrLocked,
         pc = pc,
-        onSelect = onAmbientMode,
+        onSelect = onAmbientLevel,
     )
     Spacer(Modifier.height(10.dp))
 
@@ -1396,16 +1439,18 @@ private fun <T> MoreOptionRow(
         Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).graphicsLayer { alpha = if (enabled) 1f else 0.45f },
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
+        val liquid = GlassStylePref.style == GlassStyle.LIQUID
         options.forEach { (title, value) ->
             val on = value == selected
             Box(
                 Modifier
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(if (on) pc.accentSoft else Color.White.copy(0.08f))
-                    .border(
-                        1.dp,
-                        if (on) pc.accent.copy(0.55f) else Color.White.copy(0.10f),
-                        RoundedCornerShape(10.dp),
+                    .then(
+                        // LIQUID: sheer dark glass chip + specular rim, glowing accent rim when selected
+                        if (liquid) Modifier.glassPill(RoundedCornerShape(10.dp), selected = on, dark = true, accent = pc.accent)
+                        else Modifier
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(if (on) pc.accentSoft else Color.White.copy(0.08f))
+                            .border(1.dp, if (on) pc.accent.copy(0.55f) else Color.White.copy(0.10f), RoundedCornerShape(10.dp)),
                     )
                     .clickable { onSelect(value) }
                     .padding(horizontal = 13.dp, vertical = 7.dp),
@@ -1428,9 +1473,38 @@ private data class AmbientEdgeColors(
     val left: Color = Color.Black,
     val right: Color = Color.Black,
     val glowBitmap: androidx.compose.ui.graphics.ImageBitmap? = null,
+    /** Baked-in near-black bar above / below the picture, as a fraction of the decoded frame height. */
+    val topInsetFrac: Float = 0f,
+    val bottomInsetFrac: Float = 0f,
 )
 
-private fun computeAmbientEdgeColors(bmp: android.graphics.Bitmap): AmbientEdgeColors {
+/** Per-level 氛围模式 tuning (Infuse-style 柔和 / 标准 / 鲜艳 / 极光). */
+private class AmbientSpec(
+    val alpha: Float,
+    val blur: androidx.compose.ui.unit.Dp,
+    val sampleIntervalMs: Long,
+    val crossfadeMs: Int,
+    val edgeOverlayAlpha: Float,
+    val satMult: Float,
+    val valMult: Float,
+    val maxVal: Float,
+)
+
+private val AmbientSpecs = arrayOf(
+    AmbientSpec(0.50f, 68.dp, 380L, 550, 0.32f, 1.15f, 1.08f, 0.78f), // 1 柔和
+    AmbientSpec(0.75f, 54.dp, 280L, 380, 0.48f, 1.30f, 1.18f, 0.86f), // 2 标准
+    AmbientSpec(0.90f, 44.dp, 200L, 260, 0.62f, 1.48f, 1.28f, 0.94f), // 3 鲜艳
+    AmbientSpec(1.00f, 36.dp, 150L, 180, 0.76f, 1.65f, 1.38f, 1.00f), // 4 极光
+)
+
+private fun ambientSpec(level: Int): AmbientSpec = AmbientSpecs[(level.coerceIn(1, 4)) - 1]
+
+private fun ambientLevelLabel(level: Int): String = when (level) {
+    1 -> "柔和"; 2 -> "标准"; 3 -> "鲜艳"; 4 -> "极光"; else -> "关闭"
+}
+
+private fun computeAmbientEdgeColors(bmp: android.graphics.Bitmap, level: Int): AmbientEdgeColors {
+    val spec = ambientSpec(level)
     val w = bmp.width
     val h = bmp.height
     if (w <= 0 || h <= 0) return AmbientEdgeColors()
@@ -1530,9 +1604,10 @@ private fun computeAmbientEdgeColors(bmp: android.graphics.Bitmap): AmbientEdgeC
         android.graphics.Color.RGBToHSV(r, g, b, hsv)
         val s = hsv[1]
         val v = hsv[2]
-        if (v < 0.06f) return 0xFF000000.toInt()
-        if (s > 0.05f) hsv[1] = (s * 1.25f).coerceIn(0f, 0.88f)
-        hsv[2] = (v * 1.15f).coerceIn(0f, 0.85f)
+        // near-black stays black at every level, so a black suit in a corner never glows
+        if (v < 0.05f) return 0xFF000000.toInt()
+        if (s > 0.05f) hsv[1] = (s * spec.satMult).coerceIn(0f, 0.95f)
+        hsv[2] = (v * spec.valMult).coerceIn(0f, spec.maxVal)
         return android.graphics.Color.HSVToColor(hsv)
     }
 
@@ -1574,9 +1649,20 @@ private fun computeAmbientEdgeColors(bmp: android.graphics.Bitmap): AmbientEdgeC
         left = regionToAmbientColor(activeLeft, activeLeft + stripX, activeTop, activeBottom),
         right = regionToAmbientColor(activeRight - stripX, activeRight, activeTop, activeBottom),
         glowBitmap = glowImg,
+        topInsetFrac = activeTop.toFloat() / h.toFloat(),
+        bottomInsetFrac = (h - activeBottom).toFloat() / h.toFloat(),
     )
 }
 
+/**
+ * 氛围模式 background glow, drawn BEHIND the PlayerView (whose letterbox is transparent).
+ *
+ * API 31+: the 16x16 map of the active (black-bar-trimmed) picture is stretched over the WHOLE container and
+ * hardware-blurred with Rectangle edges (clamped, so the screen edges never bleed transparent black inward). In
+ * portrait the top rows light the entire top bar up to the status bar and the bottom rows the entire bottom bar,
+ * spatially matched to the picture. Edge-bleed gradients from the screen edges inward add the strong rim glow.
+ * API < 31: the edge-bleed gradients alone, each tinted only by its own darkness-preserving edge colour.
+ */
 @Composable
 private fun AmbientGlowLayer(
     topColor: Color,
@@ -1584,106 +1670,165 @@ private fun AmbientGlowLayer(
     leftColor: Color,
     rightColor: Color,
     glowBitmap: androidx.compose.ui.graphics.ImageBitmap? = null,
-    videoAspectRatio: Float = 0f,
+    level: Int = 2,
     visible: Boolean = true,
     modifier: Modifier = Modifier,
 ) {
+    val spec = ambientSpec(level)
     val layerAlpha by androidx.compose.animation.core.animateFloatAsState(
         targetValue = if (visible) 1f else 0f,
         animationSpec = androidx.compose.animation.core.tween(450),
         label = "ambientVisible",
     )
     if (layerAlpha <= 0.005f) return
-    val animTop by androidx.compose.animation.animateColorAsState(topColor, androidx.compose.animation.core.tween(600), label = "ambTop")
-    val animBottom by androidx.compose.animation.animateColorAsState(bottomColor, androidx.compose.animation.core.tween(600), label = "ambBottom")
-    val animLeft by androidx.compose.animation.animateColorAsState(leftColor, androidx.compose.animation.core.tween(600), label = "ambLeft")
-    val animRight by androidx.compose.animation.animateColorAsState(rightColor, androidx.compose.animation.core.tween(600), label = "ambRight")
+    val colorSpec = androidx.compose.animation.core.tween<Color>(spec.crossfadeMs + 200)
+    val animTop by androidx.compose.animation.animateColorAsState(topColor, colorSpec, label = "ambTop")
+    val animBottom by androidx.compose.animation.animateColorAsState(bottomColor, colorSpec, label = "ambBottom")
+    val animLeft by androidx.compose.animation.animateColorAsState(leftColor, colorSpec, label = "ambLeft")
+    val animRight by androidx.compose.animation.animateColorAsState(rightColor, colorSpec, label = "ambRight")
 
-    val useBitmapGlow = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S && glowBitmap != null
+    val frame = glowBitmap?.takeIf { android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S }
+    val useBitmapGlow = frame != null
     Box(modifier.fillMaxSize()) {
-        if (useBitmapGlow) {
-            // API 31+: the 16x16 frame map, scaled onto the actual video rect (+44 dp) and hardware-blurred. No uniform
-            // full-width blooms, so dark regions stay dark and bright regions glow right next to their true colours.
+        if (frame != null) {
             androidx.compose.animation.Crossfade(
-                targetState = glowBitmap,
-                animationSpec = androidx.compose.animation.core.tween(260),
+                targetState = frame,
+                animationSpec = androidx.compose.animation.core.tween(spec.crossfadeMs),
                 label = "ambientFrame",
             ) { bmp ->
                 androidx.compose.foundation.Canvas(
                     Modifier
                         .fillMaxSize()
-                        .graphicsLayer { alpha = 0.75f * layerAlpha }
-                        .blur(radius = 48.dp, edgeTreatment = BlurredEdgeTreatment.Unbounded),
+                        .graphicsLayer { alpha = spec.alpha * layerAlpha }
+                        .blur(radius = spec.blur, edgeTreatment = BlurredEdgeTreatment.Rectangle),
                 ) {
-                    val w = size.width
-                    val h = size.height
-                    if (w <= 0f || h <= 0f) return@Canvas
-                    val expandPx = 44.dp.toPx()
-                    val viewAspect = w / h
-                    val ar = if (videoAspectRatio > 0.05f) videoAspectRatio else (16f / 9f)
-                    val vidW: Float
-                    val vidH: Float
-                    if (ar > viewAspect) {
-                        vidW = w
-                        vidH = w / ar
-                    } else {
-                        vidH = h
-                        vidW = h * ar
-                    }
-                    val dstW = vidW + expandPx * 2f
-                    val dstH = vidH + expandPx * 2f
+                    if (size.width <= 0f || size.height <= 0f) return@Canvas
+                    // full-screen container projection: (0, 0) → (w, h)
                     drawImage(
                         image = bmp,
-                        dstOffset = androidx.compose.ui.unit.IntOffset(((w - dstW) * 0.5f).toInt(), ((h - dstH) * 0.5f).toInt()),
-                        dstSize = androidx.compose.ui.unit.IntSize(dstW.toInt().coerceAtLeast(1), dstH.toInt().coerceAtLeast(1)),
+                        dstOffset = androidx.compose.ui.unit.IntOffset(0, 0),
+                        dstSize = androidx.compose.ui.unit.IntSize(size.width.toInt().coerceAtLeast(1), size.height.toInt().coerceAtLeast(1)),
                         filterQuality = androidx.compose.ui.graphics.FilterQuality.Low,
                     )
                 }
             }
-        } else {
-            // API < 31 fallback: per-edge gradients, each tinted only by its own (darkness-preserving) edge colour.
-            androidx.compose.foundation.Canvas(Modifier.fillMaxSize()) {
-                val w = size.width
-                val h = size.height
-                if (w <= 0f || h <= 0f) return@Canvas
-                val baseAlpha = 0.78f * layerAlpha
-                drawRect(
-                    brush = Brush.verticalGradient(
-                        0f to animTop.copy(alpha = baseAlpha * 0.52f),
-                        0.34f to animTop.copy(alpha = baseAlpha),
-                        0.55f to Color.Transparent,
-                        startY = 0f,
-                        endY = h,
-                    ),
-                )
-                drawRect(
-                    brush = Brush.verticalGradient(
-                        0.45f to Color.Transparent,
-                        0.66f to animBottom.copy(alpha = baseAlpha),
-                        1f to animBottom.copy(alpha = baseAlpha * 0.52f),
-                        startY = 0f,
-                        endY = h,
-                    ),
-                )
-                drawRect(
-                    brush = Brush.horizontalGradient(
-                        0f to animLeft.copy(alpha = baseAlpha * 0.45f),
-                        0.34f to animLeft.copy(alpha = baseAlpha * 0.85f),
-                        0.55f to Color.Transparent,
-                        startX = 0f,
-                        endX = w,
-                    ),
-                )
-                drawRect(
-                    brush = Brush.horizontalGradient(
-                        0.45f to Color.Transparent,
-                        0.66f to animRight.copy(alpha = baseAlpha * 0.85f),
-                        1f to animRight.copy(alpha = baseAlpha * 0.45f),
-                        startX = 0f,
-                        endX = w,
-                    ),
-                )
-            }
+        }
+        // Edge bleed from the screen edges inward toward the video.
+        androidx.compose.foundation.Canvas(Modifier.fillMaxSize()) {
+            val w = size.width
+            val h = size.height
+            if (w <= 0f || h <= 0f) return@Canvas
+            val baseAlpha = (if (useBitmapGlow) 0.62f else 0.82f) * spec.alpha * layerAlpha
+            drawRect(
+                brush = Brush.verticalGradient(
+                    0f to animTop.copy(alpha = baseAlpha),
+                    0.16f to animTop.copy(alpha = baseAlpha * 0.62f),
+                    0.34f to Color.Transparent,
+                    startY = 0f,
+                    endY = h,
+                ),
+            )
+            drawRect(
+                brush = Brush.verticalGradient(
+                    0.66f to Color.Transparent,
+                    0.84f to animBottom.copy(alpha = baseAlpha * 0.62f),
+                    1f to animBottom.copy(alpha = baseAlpha),
+                    startY = 0f,
+                    endY = h,
+                ),
+            )
+            drawRect(
+                brush = Brush.horizontalGradient(
+                    0f to animLeft.copy(alpha = baseAlpha * 0.85f),
+                    0.12f to animLeft.copy(alpha = baseAlpha * 0.50f),
+                    0.28f to Color.Transparent,
+                    startX = 0f,
+                    endX = w,
+                ),
+            )
+            drawRect(
+                brush = Brush.horizontalGradient(
+                    0.72f to Color.Transparent,
+                    0.88f to animRight.copy(alpha = baseAlpha * 0.50f),
+                    1f to animRight.copy(alpha = baseAlpha * 0.85f),
+                    startX = 0f,
+                    endX = w,
+                ),
+            )
+        }
+    }
+}
+
+/**
+ * 氛围模式 edge-bleed overlay, drawn OVER the PlayerView but below danmaku / gestures / HUD (draw-only, so touches
+ * pass straight through). The TextureView paints opaque pixels over its own area, which hides the background glow
+ * whenever a portrait video fills the height or carries black bars baked into the frame. This feathers the glow
+ * into the top and bottom bands: container letterbox gap + baked-in bar, at least 88 dp (top) / 96 dp (bottom) in
+ * portrait, so every portrait case (16:9, 4:3, 9:16 with baked-in bars, full 9:16 on a tall phone) shows a
+ * spatially matched glow. Near-black edge colours (and the pre-sample black) draw nothing, so dark edges stay dark.
+ */
+@Composable
+private fun AmbientEdgeBleedOverlay(
+    topColor: Color,
+    bottomColor: Color,
+    topInsetFrac: Float,
+    bottomInsetFrac: Float,
+    videoAspectRatio: Float,
+    portrait: Boolean,
+    level: Int,
+    visible: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val spec = ambientSpec(level)
+    val overlayAlpha by androidx.compose.animation.core.animateFloatAsState(
+        targetValue = if (visible) 1f else 0f,
+        animationSpec = androidx.compose.animation.core.tween(450),
+        label = "ambientEdgeVisible",
+    )
+    if (overlayAlpha <= 0.005f) return
+    val colorSpec = androidx.compose.animation.core.tween<Color>(spec.crossfadeMs + 200)
+    val animTop by androidx.compose.animation.animateColorAsState(topColor, colorSpec, label = "ambEdgeTop")
+    val animBottom by androidx.compose.animation.animateColorAsState(bottomColor, colorSpec, label = "ambEdgeBottom")
+    val insetSpec = androidx.compose.animation.core.tween<Float>(400)
+    val topInset by androidx.compose.animation.core.animateFloatAsState(topInsetFrac.coerceIn(0f, 0.34f), insetSpec, label = "ambInsetTop")
+    val bottomInset by androidx.compose.animation.core.animateFloatAsState(bottomInsetFrac.coerceIn(0f, 0.34f), insetSpec, label = "ambInsetBottom")
+    androidx.compose.foundation.Canvas(modifier.fillMaxSize()) {
+        val w = size.width
+        val h = size.height
+        if (w <= 0f || h <= 0f) return@Canvas
+        // Where the picture sits inside the FIT-sized TextureView (unknown aspect = fills the height).
+        val ar = videoAspectRatio
+        val vidH = if (ar > 0.05f) (if (ar > w / h) w / ar else h) else h
+        val gap = ((h - vidH) * 0.5f).coerceAtLeast(0f)
+        val topZone = maxOf(gap + vidH * topInset, if (portrait) 88.dp.toPx() else 0f).coerceAtMost(h * 0.45f)
+        val bottomZone = maxOf(gap + vidH * bottomInset, if (portrait) 96.dp.toPx() else 0f).coerceAtMost(h * 0.45f)
+        fun weight(c: Color) = (maxOf(c.red, c.green, c.blue) / 0.12f).coerceIn(0f, 1f)
+        val topA = spec.edgeOverlayAlpha * overlayAlpha * weight(animTop)
+        val bottomA = spec.edgeOverlayAlpha * overlayAlpha * weight(animBottom)
+        if (topZone > 1f && topA > 0.005f) {
+            drawRect(
+                brush = Brush.verticalGradient(
+                    0f to animTop.copy(alpha = topA),
+                    0.5f to animTop.copy(alpha = topA * 0.42f),
+                    1f to Color.Transparent,
+                    startY = 0f,
+                    endY = topZone,
+                ),
+                size = androidx.compose.ui.geometry.Size(w, topZone),
+            )
+        }
+        if (bottomZone > 1f && bottomA > 0.005f) {
+            drawRect(
+                brush = Brush.verticalGradient(
+                    0f to Color.Transparent,
+                    0.5f to animBottom.copy(alpha = bottomA * 0.42f),
+                    1f to animBottom.copy(alpha = bottomA),
+                    startY = h - bottomZone,
+                    endY = h,
+                ),
+                topLeft = androidx.compose.ui.geometry.Offset(0f, h - bottomZone),
+                size = androidx.compose.ui.geometry.Size(w, bottomZone),
+            )
         }
     }
 }
