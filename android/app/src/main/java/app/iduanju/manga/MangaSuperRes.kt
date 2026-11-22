@@ -37,7 +37,7 @@ fun Modifier.mangaSuperRes(level: Int, contentSize: IntSize = IntSize.Zero, fill
         else runCatching { // AGSL compilation can fail on broken drivers: fall back to the plain page
             val k = ((scale - 1f) / 0.8f).coerceIn(0f, 1f) // 0 = page shown at ≤ 1:1, 1 = enlarged ≥ 1.8×
             val shader = RuntimeShader(MANGA_SR_SHADER)
-            shader.setFloatUniform("uSize", size.width.toFloat(), size.height.toFloat())
+            shader.setFloatUniform("uStep", 1f)
             shader.setFloatUniform("uRadius", scale.roundToInt().coerceIn(1, 3).toFloat())
             shader.setFloatUniform("uAmount", 0.45f + 0.4f * k)
             shader.setFloatUniform("uInk", 0.45f + 0.25f * k)
@@ -65,32 +65,29 @@ fun mangaInkLevels(): FloatArray {
 
 private const val MANGA_SR_SHADER = """
 uniform shader img;
-uniform float2 uSize;
+uniform float uStep;
 uniform float uRadius;
 uniform float uAmount;
 uniform float uInk;
 
 const half3 LUMA = half3(0.2126, 0.7152, 0.0722);
 
-float2 lo() { return float2(0.5); }
-float2 hi() { return uSize - 0.5; }
-
 // Luma of a neighbour; transparent letterbox pixels read as the centre so page edges never get a rim.
 half lumaAt(float2 p, half centre) {
-    half4 c = img.eval(clamp(p, lo(), hi()));
+    half4 c = img.eval(p);
     return dot(c.rgb, LUMA) + (1.0 - c.a) * centre;
 }
 
 half4 main(float2 pos) {
-    float2 p = clamp(pos, lo(), hi());
-    half4 base = img.eval(p);
+    half4 base = img.eval(pos);
     if (base.a == 0.0) return base;
     half mid = dot(base.rgb, LUMA) / base.a;
 
     // 1 px ring: 3x3 gaussian + local range
-    half a0 = lumaAt(p + float2(-1.0, -1.0), mid); half a1 = lumaAt(p + float2(0.0, -1.0), mid); half a2 = lumaAt(p + float2(1.0, -1.0), mid);
-    half a3 = lumaAt(p + float2(-1.0, 0.0), mid);                                            half a5 = lumaAt(p + float2(1.0, 0.0), mid);
-    half a6 = lumaAt(p + float2(-1.0, 1.0), mid);  half a7 = lumaAt(p + float2(0.0, 1.0), mid);  half a8 = lumaAt(p + float2(1.0, 1.0), mid);
+    float stepPx = uStep;
+    half a0 = lumaAt(pos + float2(-stepPx, -stepPx), mid); half a1 = lumaAt(pos + float2(0.0, -stepPx), mid); half a2 = lumaAt(pos + float2(stepPx, -stepPx), mid);
+    half a3 = lumaAt(pos + float2(-stepPx, 0.0), mid);                                                half a5 = lumaAt(pos + float2(stepPx, 0.0), mid);
+    half a6 = lumaAt(pos + float2(-stepPx, stepPx), mid);  half a7 = lumaAt(pos + float2(0.0, stepPx), mid);  half a8 = lumaAt(pos + float2(stepPx, stepPx), mid);
     half blur = (a0 + a2 + a6 + a8 + 2.0 * (a1 + a3 + a5 + a7) + 4.0 * mid) / 16.0;
     half mn = min(mid, min(min(min(a0, a1), min(a2, a3)), min(min(a5, a6), min(a7, a8))));
     half mx = max(mid, max(max(max(a0, a1), max(a2, a3)), max(max(a5, a6), max(a7, a8))));
@@ -98,9 +95,9 @@ half4 main(float2 pos) {
     // R px ring for pages drawn enlarged (their edges are spread over R screen pixels)
     if (uRadius > 1.5) {
         float r = uRadius;
-        half b0 = lumaAt(p + float2(-r, -r), mid); half b1 = lumaAt(p + float2(0.0, -r), mid); half b2 = lumaAt(p + float2(r, -r), mid);
-        half b3 = lumaAt(p + float2(-r, 0.0), mid);                                           half b5 = lumaAt(p + float2(r, 0.0), mid);
-        half b6 = lumaAt(p + float2(-r, r), mid);  half b7 = lumaAt(p + float2(0.0, r), mid);  half b8 = lumaAt(p + float2(r, r), mid);
+        half b0 = lumaAt(pos + float2(-r, -r), mid); half b1 = lumaAt(pos + float2(0.0, -r), mid); half b2 = lumaAt(pos + float2(r, -r), mid);
+        half b3 = lumaAt(pos + float2(-r, 0.0), mid);                                            half b5 = lumaAt(pos + float2(r, 0.0), mid);
+        half b6 = lumaAt(pos + float2(-r, r), mid);  half b7 = lumaAt(pos + float2(0.0, r), mid);  half b8 = lumaAt(pos + float2(r, r), mid);
         half blurR = (b0 + b2 + b6 + b8 + 2.0 * (b1 + b3 + b5 + b7) + 4.0 * mid) / 16.0;
         blur = 0.5 * blur + 0.5 * blurR;
         mn = min(mn, min(min(min(b0, b1), min(b2, b3)), min(min(b5, b6), min(b7, b8))));

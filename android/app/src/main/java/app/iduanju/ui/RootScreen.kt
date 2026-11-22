@@ -1,38 +1,66 @@
 package app.iduanju.ui
 
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.snap
+import androidx.compose.animation.core.spring
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.LiveTv
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Icon
+import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.lerp
+import androidx.compose.ui.unit.sp
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import com.kyant.backdrop.Backdrop
 import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import app.iduanju.ui.category.CategoryScreen
 import app.iduanju.ui.components.GlassNavigationRail
-import app.iduanju.ui.components.GlassTabBar
+import app.iduanju.ui.components.GlassStyle
+import app.iduanju.ui.components.GlassStylePref
 import app.iduanju.ui.components.LayoutMetrics
 import app.iduanju.ui.components.LocalRootBackdrop
 import app.iduanju.ui.components.LocalLayoutMetrics
 import app.iduanju.ui.components.SearchDockState
+import app.iduanju.ui.components.glassPill
+import app.iduanju.ui.components.glassSurface
 import app.iduanju.ui.detail.DetailScreen
 import app.iduanju.ui.home.HomeScreen
 import app.iduanju.ui.player.PlayerScreen
 import app.iduanju.ui.profile.ProfileScreen
 import app.iduanju.ui.search.SearchScreen
 import app.iduanju.ui.theme.IdjThemeColors
+import kotlin.math.roundToInt
 
 /** Lets deep rows (继续观看 · 全部) open a route without threading callbacks through every page. */
 val LocalNavigate = androidx.compose.runtime.staticCompositionLocalOf<(String) -> Unit> { {} }
@@ -286,7 +314,7 @@ fun RootScreen(initialRoute: String? = null) {
             exit = androidx.compose.animation.fadeOut(androidx.compose.animation.core.tween(140)) +
                 androidx.compose.animation.slideOutVertically(androidx.compose.animation.core.tween(180)) { it / 2 },
         ) {
-            GlassTabBar(
+            SwipeableGlassTabBar(
                 selected = tab,
                 items = navItems,
                 onSelect = onSelectTab,
@@ -302,5 +330,271 @@ fun RootScreen(initialRoute: String? = null) {
             )
         }
         app.iduanju.update.UpdateDialog(updater)
+    }
+}
+
+private val DockPillShape = RoundedCornerShape(percent = 50)
+
+/**
+ * Floating bottom Liquid Glass dock with horizontal finger-slide tab scrubbing,
+ * sliding glass indicator pill, haptic ticks on slot boundaries, and Yamby search morph.
+ */
+@Composable
+private fun SwipeableGlassTabBar(
+    selected: Int,
+    items: List<Pair<String, @Composable (Boolean) -> Unit>>,
+    onSelect: (Int) -> Unit,
+    backdrop: Backdrop? = null,
+    modifier: Modifier = Modifier,
+    searchSelected: Boolean = false,
+    onSearch: (() -> Unit)? = null,
+    searchIcon: (@Composable (Boolean) -> Unit)? = null,
+    searchDockState: SearchDockState? = null,
+    onCloseSearch: () -> Unit = {},
+) {
+    val c = IdjThemeColors
+    val liquid = GlassStylePref.style == GlassStyle.LIQUID
+    val focusManager = LocalFocusManager.current
+    val haptic = LocalHapticFeedback.current
+    val hasSearch = onSearch != null && searchIcon != null
+    val morph by animateFloatAsState(
+        targetValue = if (hasSearch && searchSelected) 1f else 0f,
+        animationSpec = spring(dampingRatio = 0.78f, stiffness = 360f),
+        label = "dockMorph",
+    )
+
+    LaunchedEffect(searchSelected) { if (!searchSelected) focusManager.clearFocus() }
+
+    var isDragging by remember { mutableStateOf(false) }
+    var dragFraction by remember { mutableFloatStateOf(selected.toFloat()) }
+    var hoveredIdx by remember { mutableIntStateOf(selected) }
+    val latestSelected by rememberUpdatedState(selected)
+    val latestOnSelect by rememberUpdatedState(onSelect)
+
+    LaunchedEffect(selected, searchSelected) {
+        if (!isDragging) {
+            dragFraction = selected.toFloat()
+            hoveredIdx = selected
+        }
+    }
+
+    val activeTab = if (isDragging) hoveredIdx else selected
+    val indicatorFraction by animateFloatAsState(
+        targetValue = if (isDragging) dragFraction else selected.toFloat(),
+        animationSpec = if (isDragging) snap() else spring(dampingRatio = 0.78f, stiffness = 420f),
+        label = "dockIndicator",
+    )
+    val indicatorScale by animateFloatAsState(
+        targetValue = if (isDragging) 1.04f else 1f,
+        animationSpec = spring(dampingRatio = 0.72f, stiffness = 480f),
+        label = "dockIndicatorScale",
+    )
+
+    Box(modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+        BoxWithConstraints(
+            Modifier.widthIn(max = 420.dp).fillMaxWidth().padding(horizontal = 16.dp),
+        ) {
+            val gap = 10.dp
+            val circleSize = 58.dp
+            val totalW = maxWidth
+            val expandedW = if (hasSearch) (totalW - gap - circleSize).coerceAtLeast(circleSize) else totalW
+            val t = morph.coerceIn(0f, 1f)
+            val leftW = if (hasSearch) lerp(expandedW, circleSize, t) else totalW
+            val rightW = lerp(circleSize, expandedW, t)
+
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(gap),
+            ) {
+                Box(
+                    Modifier
+                        .width(leftW)
+                        .height(circleSize)
+                        .glassSurface(shape = DockPillShape, backdrop = backdrop, shadowRadius = 18.dp)
+                        .then(
+                            if (searchSelected) {
+                                Modifier.clickable {
+                                    focusManager.clearFocus()
+                                    onCloseSearch()
+                                }
+                            } else {
+                                Modifier
+                            },
+                        )
+                        .padding(if (t < 0.5f) 5.dp else 0.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (t < 0.5f) {
+                        val tabsAlpha = (1f - t * 2f).coerceIn(0f, 1f)
+                        BoxWithConstraints(
+                            Modifier
+                                .fillMaxSize()
+                                .graphicsLayer { alpha = tabsAlpha },
+                            contentAlignment = Alignment.CenterStart,
+                        ) {
+                            val count = items.size.coerceAtLeast(1)
+                            val slotWidth = maxWidth / count
+                            val slotWidthPx = with(LocalDensity.current) { slotWidth.toPx() }.coerceAtLeast(1f)
+                            val maxIdx = (count - 1).toFloat()
+
+                            if (!searchSelected) {
+                                Box(
+                                    Modifier
+                                        .offset {
+                                            IntOffset((indicatorFraction.coerceIn(0f, maxIdx) * slotWidthPx).roundToInt(), 0)
+                                        }
+                                        .width(slotWidth)
+                                        .height(48.dp)
+                                        .graphicsLayer {
+                                            scaleX = indicatorScale
+                                            scaleY = indicatorScale
+                                        }
+                                        .then(
+                                            if (liquid) Modifier.glassPill(DockPillShape, selected = true, neutralSelected = true)
+                                            else Modifier.clip(DockPillShape).background(if (c.dark) Color.White.copy(alpha = 0.14f) else Color.Black.copy(alpha = 0.08f)),
+                                        ),
+                                )
+                            }
+
+                            Row(
+                                Modifier
+                                    .fillMaxSize()
+                                    .pointerInput(count, searchSelected, slotWidthPx) {
+                                        if (searchSelected || count <= 1) return@pointerInput
+                                        detectHorizontalDragGestures(
+                                            onDragStart = { startOffset ->
+                                                isDragging = true
+                                                val idx = (startOffset.x / slotWidthPx).toInt().coerceIn(0, count - 1)
+                                                dragFraction = (startOffset.x / slotWidthPx - 0.5f).coerceIn(0f, maxIdx)
+                                                if (idx != hoveredIdx) {
+                                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                                }
+                                                hoveredIdx = idx
+                                            },
+                                            onHorizontalDrag = { change, _ ->
+                                                change.consume()
+                                                val x = change.position.x
+                                                dragFraction = (x / slotWidthPx - 0.5f).coerceIn(0f, maxIdx)
+                                                val idx = (x / slotWidthPx).toInt().coerceIn(0, count - 1)
+                                                if (idx != hoveredIdx) {
+                                                    hoveredIdx = idx
+                                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                                }
+                                            },
+                                            onDragEnd = {
+                                                val target = hoveredIdx
+                                                isDragging = false
+                                                if (target != latestSelected) latestOnSelect(target)
+                                            },
+                                            onDragCancel = {
+                                                isDragging = false
+                                                hoveredIdx = latestSelected
+                                                dragFraction = latestSelected.toFloat()
+                                            },
+                                        )
+                                    },
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                items.forEachIndexed { i, (label, icon) ->
+                                    val on = i == activeTab && !searchSelected
+                                    Box(
+                                        Modifier
+                                            .weight(1f)
+                                            .height(48.dp)
+                                            .clip(DockPillShape)
+                                            .clickable { latestOnSelect(i) },
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                            icon(on)
+                                            Spacer(Modifier.height(2.dp))
+                                            Text(
+                                                label,
+                                                color = if (on) c.text else c.secondary,
+                                                fontSize = 11.sp,
+                                                fontWeight = if (on) FontWeight.SemiBold else FontWeight.Medium,
+                                                maxLines = 1,
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        val backAlpha = ((t - 0.5f) * 2f).coerceIn(0f, 1f)
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "返回",
+                            tint = c.text,
+                            modifier = Modifier.size(22.dp).graphicsLayer { alpha = backAlpha },
+                        )
+                    }
+                }
+
+                if (hasSearch) {
+                    val searchQuery = searchDockState?.query.orEmpty()
+                    Box(
+                        Modifier
+                            .width(rightW)
+                            .height(circleSize)
+                            .glassSurface(
+                                shape = DockPillShape,
+                                backdrop = backdrop,
+                                shadowRadius = 18.dp,
+                                activeOverlay = if (searchSelected) c.accent.copy(alpha = if (c.dark) 0.06f else 0.04f) else Color.Transparent,
+                            )
+                            .clickable {
+                                if (!searchSelected) onSearch?.invoke() else searchDockState?.isTyping = true
+                            },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        if (t < 0.38f && !searchSelected) {
+                            val iconAlpha = (1f - t / 0.38f).coerceIn(0f, 1f)
+                            Box(Modifier.graphicsLayer { alpha = iconAlpha }, contentAlignment = Alignment.Center) {
+                                searchIcon?.invoke(false)
+                            }
+                        } else {
+                            val fieldAlpha = ((t - 0.25f) / 0.75f).coerceIn(0f, 1f)
+                            Row(
+                                Modifier
+                                    .fillMaxSize()
+                                    .padding(horizontal = 16.dp)
+                                    .graphicsLayer { alpha = fieldAlpha },
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    Icons.Filled.Search,
+                                    contentDescription = "搜索",
+                                    tint = c.accent,
+                                    modifier = Modifier.size(20.dp),
+                                )
+                                Spacer(Modifier.width(10.dp))
+                                Text(
+                                    searchQuery.ifEmpty { "搜索短剧 / 演员 / 频道…" },
+                                    color = if (searchQuery.isEmpty()) c.secondary else c.text,
+                                    fontSize = 15.sp,
+                                    fontWeight = if (searchQuery.isEmpty()) FontWeight.Normal else FontWeight.Medium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                if (searchQuery.isNotEmpty()) {
+                                    Spacer(Modifier.width(6.dp))
+                                    Icon(
+                                        Icons.Filled.Cancel,
+                                        contentDescription = "清除",
+                                        tint = c.secondary,
+                                        modifier = Modifier
+                                            .size(18.dp)
+                                            .clickable { searchDockState?.clear() },
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

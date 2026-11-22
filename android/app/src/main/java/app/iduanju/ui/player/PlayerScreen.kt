@@ -31,6 +31,8 @@ import androidx.compose.material.icons.automirrored.filled.VolumeDown
 import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.rounded.ChevronRight
+import androidx.compose.material.icons.rounded.SkipNext
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -46,6 +48,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.util.VelocityTracker
+import androidx.compose.ui.input.pointer.util.addPointerInputChange
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -123,16 +127,48 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
     val activity = ctx as? android.app.Activity
     val metrics = app.iduanju.ui.components.LocalLayoutMetrics.current
     val landscape = metrics.isLandscape
-    var forcedLandscape by remember { mutableStateOf(false) }
-    fun setLandscape(on: Boolean) {
-        forcedLandscape = on
-        activity?.requestedOrientation = when {
-            on -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-            metrics.isTablet -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-            else -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+    var manualOrientation by remember { mutableStateOf<Boolean?>(null) }
+    val forcedLandscape = manualOrientation == true
+    val currentLocked by rememberUpdatedState(locked)
+    val currentManualOrientation by rememberUpdatedState(manualOrientation)
+    fun applyRequestedOrientation(isLocked: Boolean = locked, manual: Boolean? = manualOrientation) {
+        val act = activity ?: return
+        act.requestedOrientation = when {
+            isLocked -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LOCKED
+            manual == true -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            manual == false -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            else -> android.content.pm.ActivityInfo.SCREEN_ORIENTATION_USER
         }
     }
-    androidx.activity.compose.BackHandler(enabled = landscape && forcedLandscape) { setLandscape(false) }
+    fun setLandscape(on: Boolean) {
+        manualOrientation = on
+        applyRequestedOrientation(locked, on)
+    }
+    LaunchedEffect(locked, manualOrientation, activity) {
+        applyRequestedOrientation(locked, manualOrientation)
+    }
+    DisposableEffect(activity) {
+        val listener = object : android.view.OrientationEventListener(ctx) {
+            override fun onOrientationChanged(orientation: Int) {
+                if (orientation == ORIENTATION_UNKNOWN || currentLocked) return
+                val targetLandscape = currentManualOrientation ?: return
+                val isPhysicalPortrait = orientation <= 30 || orientation >= 330
+                val isPhysicalLandscape = orientation in 60..120 || orientation in 240..300
+                if ((targetLandscape && isPhysicalLandscape) || (!targetLandscape && isPhysicalPortrait)) {
+                    if (isAutoRotateEnabled(ctx)) {
+                        manualOrientation = null
+                        activity?.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_USER
+                    }
+                }
+            }
+        }
+        if (listener.canDetectOrientation()) listener.enable()
+        onDispose {
+            listener.disable()
+            activity?.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        }
+    }
+    androidx.activity.compose.BackHandler(enabled = !locked && landscape && forcedLandscape) { setLandscape(false) }
     LaunchedEffect(landscape) {
         val w = activity?.window ?: return@LaunchedEffect
         val ic = androidx.core.view.WindowCompat.getInsetsController(w, w.decorView)
@@ -181,6 +217,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
         w.attributes = lp
     }
 
+    var mediaSeekTick by remember { mutableIntStateOf(0) }
     DisposableEffect(player) {
         val l = object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
@@ -219,7 +256,10 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                 keepScreenOn(activity, false)
             }
             // Keep the display awake only while frames are actually playing (portrait, landscape, same activity window).
-            override fun onIsPlayingChanged(isPlaying: Boolean) { keepScreenOn(activity, isPlaying) }
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                keepScreenOn(activity, isPlaying)
+                playing = isPlaying
+            }
             override fun onTracksChanged(t: androidx.media3.common.Tracks) {
                 tags = TechTags.from(player, quality)
             }
@@ -234,6 +274,11 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                 reason: Int,
             ) {
                 ambientSampleTick++
+                if (reason == Player.DISCONTINUITY_REASON_SEEK ||
+                    reason == Player.DISCONTINUITY_REASON_SEEK_ADJUSTMENT
+                ) {
+                    mediaSeekTick++
+                }
             }
             override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
                 tags = TechTags.from(player, quality)
@@ -299,6 +344,52 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
     fun selectEpisode(index: Int) {
         val current = activeQueue
         if (current == null) epIndex = index else current.select(index)
+    }
+
+    val currentDetail by rememberUpdatedState(detail)
+    val currentEpIndex by rememberUpdatedState(epIndex)
+    val mediaSession = remember(player) {
+        PlayerMediaSession(
+            context = ctx,
+            onPlayPause = { if (player.isPlaying) player.pause() else player.play() },
+            onNext = {
+                val n = currentDetail?.episodes?.size ?: 0
+                if (currentEpIndex >= 0 && currentEpIndex + 1 < n) selectEpisode(currentEpIndex + 1)
+            },
+            onPrev = {
+                if (currentEpIndex > 0) selectEpisode(currentEpIndex - 1)
+            },
+            onSeekTo = { targetMs ->
+                val maxDur = player.duration.coerceAtLeast(0L)
+                val clamped = if (maxDur > 0L) targetMs.coerceIn(0L, maxDur) else targetMs.coerceAtLeast(0L)
+                player.seekTo(clamped)
+            },
+        )
+    }
+    DisposableEffect(mediaSession) {
+        onDispose { mediaSession.release() }
+    }
+    val mediaTitle = detail?.title.orEmpty()
+    val mediaEpisode = detail?.episodes?.getOrNull(epIndex)
+    val mediaSubtitle = when {
+        mediaEpisode == null -> ""
+        queue != null -> "第 ${epIndex + 1} 章" + if (mediaEpisode.title.isNotBlank()) " · ${mediaEpisode.title}" else ""
+        else -> "第 ${mediaEpisode.ep} 集" + if (mediaEpisode.title.isNotBlank()) " · ${mediaEpisode.title}" else ""
+    }
+    val mediaCoverUrl = detail?.cover
+    LaunchedEffect(mediaSession, mediaTitle, mediaSubtitle, mediaCoverUrl, dur) {
+        if (mediaTitle.isNotEmpty() || mediaSubtitle.isNotEmpty()) {
+            mediaSession.updateMetadata(mediaTitle, mediaSubtitle, mediaCoverUrl, dur)
+        }
+    }
+    val mediaHasPrev = epIndex > 0
+    val mediaHasNext = epIndex >= 0 && epIndex + 1 < (detail?.episodes?.size ?: 0)
+    val mediaSpeed = if (holdSpeed) 2f else speed
+    LaunchedEffect(mediaSession, playing, epIndex, mediaHasPrev, mediaHasNext, mediaSpeed, mediaSeekTick) {
+        if (detail != null) {
+            val curPos = runCatching { player.currentPosition.coerceAtLeast(0L) }.getOrDefault(pos)
+            mediaSession.updatePlaybackState(playing, curPos, mediaSpeed, mediaHasPrev, mediaHasNext)
+        }
     }
 
     // ── Bilibili-style 3-zone vertical gestures: left = 亮度, right = 音量, centre = 抖音式 follow-finger 上/下一集 ──
@@ -648,8 +739,12 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
         )
         }
         // Adjacent-episode preview panel: below the video while dragging up (下一集), above it while dragging down.
+        val density = androidx.compose.ui.platform.LocalDensity.current
+        val epSwitchThresholdPx = remember(containerH, density) {
+            minOf(containerH * EPISODE_SWITCH_THRESHOLD, with(density) { EPISODE_SWITCH_MAX_DP.toPx() })
+        }
         val epDragDir by remember { derivedStateOf { if (episodeDragY < -0.5f) 1 else if (episodeDragY > 0.5f) -1 else 0 } }
-        val epArmed by remember(containerH) { derivedStateOf { kotlin.math.abs(episodeDragY) > containerH * EPISODE_SWITCH_THRESHOLD } }
+        val epArmed by remember(epSwitchThresholdPx) { derivedStateOf { kotlin.math.abs(episodeDragY) > epSwitchThresholdPx } }
         val previewEp = if (epDragDir != 0) detail?.episodes?.getOrNull(epIndex + epDragDir) else null
         if (previewEp != null) EpisodeSwitchPreview(
             cover = detail?.cover.orEmpty(), ep = previewEp, next = epDragDir > 0, armed = epArmed,
@@ -692,17 +787,24 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                     var maxVol = 1
                     var rawY = 0f
                     var committing = false
+                    val velocityTracker = VelocityTracker()
                     val music = android.media.AudioManager.STREAM_MUSIC
                     fun finish(commit: Boolean) {
                         if (zone == 1 || zone == 2) hudDragging = false
                         if (zone == 3) {
                             val h = size.height.toFloat()
                             val off = episodeDragY
+                            val vy = if (commit) velocityTracker.calculateVelocity().y else 0f
+                            val thresholdPx = minOf(h * EPISODE_SWITCH_THRESHOLD, EPISODE_SWITCH_MAX_DP.toPx())
+                            val flickVelPx = EPISODE_FLICK_VELOCITY_DP.toPx()
+                            val flickDistPx = EPISODE_FLICK_MIN_DISTANCE_DP.toPx()
                             val n = detail?.episodes?.size ?: 0
+                            val wantNext = (off < -thresholdPx) || (vy < -flickVelPx && off < -flickDistPx)
+                            val wantPrev = (off > thresholdPx) || (vy > flickVelPx && off > flickDistPx)
                             val target = when {
                                 !commit -> -1
-                                off < -h * EPISODE_SWITCH_THRESHOLD && epIndex + 1 < n -> epIndex + 1
-                                off > h * EPISODE_SWITCH_THRESHOLD && epIndex > 0 -> epIndex - 1
+                                wantNext && epIndex + 1 < n -> epIndex + 1
+                                wantPrev && epIndex > 0 -> epIndex - 1
                                 else -> -1
                             }
                             episodeSettle = gestureScope.launch {
@@ -734,7 +836,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                                     maxVol = audioManager.getStreamMaxVolume(music).coerceAtLeast(1)
                                     level = audioManager.getStreamVolume(music).toFloat() / maxVol
                                 }
-                                3 -> { episodeSettle?.cancel(); rawY = episodeDragY }
+                                3 -> { episodeSettle?.cancel(); rawY = episodeDragY; velocityTracker.resetTracking() }
                             }
                             if (zone == 1 || zone == 2) {
                                 hudKind = if (zone == 1) GestureHudKind.BRIGHTNESS else GestureHudKind.VOLUME
@@ -761,6 +863,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                                 hudValue = level
                             }
                             else -> {
+                                velocityTracker.addPointerInputChange(change)
                                 rawY += dy
                                 val n = detail?.episodes?.size ?: 0
                                 val atEdge = (rawY < 0f && epIndex + 1 >= n) || (rawY > 0f && epIndex <= 0)
@@ -968,8 +1071,9 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                         HudIcon(if (landscape) Icons.Filled.FullscreenExit else Icons.Filled.Fullscreen, null, false) { setLandscape(!landscape) }
                     }
                 }
-                // Playback actions only. 画面比例 / 氛围光晕 / AI 超分 / SDR→HDR / 定时 / 连播 live solely in 更多设置 (top-right ⋯).
+                // Playback actions only. 画面比例 / 氛围光晕 / AI 超分 / SDR→HDR / 定时 / 连播 / 音轨字幕 live solely in 更多设置 (top-right ⋯).
                 val speedLabel = if (speed == 1f) "1.0×" else "${speed}×".replace(".0×", "×")
+                val hasNextEp = epIndex >= 0 && epIndex + 1 < (curDetail?.episodes?.size ?: 0)
                 if (landscape) Row(Modifier.fillMaxWidth().padding(top = 6.dp),
                     verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     if (introSkippable) LandChip(Icons.Filled.SkipNext, "跳过片头", null, false, chromeOn) { player.seekTo(15000) }
@@ -978,13 +1082,13 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                     LandChip(Icons.Filled.Speed, "倍速", speedLabel, panel == "speed" || speed != 1f, chromeOn) { togglePanel("speed") }
                     LandChip(Icons.Filled.HighQuality, "画质", quality ?: tags.res, panel == "quality", chromeOn) { togglePanel("quality") }
                     LandChip(Icons.Filled.Subtitles, "弹幕", if (dmOK) (if (danmaku) "开" else "关") else null, dmOK && danmaku, chromeOn && dmOK) { danmaku = !danmaku }
-                    LandChip(Icons.Filled.ClosedCaption, "音轨字幕", null, panel == "audio", chromeOn) { togglePanel("audio") }
+                    LandChip(Icons.Rounded.SkipNext, "下一集", null, false, chromeOn && hasNextEp) { if (hasNextEp) selectEpisode(epIndex + 1) }
                 } else Row(Modifier.fillMaxWidth().padding(top = 10.dp)) {
                     ActionBtn(Icons.Filled.GridView, "选集", null, panel == "episodes", false, chromeOn) { togglePanel("episodes") }
                     ActionBtn(Icons.Filled.Speed, "倍速", speedLabel, panel == "speed", speed != 1f, chromeOn) { togglePanel("speed") }
                     ActionBtn(Icons.Filled.HighQuality, "画质", quality ?: tags.res, panel == "quality", false, chromeOn) { togglePanel("quality") }
                     ActionBtn(Icons.Filled.Subtitles, "弹幕", if (dmOK) (if (danmaku) "开" else "关") else null, false, dmOK && danmaku, chromeOn) { if (dmOK) danmaku = !danmaku }
-                    ActionBtn(Icons.Filled.ClosedCaption, "音轨字幕", null, panel == "audio", false, chromeOn) { togglePanel("audio") }
+                    ActionBtn(Icons.Rounded.SkipNext, "下一集", null, false, false, chromeOn && hasNextEp) { if (hasNextEp) selectEpisode(epIndex + 1) }
                 }
             }
         }
@@ -1058,6 +1162,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                             sleepEndMs = sleepEndMs,
                             autoNext = autoNext,
                             showAutoNext = queue == null,
+                            audioLabel = tags.audio,
                             pc = pc,
                             onFillMode = { fill ->
                                 fillMode = fill
@@ -1088,6 +1193,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                                 }
                             },
                             onAutoNext = { autoNext = it },
+                            onAudioSubtitle = { panel = "audio" },
                         )
                     }
                     else -> {
@@ -1243,7 +1349,9 @@ private fun LandChip(icon: ImageVector, title: String, value: String?, on: Boole
 private fun RowScope.ActionBtn(icon: ImageVector, title: String, value: String?, active: Boolean, accent: Boolean, enabled: Boolean, onClick: () -> Unit) {
     val pc = IdjDarkColors
     val bg by androidx.compose.animation.animateColorAsState(if (active) Color.White.copy(0.15f) else Color.Transparent, DS.select(), label = "pact")
-    Column(Modifier.weight(1f).clip(RoundedCornerShape(14.dp)).background(bg).pressClick(enabled = enabled, label = title, onClick = onClick)
+    Column(Modifier.weight(1f).clip(RoundedCornerShape(14.dp)).background(bg)
+        .graphicsLayer { alpha = if (enabled) 1f else 0.42f }
+        .pressClick(enabled = enabled, label = title, onClick = onClick)
         .padding(top = 7.dp, bottom = 6.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         Icon(icon, title, tint = if (accent) pc.accent else Color.White, modifier = Modifier.size(23.dp))
         Spacer(Modifier.height(4.dp))
@@ -1419,8 +1527,21 @@ private fun systemBrightness(ctx: android.content.Context): Float {
     return (raw.toFloat() / maxOf(max, raw).toFloat()).coerceIn(0f, 1f)
 }
 
-/** Fraction of the player height the centre-zone drag must pass before releasing switches the episode. */
-private const val EPISODE_SWITCH_THRESHOLD = 0.16f
+/** Returns true when system auto-rotation (`ACCELEROMETER_ROTATION == 1`) is enabled. */
+private fun isAutoRotateEnabled(ctx: android.content.Context): Boolean =
+    runCatching {
+        android.provider.Settings.System.getInt(
+            ctx.contentResolver,
+            android.provider.Settings.System.ACCELEROMETER_ROTATION,
+            0,
+        ) == 1
+    }.getOrDefault(false)
+
+/** Fraction of the player height (capped at 105 dp) the centre-zone drag must pass before releasing switches the episode. */
+private const val EPISODE_SWITCH_THRESHOLD = 0.14f
+private val EPISODE_SWITCH_MAX_DP = 105.dp
+private val EPISODE_FLICK_VELOCITY_DP = 750.dp
+private val EPISODE_FLICK_MIN_DISTANCE_DP = 36.dp
 
 private enum class GestureHudKind { BRIGHTNESS, VOLUME }
 
@@ -1499,6 +1620,7 @@ private fun MoreSettingsPanel(
     sleepEndMs: Long,
     autoNext: Boolean,
     showAutoNext: Boolean,
+    audioLabel: String?,
     pc: IdjColors,
     onFillMode: (Boolean) -> Unit,
     onAmbientLevel: (Int) -> Unit,
@@ -1506,6 +1628,7 @@ private fun MoreSettingsPanel(
     onSdrToHdr: (Boolean) -> Unit,
     onSleep: (Int) -> Unit,
     onAutoNext: (Boolean) -> Unit,
+    onAudioSubtitle: () -> Unit,
 ) {
     val sleepSubtitle = when {
         sleepMode == -1 -> "定时：播完本集"
@@ -1588,6 +1711,25 @@ private fun MoreSettingsPanel(
             pc = pc,
             onSelect = onAutoNext,
         )
+    }
+
+    Spacer(Modifier.height(10.dp))
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(Color.White.copy(0.06f))
+            .border(1.dp, Color.White.copy(0.10f), RoundedCornerShape(12.dp))
+            .pressClick(0.98f, label = "音轨字幕", onClick = onAudioSubtitle)
+            .padding(horizontal = 12.dp, vertical = 11.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(Icons.Filled.ClosedCaption, null, tint = Color.White.copy(0.86f), modifier = Modifier.size(18.dp))
+        Spacer(Modifier.width(10.dp))
+        Text("音轨字幕", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
+        Text("${audioLabel ?: "默认音轨"} · 字幕关闭", color = Color.White.copy(0.55f), fontSize = 12.sp)
+        Spacer(Modifier.width(6.dp))
+        Icon(Icons.Rounded.ChevronRight, null, tint = Color.White.copy(0.5f), modifier = Modifier.size(16.dp))
     }
 }
 
