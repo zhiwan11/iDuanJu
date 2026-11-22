@@ -14,7 +14,6 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
-import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -71,6 +70,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.floor
@@ -225,10 +225,10 @@ val LocalReaderPageActive = compositionLocalOf { true }
  * Page state for [BookPageCurlViewer]. One turn at a time: [turnDir] (+1 next, −1 previous, 0 idle) and [progress]
  * 0..1 (share of the turn done, in the turn's direction) drive 覆盖 / 淡入 and the commit decision.
  *
- * 仿真翻页 additionally tracks the lifted corner A = ([curlX], [curlY]) of the turning page, in *forward* reading space
- * normalised to the page: x = 1 is the free edge, x = −1 is fully turned over the spine; y is measured in the corner
- * frame (1 = the edge the hinge corner sits on, 0 = the opposite edge). [curlCorner] picks that corner: +1 bottom,
- * −1 top, 0 middle (a straight roll). A backward turn is the previous page's forward turn played in reverse.
+ * 仿真翻页 additionally tracks the continuous curl coordinates ([curlX], [curlY]) in *forward* reading space
+ * normalised to the page: x = 1 is flat at rest, x = −1 is fully turned over the spine; y ∈ 0..1 tracks the
+ * live vertical finger position (0 = top edge, 0.5 = vertical center roll, 1 = bottom edge) with zero discrete
+ * zone locking. A backward turn is the previous page's forward turn played in reverse.
  * A new turn first commits any turn still in flight, so rapid taps never lose a page.
  */
 @Stable
@@ -241,20 +241,19 @@ class BookPagerState(initialPage: Int, private val count: () -> Int) {
         private set
     var curlX by mutableFloatStateOf(1f)
         private set
-    var curlY by mutableFloatStateOf(1f)
-        private set
-    var curlCorner by mutableIntStateOf(1)
+    var curlY by mutableFloatStateOf(0.5f)
         private set
     /** Bumped on every drag start (the reader hides its HUD on it, like the pager's DragInteraction). */
     var dragStarts by mutableIntStateOf(0)
         private set
     val pageCount get() = count()
     val isTurning get() = turnDir != 0
-    /** While a finger holds a forward curl the hinge stays on the spine (see [drawCurlPage]). */
+    /** While a finger holds a forward curl the roll stays inside the spine edge (see [drawCurlPage]). */
     val isDragging get() = dragging
 
     private var dragging = false
     private var downX = 0f
+    private var targetCurlY = 0.5f
     /** Where the motion in flight will land (== currentPage when idle or snapping back). */
     private var goal = initialPage
     private var job: Job? = null
@@ -264,10 +263,10 @@ class BookPagerState(initialPage: Int, private val count: () -> Int) {
         val last = (pageCount - 1).coerceAtLeast(0)
         if (goal != currentPage) currentPage = goal.coerceIn(0, last)
         goal = currentPage; turnDir = 0; progress = 0f; dragging = false
-        curlX = 1f; curlY = 1f; curlCorner = 1
+        curlX = 1f; curlY = 0.5f; targetCurlY = 0.5f
     }
 
-    /** Animates [progress] to 0 / 1 and the curl corner along [path] (s = 0..1, may overshoot with a spring). */
+    /** Animates [progress] to 0 / 1 and the curl coordinates along [path] (s = 0..1, may overshoot with a spring). */
     private fun settle(scope: CoroutineScope, target: Int, toEnd: Boolean, spec: AnimationSpec<Float>, path: (Float) -> Offset) {
         goal = target
         val from = progress
@@ -275,9 +274,10 @@ class BookPagerState(initialPage: Int, private val count: () -> Int) {
         job = scope.launch {
             animate(0f, 1f, animationSpec = spec) { s, _ ->
                 progress = (from + (to - from) * s).coerceIn(0f, 1f)
-                val o = path(s); curlX = o.x; curlY = o.y
+                val o = path(s); curlX = o.x; curlY = o.y; targetCurlY = o.y
             }
-            currentPage = target; goal = target; turnDir = 0; progress = 0f; curlX = 1f; curlY = 1f; job = null
+            currentPage = target; goal = target; turnDir = 0; progress = 0f
+            curlX = 1f; curlY = 0.5f; targetCurlY = 0.5f; job = null
         }
     }
 
@@ -288,7 +288,6 @@ class BookPagerState(initialPage: Int, private val count: () -> Int) {
         finishNow()
         if (!animate) { currentPage = target; goal = target; return true }
         turnDir = if (forward) 1 else -1
-        curlCorner = 1
         // Like flipping a real book from the lower-right corner: the corner lifts, sweeps over in a graceful
         // parabolic arc and lays the page flat on the left. A backward turn plays the same arc in reverse.
         settle(scope, target, toEnd = true, tween(460, easing = FastOutSlowInEasing)) { s -> TapArc.at(if (forward) s else 1f - s) }
@@ -306,8 +305,8 @@ class BookPagerState(initialPage: Int, private val count: () -> Int) {
         if (currentPage + dir !in 0 until pageCount) return false
         turnDir = dir; progress = 0f; dragging = true; dragStarts++
         downX = x
-        curlCorner = when { y < 0.35f -> -1; y > 0.65f -> 1; else -> 0 }
-        curlX = if (dir > 0) 1f else -1f; curlY = 1f
+        val cy = y.coerceIn(0f, 1f)
+        curlX = if (dir > 0) 1f else -1f; curlY = cy; targetCurlY = cy
         return true
     }
 
@@ -315,11 +314,20 @@ class BookPagerState(initialPage: Int, private val count: () -> Int) {
         if (!dragging) return
         val dx = x - downX
         progress = (dx * -turnDir).coerceIn(0f, 1f)
-        // The corner rises toward the finger as the drag develops (no jump on touch-down).
-        val fingerY = if (curlCorner < 0) 1f - y else y
-        val lift = smoothstep01((abs(dx) / 0.22f).coerceIn(0f, 1f))
-        curlY = if (curlCorner == 0) 1f else 1f + (fingerY.coerceIn(0f, 1f) - 1f) * lift
-        curlX = if (turnDir > 0) (1f + dx * 1.1f).coerceIn(-1f, 1f) else (-1f + dx * 2f).coerceIn(-1f, 1f)
+        targetCurlY = y.coerceIn(0f, 1f)
+        curlX = if (turnDir > 0) (1f + dx * 1.15f).coerceIn(-1f, 1f) else (-1f + dx * 2f).coerceIn(-1f, 1f)
+    }
+
+    /** Frame-rate independent exponential smoothing on [curlY] for supple vertical sweeps. */
+    internal fun stepCurlY(dtSeconds: Float) {
+        if (!dragging) return
+        val diff = targetCurlY - curlY
+        if (abs(diff) < 1e-4f) {
+            if (curlY != targetCurlY) curlY = targetCurlY
+            return
+        }
+        val alpha = 1f - exp(-dtSeconds.coerceIn(0f, 0.05f) / 0.022f)
+        curlY += diff * alpha
     }
 
     /** [velocity] in page widths / s along the turn direction (positive = keep turning). */
@@ -328,18 +336,19 @@ class BookPagerState(initialPage: Int, private val count: () -> Int) {
         dragging = false
         val complete = velocity > 0.9f || (velocity > -0.5f && progress > 0.3f)
         val x0 = curlX; val y0 = curlY
-        // forward-equivalent destinations: (−1, 1) = page laid over the spine, (1, 1) = page flat in place
+        // forward-equivalent destinations: −1 = page laid over the spine, 1 = page flat in place
         val toTurned = (turnDir > 0) == complete
         val endX = if (toTurned) -1f else 1f
         val target = if (complete) currentPage + turnDir else currentPage
         if (complete) {
-            // released past the threshold / flicked: the corner sails on along a natural curved arc
-            val cx = (x0 + endX) / 2f; val cy = minOf(y0, 1f) - 0.16f
-            settle(scope, target, true, tween(320, easing = FastOutSlowInEasing)) { s -> quad(x0, y0, cx, cy, endX, 1f, s) }
+            // released past threshold / flicked: sails smoothly off-screen along the current tilt
+            settle(scope, target, true, tween(300, easing = FastOutSlowInEasing)) { s ->
+                Offset(x0 + (endX - x0) * s, y0)
+            }
         } else {
-            // cancelled: the page springs back with a little life
+            // cancelled: springs smoothly back to flat along the current tilt
             settle(scope, target, false, spring(dampingRatio = 0.78f, stiffness = 420f)) { s ->
-                Offset(x0 + (endX - x0) * s, y0 + (1f - y0) * s)
+                Offset(x0 + (endX - x0) * s, y0)
             }
         }
     }
@@ -347,17 +356,12 @@ class BookPagerState(initialPage: Int, private val count: () -> Int) {
 
 private fun smoothstep01(t: Float) = t * t * (3f - 2f * t)
 
-private fun quad(x0: Float, y0: Float, cx: Float, cy: Float, x1: Float, y1: Float, s: Float): Offset {
-    val u = 1f - s
-    return Offset(u * u * x0 + 2f * u * s * cx + s * s * x1, u * u * y0 + 2f * u * s * cy + s * s * y1)
-}
-
-/** Tap / volume-key turn path: flat → lifted lower-right corner (≈ 0.92, 0.85) → high parabolic sweep → laid flat. */
+/** Tap / volume-key turn path: flat → lifted lower-right corner → smooth diagonal sweep → laid flat. */
 private object TapArc {
-    private const val X0 = 1f; private const val Y0 = 1f
-    private const val X1 = 0.62f; private const val Y1 = 0.5f
-    private const val X2 = -0.45f; private const val Y2 = 0.35f
-    private const val X3 = -1f; private const val Y3 = 1f
+    private const val X0 = 1f; private const val Y0 = 0.90f
+    private const val X1 = 0.58f; private const val Y1 = 0.85f
+    private const val X2 = -0.35f; private const val Y2 = 0.72f
+    private const val X3 = -1f; private const val Y3 = 0.62f
     fun at(s: Float): Offset {
         val u = 1f - s
         val a = u * u * u; val b = 3f * u * u * s; val c = 3f * u * s * s; val d = s * s * s
@@ -403,6 +407,15 @@ fun BookPageCurlViewer(
     // forward-equivalent turn progress: a backward turn is the previous page's forward turn in reverse
     fun t() = if (state.turnDir < 0) 1f - state.progress else state.progress
     val mirror = rtl
+    LaunchedEffect(state.isDragging) {
+        if (!state.isDragging) return@LaunchedEffect
+        var last = withFrameNanos { it }
+        while (state.isDragging && isActive) {
+            val now = withFrameNanos { it }
+            state.stepCurlY((now - last) / 1_000_000_000f)
+            last = now
+        }
+    }
     Box(
         modifier.fillMaxSize().clipToBounds()
             .pointerInput(enabled, rtl) { if (enabled) coroutineScope { bookDragGestures(state, scope, rtl) } }
@@ -420,7 +433,7 @@ fun BookPageCurlViewer(
                             MangaPageAnim.COVER -> Modifier.graphicsLayer { translationX = -t() * size.width * (if (mirror) -1f else 1f) }
                             MangaPageAnim.FADE -> Modifier.graphicsLayer { alpha = 1f - t() }
                             else -> Modifier.drawWithContent {
-                                drawCurlPage(state.curlX, state.curlY, state.curlCorner, mirror, paper,
+                                drawCurlPage(state.curlX, state.curlY, mirror, paper,
                                     restrict = state.isDragging && state.turnDir > 0)
                             }
                         }
@@ -443,208 +456,336 @@ fun BookPageCurlViewer(
 
 private suspend fun PointerInputScope.bookDragGestures(state: BookPagerState, scope: CoroutineScope, rtl: Boolean) {
     val tracker = VelocityTracker()
-    var decided = false
-    var active = false
-    var down = Offset.Zero
+    val slop = viewConfiguration.touchSlop
     fun fx(x: Float) = (if (rtl) size.width - x else x) / size.width.coerceAtLeast(1)
     fun fy(y: Float) = y / size.height.coerceAtLeast(1)
-    fun end(fling: Boolean) {
+    awaitEachGesture {
+        val down = awaitFirstDown(requireUnconsumed = false)
+        tracker.resetTracking()
+        tracker.addPointerInputChange(down)
+        val pointerId = down.id
+        var decided = false
+        var active = false
+        var cancelled = false
+        while (true) {
+            val ev = awaitPointerEvent()
+            if (ev.changes.count { it.pressed } >= 2) {
+                cancelled = true
+                break
+            }
+            val change = ev.changes.firstOrNull { it.id == pointerId } ?: ev.changes.firstOrNull() ?: break
+            if (!change.pressed) {
+                tracker.addPointerInputChange(change)
+                break
+            }
+            if (!decided) {
+                if (change.isConsumed) {
+                    cancelled = true
+                    break
+                }
+                val totalDx = change.position.x - down.position.x
+                if (abs(totalDx) > slop) {
+                    decided = true
+                    // reading-space delta: positive = toward the next page (finger leftward in 左翻, rightward in 日漫)
+                    val fwd = if (rtl) totalDx else -totalDx
+                    active = state.dragStart(if (fwd > 0f) 1 else -1, fx(down.position.x), fy(down.position.y))
+                    if (!active) break
+                }
+            }
+            if (active && change.positionChanged()) {
+                tracker.addPointerInputChange(change)
+                change.consume()
+                state.dragTo(fx(change.position.x), fy(change.position.y))
+            } else if (!decided && change.positionChanged()) {
+                tracker.addPointerInputChange(change)
+            }
+        }
         if (active) {
             val w = size.width.coerceAtLeast(1).toFloat()
-            val vx = if (fling) tracker.calculateVelocity().x else 0f
+            val vx = if (!cancelled) tracker.calculateVelocity().x else 0f
             state.dragEnd(scope, (if (rtl) vx else -vx) * state.turnDir / w)
         }
-        decided = false; active = false
-    }
-    detectHorizontalDragGestures(
-        onDragStart = { tracker.resetTracking(); decided = false; active = false; down = it },
-        onDragEnd = { end(fling = true) },
-        onDragCancel = { end(fling = false) },
-    ) { change, dx ->
-        tracker.addPointerInputChange(change)
-        // reading-space delta: positive = toward the next page (finger leftward in 左翻, rightward in 日漫)
-        val fwd = if (rtl) dx else -dx
-        if (!decided) {
-            if (fwd == 0f) return@detectHorizontalDragGestures
-            decided = true
-            active = state.dragStart(if (fwd > 0f) 1 else -1, fx(down.x), fy(down.y))
-        }
-        if (!active) return@detectHorizontalDragGestures
-        change.consume()
-        state.dragTo(fx(change.position.x), fy(change.position.y))
     }
 }
 
 /** Fades in over the first ~12 % and out over the last ~20 % of a turn, so no shadow pops on commit. */
 private fun turnEnvelope(t: Float) = (t * 8f).coerceIn(0f, 1f) * ((1f - t) * 5f).coerceIn(0f, 1f)
 
-/** Intersection of lines p1-p2 and p3-p4 (frame space); falls back to [p2] when parallel. */
-private fun cross(p1: Offset, p2: Offset, p3: Offset, p4: Offset): Offset {
-    val a1 = p2.y - p1.y; val b1 = p1.x - p2.x; val c1 = a1 * p1.x + b1 * p1.y
-    val a2 = p4.y - p3.y; val b2 = p3.x - p4.x; val c2 = a2 * p3.x + b2 * p3.y
-    val det = a1 * b2 - a2 * b1
-    if (abs(det) < 1e-4f) return p2
-    return Offset((b2 * c1 - b1 * c2) / det, (a1 * c2 - a2 * c1) / det)
+/** Sutherland–Hodgman half-plane clip of convex [poly] against `p · (nx, ny) <= limit` (or `>= limit` when ![keepBelow]). */
+private fun clipHalfPlane(poly: List<Offset>, nx: Float, ny: Float, limit: Float, keepBelow: Boolean): List<Offset> {
+    if (poly.isEmpty()) return emptyList()
+    val out = ArrayList<Offset>(poly.size + 2)
+    fun inside(p: Offset): Boolean {
+        val d = p.x * nx + p.y * ny - limit
+        return if (keepBelow) d <= 0f else d >= 0f
+    }
+    var a = poly.last()
+    var aIn = inside(a)
+    for (b in poly) {
+        val bIn = inside(b)
+        if (aIn != bIn) {
+            val sa = a.x * nx + a.y * ny
+            val sb = b.x * nx + b.y * ny
+            val denom = sb - sa
+            val t = if (abs(denom) > 1e-5f) ((limit - sa) / denom).coerceIn(0f, 1f) else 0.5f
+            out.add(Offset(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t))
+        }
+        if (bIn) out.add(b)
+        a = b; aIn = bIn
+    }
+    return out
 }
 
 /**
- * 仿真翻页: the turning page's draw pass (classic conical page-curl geometry, as in iOS UIPageViewController):
- *
- * The hinge corner F = (w, h) of the corner frame is lifted to the finger A. The fold is the perpendicular bisector
- * of A–F (through G, meeting the edges at E and H); the curl starts on the parallel C–J and rolls through quadratic
- * Béziers C→(E)→B and K→(H)→J, B / K being where the folded edges A–E / A–H cross C–J; D / I are the apexes of the
- * roll. Drawn in order:
- *  1. the current page clipped to its un-curled region (with bend shading where it starts to rise),
- *  2. the drop shadow the rolled page casts on the revealed next page along the roll and along the flap's edges,
- *  3. the curled-back underside: paper with the page's mirrored bleed-through (reflected across the fold axis) and a
- *     cylindrical crease shadow → specular highlight → paper shading across the roll.
- * The corner frame is mapped to the screen by mirroring x for 日漫 and y for a top-corner curl.
+ * Builds the 2D projection of a convex clipped page polygon wrapped over a cylinder of radius [rCyl]
+ * starting at normal coordinate [sC] (with full 180° wrap ending at `sC + PI * rCyl`), mapped to screen via [m].
  */
-private fun ContentDrawScope.drawCurlPage(ux: Float, uy: Float, corner: Int, mirror: Boolean, paper: Color, restrict: Boolean) {
+private inline fun buildCylinderPath(
+    poly: List<Offset>,
+    nx: Float,
+    ny: Float,
+    sC: Float,
+    s1: Float,
+    sRef: Float,
+    phi: (Offset) -> Offset,
+    m: (Offset) -> Offset,
+): Path {
+    val path = Path()
+    if (poly.size < 3) return path
+    val first = m(phi(poly[0]))
+    path.moveTo(first.x, first.y)
+    val n = poly.size
+    for (idx in 0 until n) {
+        val a = poly[idx]
+        val b = poly[(idx + 1) % n]
+        val sa = a.x * nx + a.y * ny
+        val sb = b.x * nx + b.y * ny
+        val onCrest = abs(sa - sRef) < 0.05f && abs(sb - sRef) < 0.05f
+        val allFlat = (sa <= sC && sb <= sC) || (sa >= s1 && sb >= s1)
+        if (onCrest || allFlat || abs(sb - sa) < 0.05f) {
+            val p = m(phi(b))
+            path.lineTo(p.x, p.y)
+        } else {
+            val ts = FloatArray(4)
+            var count = 0
+            ts[count++] = 0f
+            val tc = (sC - sa) / (sb - sa)
+            if (tc > 1e-4f && tc < 1f - 1e-4f) ts[count++] = tc
+            val t1 = (s1 - sa) / (sb - sa)
+            if (t1 > 1e-4f && t1 < 1f - 1e-4f) ts[count++] = t1
+            ts[count++] = 1f
+            // Sort the up-to-4 split parameters
+            for (i in 1 until count) {
+                val key = ts[i]; var j = i - 1
+                while (j >= 0 && ts[j] > key) { ts[j + 1] = ts[j]; j-- }
+                ts[j + 1] = key
+            }
+            for (seg in 0 until count - 1) {
+                val tStart = ts[seg]; val tEnd = ts[seg + 1]
+                val sMidSeg = sa + (sb - sa) * ((tStart + tEnd) * 0.5f)
+                if (sMidSeg > sC && sMidSeg < s1) {
+                    val steps = 8
+                    for (k in 1..steps) {
+                        val t = tStart + (tEnd - tStart) * (k / steps.toFloat())
+                        val p = m(phi(Offset(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)))
+                        path.lineTo(p.x, p.y)
+                    }
+                } else {
+                    val p = m(phi(Offset(a.x + (b.x - a.x) * tEnd, a.y + (b.y - a.y) * tEnd)))
+                    path.lineTo(p.x, p.y)
+                }
+            }
+        }
+    }
+    path.close()
+    return path
+}
+
+/**
+ * 仿真翻页: continuous $C^1$ cylindrical page-curl draw pass driven smoothly by live `(ux, uy)`:
+ *
+ * The fold axis rotates continuously from top-corner peel (`uy = 0`) through a perfectly vertical cylinder roll
+ * (`uy = 0.5`) to bottom-corner peel (`uy = 1`) with zero discrete zones or discontinuities. Drawn in 4 layers:
+ *  0. the revealed next page underneath ([BookRole.UNDER]),
+ *  1. the current page clipped to the flat + front-roll region (`pathFront`) with inner crease bend shading and
+ *     soft flap shadow cast beneath the curled edge,
+ *  2. soft diagonal drop shadows cast onto the revealed next page outside both `pathFront` and `pathBack`,
+ *  3. the curled-back underside (`pathBack`) sitting over `pathFront`: paper base + mirrored page bleed-through
+ *     reflected across the fold axis + cylindrical crease shadow → specular highlight → paper shading + crest hairline.
+ */
+private fun ContentDrawScope.drawCurlPage(ux: Float, uy: Float, mirror: Boolean, paper: Color, restrict: Boolean) {
     val w = size.width; val h = size.height
-    val fx = w; val fy = h
-    var ax = ux * w
-    // never exactly level with the hinge corner (the fold would be vertical at infinity): a middle grab rolls the
-    // page with a gentle tilt on centre-edge drag
-    var ay = if (corner == 0) h * 0.985f else (uy * h).coerceAtMost(h * 0.992f)
-    if (w < 2f || h < 2f || fx - ax < 1f || ux <= -0.999f) {
-        if (ux > -0.999f) drawContent() // flat (or fully turned away: draw nothing)
+    if (w < 2f || h < 2f || ux >= 0.999f) {
+        drawContent()
+        return
+    }
+    if (ux <= -0.999f) return
+
+    val p = ((1f - ux) * 0.5f).coerceIn(0f, 1f)
+    val env = turnEnvelope(p)
+
+    // Continuous fold angle: 0 at vertical center (uy = 0.5), smoothly tilting toward top (-theta) or bottom (+theta),
+    // modulated smoothly by horizontal turn progress so the page rests & lands flat along the vertical edges.
+    val v = (uy * 2f - 1f).coerceIn(-1f, 1f)
+    val maxTilt = atan2(1.25f * w, h).coerceIn(0.42f, 0.72f)
+    val tiltGain = smoothstep01((p / 0.06f).coerceIn(0f, 1f)) * smoothstep01(((0.96f - p) / 0.24f).coerceIn(0f, 1f))
+    val theta = v * maxTilt * tiltGain
+    val nx = cos(theta); val ny = sin(theta)
+
+    val sMin = minOf(0f, h * ny)
+    val sMax = w * nx + maxOf(0f, h * ny)
+    val pivotX = w * (1f - p)
+    val pivotY = uy.coerceIn(0f, 1f) * h
+    var sRef = pivotX * nx + pivotY * ny
+    if (restrict) sRef = maxOf(sRef, sMin + 0.02f * w)
+
+    val tail = (sMax - sRef).coerceAtLeast(0f)
+    val head = (sRef - sMin).coerceAtLeast(0f)
+    if (tail <= 0.5f) {
+        drawContent()
+        return
+    }
+    if (head <= 0.5f) return
+
+    val rollRamp = smoothstep01((tail / (0.28f * w)).coerceIn(0f, 1f)) * smoothstep01((head / (0.20f * w)).coerceIn(0f, 1f))
+    val rCyl = minOf(0.125f * w * rollRamp, 0.38f * tail, 0.55f * head).coerceAtLeast(0.25f)
+    val halfPi = (PI * 0.5).toFloat()
+    val sC = sRef - halfPi * rCyl
+    val sD = sC + rCyl
+    val s1 = sC + PI.toFloat() * rCyl
+
+    fun s(q: Offset) = q.x * nx + q.y * ny
+    fun phi(q: Offset): Offset {
+        val sq = s(q)
+        val ds = when {
+            sq <= sC -> 0f
+            sq < s1 -> sC + rCyl * sin((sq - sC) / rCyl) - sq
+            else -> 2f * sRef - 2f * sq
+        }
+        return Offset(q.x + nx * ds, q.y + ny * ds)
+    }
+    fun m(q: Offset) = Offset(if (mirror) w - q.x else q.x, q.y)
+    fun at(sv: Float) = m(Offset(sv * nx, sv * ny))
+    fun band(v0: Float, v1: Float): Path {
+        val far = (w + h) * 4f
+        fun pt(sv: Float, along: Float) = m(Offset(sv * nx - ny * along, sv * ny + nx * along))
+        val p1 = pt(v0, -far); val p2 = pt(v0, far); val p3 = pt(v1, far); val p4 = pt(v1, -far)
+        return Path().apply { moveTo(p1.x, p1.y); lineTo(p2.x, p2.y); lineTo(p3.x, p3.y); lineTo(p4.x, p4.y); close() }
+    }
+
+    val rect = listOf(Offset(0f, 0f), Offset(w, 0f), Offset(w, h), Offset(0f, h))
+    val polyFront = clipHalfPlane(rect, nx, ny, sRef, keepBelow = true)
+    val polyBack = clipHalfPlane(rect, nx, ny, sRef, keepBelow = false)
+    if (polyFront.size < 3) return
+    if (polyBack.size < 3) {
+        drawContent()
         return
     }
 
-    fun geometry(): Array<Offset> {
-        val gx = (ax + fx) / 2f; val gy = (ay + fy) / 2f
-        val dxg = (fx - gx).coerceAtLeast(0.01f); val dyg = (fy - gy).coerceAtLeast(0.01f)
-        val e = Offset(gx - dyg * dyg / dxg, fy)
-        val hP = Offset(fx, gy - dxg * dxg / dyg)
-        val c = Offset(e.x - (fx - e.x) / 2f, fy)
-        val j = Offset(fx, hP.y - (fy - hP.y) / 2f)
-        return arrayOf(e, hP, c, j)
-    }
-    var (e, hP, c, j) = geometry()
-    // While the finger holds the page, keep the roll on the page (C ≥ 0): pull A toward F along A–F.
-    if (restrict && c.x < 0f) {
-        val w1 = fx - ax
-        val w2 = w * w1 / (w - c.x)
-        val h2 = w2 * (fy - ay) / w1
-        ax = fx - w2; ay = fy - h2
-        val g = geometry(); e = g[0]; hP = g[1]; c = g[2]; j = g[3]
-    }
-    val a = Offset(ax, ay)
-    val b = cross(a, e, c, j)
-    val k = cross(a, hP, c, j)
-    val d = Offset(((c.x + b.x) / 2f + e.x) / 2f, ((c.y + b.y) / 2f + e.y) / 2f)
-    val i = Offset(((j.x + k.x) / 2f + hP.x) / 2f, ((j.y + k.y) / 2f + hP.y) / 2f)
+    val pathFront = buildCylinderPath(polyFront, nx, ny, sC, s1, sRef, ::phi, ::m)
+    val pathBack = buildCylinderPath(polyBack, nx, ny, sC, s1, sRef, ::phi, ::m)
 
-    val top = corner < 0
-    fun m(p: Offset) = Offset(if (mirror) w - p.x else p.x, if (top) h - p.y else p.y)
-    fun m(x: Float, y: Float) = m(Offset(x, y))
-
-    val pathA = Path().apply {
-        moveTo(m(0f, 0f).x, m(0f, 0f).y)
-        m(0f, h).let { lineTo(it.x, it.y) }
-        m(c).let { lineTo(it.x, it.y) }
-        val me = m(e); val mb = m(b); quadraticTo(me.x, me.y, mb.x, mb.y)
-        m(a).let { lineTo(it.x, it.y) }
-        m(k).let { lineTo(it.x, it.y) }
-        val mh = m(hP); val mj = m(j); quadraticTo(mh.x, mh.y, mj.x, mj.y)
-        m(w, 0f).let { lineTo(it.x, it.y) }
-        close()
+    // Mapped vertices & centroid of the curled-back flap (used for shading span, crest hairline, and outward edge shadows).
+    val mappedBack = Array(polyBack.size) { idx -> phi(polyBack[idx]) }
+    var sA = sD
+    var cx = 0f; var cy = 0f
+    for (pt in mappedBack) {
+        sA = minOf(sA, s(pt))
+        cx += pt.x; cy += pt.y
     }
-    val pathC = Path().apply {
-        m(d).let { moveTo(it.x, it.y) }
-        m(b).let { lineTo(it.x, it.y) }
-        m(a).let { lineTo(it.x, it.y) }
-        m(k).let { lineTo(it.x, it.y) }
-        m(i).let { lineTo(it.x, it.y) }
-        close()
-    }
+    val backCenter = Offset(cx / mappedBack.size, cy / mappedBack.size)
 
-    // Unit normal of the fold, pointing from the flap tip A toward the hinge corner F (frame space).
-    val afLen = hypot(fx - ax, fy - ay).coerceAtLeast(1f)
-    val nx = (fx - ax) / afLen; val ny = (fy - ay) / afLen
-    fun s(p: Offset) = p.x * nx + p.y * ny
-    val g = Offset((ax + fx) / 2f, (ay + fy) / 2f)
-    /** Frame point on the fold normal through G at normal coordinate [v], mapped to the screen. */
-    fun at(v: Float) = m(Offset(g.x + nx * (v - s(g)), g.y + ny * (v - s(g))))
-    /** Screen polygon of the band between normal coordinates [v0] and [v1] (spanning far past the page). */
-    fun band(v0: Float, v1: Float): Path {
-        val far = (w + h) * 4f
-        fun p(v: Float, along: Float): Offset {
-            val base = Offset(g.x + nx * (v - s(g)), g.y + ny * (v - s(g)))
-            return m(Offset(base.x - ny * along, base.y + nx * along))
+    var crest0: Offset? = null; var crest1: Offset? = null
+    for (idx in polyBack.indices) {
+        val a = polyBack[idx]; val b = polyBack[(idx + 1) % polyBack.size]
+        if (abs(s(a) - sRef) < 0.1f && abs(s(b) - sRef) < 0.1f && hypot(b.x - a.x, b.y - a.y) > 0.5f) {
+            crest0 = mappedBack[idx]; crest1 = mappedBack[(idx + 1) % polyBack.size]
+            break
         }
-        val p1 = p(v0, -far); val p2 = p(v0, far); val p3 = p(v1, far); val p4 = p(v1, -far)
-        return Path().apply { moveTo(p1.x, p1.y); lineTo(p2.x, p2.y); lineTo(p3.x, p3.y); lineTo(p4.x, p4.y); close() }
     }
-    val sC = s(c); val sD = s(d); val sA = s(a)
-    val t = ((1f - ux) / 2f).coerceIn(0f, 1f)
-    val env = turnEnvelope(t)
-    val roll = (sD - sC).coerceAtLeast(1f)
 
-    // 1. current page, clipped to its un-curled part, with bend shading where it starts to rise into the roll
-    clipPath(pathA) {
+    fun drawFlapEdgeShadows(alphaPeak: Float, widthPx: Float) {
+        if (alphaPeak <= 0.002f || widthPx < 1f) return
+        for (idx in polyBack.indices) {
+            val rawA = polyBack[idx]; val rawB = polyBack[(idx + 1) % polyBack.size]
+            if (abs(s(rawA) - sRef) < 0.1f && abs(s(rawB) - sRef) < 0.1f) continue
+            val pA = mappedBack[idx]; val pB = mappedBack[(idx + 1) % polyBack.size]
+            val ex = pB.x - pA.x; val ey = pB.y - pA.y
+            val len = hypot(ex, ey)
+            if (len < 1.5f) continue
+            var ox = -ey / len; var oy = ex / len
+            if ((backCenter.x - pA.x) * ox + (backCenter.y - pA.y) * oy > 0f) { ox = -ox; oy = -oy }
+            val q1 = m(pA); val q2 = m(pB)
+            val q3 = m(Offset(pB.x + ox * widthPx, pB.y + oy * widthPx))
+            val q4 = m(Offset(pA.x + ox * widthPx, pA.y + oy * widthPx))
+            val strip = Path().apply { moveTo(q1.x, q1.y); lineTo(q2.x, q2.y); lineTo(q3.x, q3.y); lineTo(q4.x, q4.y); close() }
+            val mid = Offset((pA.x + pB.x) * 0.5f, (pA.y + pB.y) * 0.5f)
+            drawPath(strip, Brush.linearGradient(0f to Color.Black.copy(alpha = alphaPeak), 1f to Color.Transparent,
+                start = m(mid), end = m(Offset(mid.x + ox * widthPx, mid.y + oy * widthPx))))
+        }
+    }
+
+    // 1. current page clipped to its un-curled + front-roll region, with inner crease shading and flap shadow
+    clipPath(pathFront) {
         this@drawCurlPage.drawContent()
-        drawPath(band(sC, sD), Brush.linearGradient(0f to Color.Transparent, 1f to Color.Black.copy(alpha = 0.26f * env), start = at(sC), end = at(sD)))
+        if (rCyl >= 1f) {
+            val bendStart = sC - 0.35f * rCyl
+            drawPath(band(bendStart, sD), Brush.linearGradient(
+                0f to Color.Transparent,
+                1f to Color.Black.copy(alpha = 0.24f * env),
+                start = at(bendStart), end = at(sD)))
+        }
+        clipPath(pathBack, ClipOp.Difference) {
+            drawFlapEdgeShadows(alphaPeak = 0.15f * env, widthPx = 10.dp.toPx())
+        }
     }
 
-    // 2. drop shadows on the revealed next page (outside both the current page and the flap)
-    clipPath(pathA, ClipOp.Difference) {
-        clipPath(pathC, ClipOp.Difference) {
-            val reach = maxOf(afLen / 4f, 14.dp.toPx())
+    // 2. soft diagonal drop shadow cast onto the revealed next page (outside both pathFront and pathBack)
+    clipPath(pathFront, ClipOp.Difference) {
+        clipPath(pathBack, ClipOp.Difference) {
+            val reach = maxOf(tail * 0.30f, rCyl * 1.4f, 16.dp.toPx())
             val knee = ((sD - sC) / (sD + reach - sC)).coerceIn(0f, 0.9f)
             drawPath(band(sC, sD + reach), Brush.linearGradient(
-                0f to Color.Black.copy(alpha = 0.5f * env), knee to Color.Black.copy(alpha = 0.5f * env),
-                knee + (1f - knee) * 0.35f to Color.Black.copy(alpha = 0.2f * env), 1f to Color.Transparent,
+                0f to Color.Black.copy(alpha = 0.50f * env), knee to Color.Black.copy(alpha = 0.50f * env),
+                knee + (1f - knee) * 0.35f to Color.Black.copy(alpha = 0.20f * env), 1f to Color.Transparent,
                 start = at(sC), end = at(sD + reach)))
-            // the flap's outer edges cast a soft shadow too (A–B and A–K)
-            val edge = 12.dp.toPx() + 18.dp.toPx() * t
-            val inner = Offset((d.x + b.x + a.x + k.x + i.x) / 5f, (d.y + b.y + a.y + k.y + i.y) / 5f) // flap centroid
-            for (p in arrayOf(b, k)) {
-                val ex = p.x - a.x; val ey = p.y - a.y
-                val len = hypot(ex, ey).coerceAtLeast(1f)
-                var ox = -ey / len; var oy = ex / len
-                // outward = away from the flap's interior
-                if ((inner.x - a.x) * ox + (inner.y - a.y) * oy > 0f) { ox = -ox; oy = -oy }
-                val q1 = m(a); val q2 = m(p); val q3 = m(Offset(p.x + ox * edge, p.y + oy * edge)); val q4 = m(Offset(a.x + ox * edge, a.y + oy * edge))
-                val strip = Path().apply { moveTo(q1.x, q1.y); lineTo(q2.x, q2.y); lineTo(q3.x, q3.y); lineTo(q4.x, q4.y); close() }
-                val mid = Offset((a.x + p.x) / 2f, (a.y + p.y) / 2f)
-                drawPath(strip, Brush.linearGradient(0f to Color.Black.copy(alpha = 0.3f * env), 1f to Color.Transparent,
-                    start = m(mid), end = m(Offset(mid.x + ox * edge, mid.y + oy * edge))))
-            }
+            drawFlapEdgeShadows(alphaPeak = 0.26f * env, widthPx = 12.dp.toPx() + 16.dp.toPx() * p)
         }
     }
 
-    // 3. the curled-back underside: paper + mirrored bleed-through + cylindrical shading across the roll
-    clipPath(pathC) {
-        clipPath(pathA, ClipOp.Difference) {
-            drawRect(paper)
-            // Reflection across the fold axis (perpendicular bisector of A–F), in screen space.
-            val ga = m(g); val ua = m(Offset(g.x - ny, g.y + nx)) - ga
-            val ul = hypot(ua.x, ua.y).coerceAtLeast(1e-3f)
-            val vx = ua.x / ul; val vy = ua.y / ul
-            val r00 = 2f * vx * vx - 1f; val r01 = 2f * vx * vy; val r11 = 2f * vy * vy - 1f
-            val matrix = android.graphics.Matrix().apply {
-                setValues(floatArrayOf(r00, r01, ga.x - (r00 * ga.x + r01 * ga.y), r01, r11, ga.y - (r01 * ga.x + r11 * ga.y), 0f, 0f, 1f))
+    // 3. the curled-back underside sitting above pathFront: paper + mirrored bleed-through + cylindrical roll shading
+    clipPath(pathBack) {
+        drawRect(paper)
+        // Reflection across the fold axis (s = sRef) in screen space.
+        val g = Offset(sRef * nx, sRef * ny)
+        val ga = m(g); val ua = m(Offset(g.x - ny, g.y + nx)) - ga
+        val ul = hypot(ua.x, ua.y).coerceAtLeast(1e-3f)
+        val vx = ua.x / ul; val vy = ua.y / ul
+        val r00 = 2f * vx * vx - 1f; val r01 = 2f * vx * vy; val r11 = 2f * vy * vy - 1f
+        val matrix = android.graphics.Matrix().apply {
+            setValues(floatArrayOf(r00, r01, ga.x - (r00 * ga.x + r01 * ga.y), r01, r11, ga.y - (r01 * ga.x + r11 * ga.y), 0f, 0f, 1f))
+        }
+        drawIntoCanvas { canvas ->
+            canvas.saveLayer(Rect(0f, 0f, w, h), Paint().apply { alpha = 0.16f })
+            canvas.nativeCanvas.concat(matrix)
+        }
+        this@drawCurlPage.drawContent()
+        drawIntoCanvas { it.restore() }
+        val span = (sD - sA).coerceAtLeast(2f)
+        val hl = (rCyl / span).coerceIn(0.04f, 0.4f)
+        drawRect(Brush.linearGradient(
+            0f to Color.Black.copy(alpha = 0.34f),
+            hl * 0.25f to Color.Black.copy(alpha = 0.12f),
+            hl * 0.7f to Color.White.copy(alpha = 0.55f),
+            hl * 1.3f to Color.White.copy(alpha = 0.12f),
+            (hl * 2.2f).coerceAtMost(0.9f) to Color.Transparent,
+            1f to Color.Black.copy(alpha = 0.10f),
+            start = at(sD), end = at(sD - span)))
+        if (crest0 != null && crest1 != null) {
+            val c0 = m(crest0); val c1 = m(crest1)
+            if (hypot(c1.x - c0.x, c1.y - c0.y) > 1f) {
+                drawLine(Color.Black.copy(alpha = 0.18f * env), c0, c1, strokeWidth = 1.dp.toPx())
             }
-            drawIntoCanvas { canvas ->
-                canvas.saveLayer(Rect(0f, 0f, w, h), Paint().apply { alpha = 0.16f })
-                canvas.nativeCanvas.concat(matrix)
-            }
-            this@drawCurlPage.drawContent()
-            drawIntoCanvas { it.restore() }
-            val span = (sD - sA).coerceAtLeast(1f)
-            val hl = (roll / span).coerceIn(0.04f, 0.4f)
-            drawRect(Brush.linearGradient(
-                0f to Color.Black.copy(alpha = 0.34f),
-                hl * 0.25f to Color.Black.copy(alpha = 0.12f),
-                hl * 0.7f to Color.White.copy(alpha = 0.55f),
-                hl * 1.3f to Color.White.copy(alpha = 0.12f),
-                (hl * 2.2f).coerceAtMost(0.9f) to Color.Transparent,
-                1f to Color.Black.copy(alpha = 0.10f),
-                start = at(sD), end = at(sA)))
-            // a hairline where the paper turns over
-            drawLine(Color.Black.copy(alpha = 0.18f * env), m(d), m(i), strokeWidth = 1.dp.toPx())
         }
     }
 }
