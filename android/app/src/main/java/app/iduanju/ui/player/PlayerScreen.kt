@@ -32,6 +32,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.BlurredEdgeTreatment
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.shadow
 import androidx.compose.animation.togetherWith
 import androidx.compose.ui.graphics.Color
@@ -368,10 +370,13 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                 sleepEndMs = 0L
                 seekHint = "定时关闭已暂停"
             }
-            // Only mutate Compose UI states when controls are visible or play state/duration changed
-            if (showChrome || curPlaying != playing || curDur != dur) {
-                pos = curPos; dur = curDur; buffered = player.bufferedPosition; playing = curPlaying
-            }
+            // pos / buffered are read only by PlayerTimeBar / EdgeProgressBar (provider lambdas), so these 250 ms writes
+            // never recompose PlayerScreen itself. dur / playing are equality-checked state writes: they only invalidate
+            // readers when they actually change.
+            pos = curPos
+            dur = curDur
+            playing = curPlaying
+            if (showChrome) buffered = player.bufferedPosition
             app.iduanju.ui.UiEvidence.playerPositionMs = curPos; app.iduanju.ui.UiEvidence.playerPlaying = curPlaying
             if (queue == null && ++tick % 20 == 0 && curPlaying) detail?.let { d ->
                 d.episodes.getOrNull(epIndex)?.let { ep ->
@@ -457,12 +462,9 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
             .build()
     }
 
-    /** Last non-zero AI 超分 level, restored when the console pill toggles it back on. */
-    var lastEnhance by remember { mutableIntStateOf(enhanceLevel.takeIf { it > 0 } ?: 1) }
     fun applyEnhance(lvl: Int) {
         if (lvl > 0 && enhanceFailed) { seekHint = "当前设备不支持 GPU 画质增强"; return }
         enhanceLevel = lvl
-        if (lvl > 0) lastEnhance = lvl
         PlayerPrefs.setEnhanceLevel(ctx, lvl)
         syncEnhance()
         seekHint = when (lvl) {
@@ -532,7 +534,26 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
 
     val showPadSplit = !inPip && metrics.isTablet && landscape && metrics.widthDp >= 840 && isPortraitMedia && detail != null && padDrawerOpen
     Row(Modifier.fillMaxSize().background(Color.Black)) {
-    Box(Modifier.weight(1f).fillMaxHeight().background(Color.Black)) {
+    BoxWithConstraints(Modifier.weight(1f).fillMaxHeight().background(Color.Black)) {
+        // 画面比例 铺满: a Compose-side zoom of the FIT-sized video. PlayerView.resizeMode = ZOOM only re-lays out the
+        // inner AspectRatioFrameLayout, which the AndroidView holder often skips (outer size unchanged), and does
+        // nothing visible for 9:16 sources that already match the screen or carry baked-in letterbox bars.
+        val containerAspect = if (constraints.maxHeight > 0) constraints.maxWidth.toFloat() / constraints.maxHeight.toFloat() else 0.5625f
+        val targetScale = remember(fillMode, videoAspectRatio, containerAspect) {
+            if (!fillMode) 1f
+            else {
+                val raw = if (videoAspectRatio > 0f && containerAspect > 0f) {
+                    maxOf(containerAspect / videoAspectRatio, videoAspectRatio / containerAspect)
+                } else 1.22f
+                // At least 1.18× so 9:16 videos and videos with baked-in bars still visibly fill the screen.
+                raw.coerceIn(1.18f, 2.4f)
+            }
+        }
+        val videoScale by androidx.compose.animation.core.animateFloatAsState(
+            targetValue = targetScale,
+            animationSpec = androidx.compose.animation.core.tween(220),
+            label = "videoZoom",
+        )
         AmbientGlowLayer(
             topColor = ambientTop,
             bottomColor = ambientBottom,
@@ -558,7 +579,11 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                 }
             },
             update = { view ->
-                view.resizeMode = if (fillMode) AspectRatioFrameLayout.RESIZE_MODE_ZOOM else AspectRatioFrameLayout.RESIZE_MODE_FIT
+                // Always FIT inside the view; 铺满 is the graphicsLayer zoom below.
+                if (view.resizeMode != AspectRatioFrameLayout.RESIZE_MODE_FIT) {
+                    view.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+                }
+                view.findViewById<android.view.View>(androidx.media3.ui.R.id.exo_content_frame)?.requestLayout()
                 val tv = view.videoSurfaceView as? android.view.TextureView
                 tv?.isOpaque = false
                 if (tv !== textureView) textureView = tv
@@ -574,7 +599,9 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                     }, 250)
                 }
             },
-            modifier = Modifier.fillMaxSize(),
+            // clipToBounds first so the zoomed video never bleeds into the iPad episode drawer; the scale is read in
+            // the layer block only, so the zoom animation redraws without recomposing.
+            modifier = Modifier.fillMaxSize().clipToBounds().graphicsLayer { scaleX = videoScale; scaleY = videoScale },
         )
         // official danmaku (红果 only), lanes under the top bar + tech strip, never into the bottom controls
         val epNow = detail?.episodes?.getOrNull(epIndex)
@@ -662,6 +689,8 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
         val pc = IdjDarkColors
         val chromeA by androidx.compose.animation.core.animateFloatAsState(if (!inPip && (showChrome || panel != null)) 1f else 0f, DS.panel(), label = "chrome")
         val ready = status.isEmpty() && error == null && dur > 0
+        // derivedStateOf: PlayerScreen only recomposes when the 跳过片头 chip appears / disappears, not every tick.
+        val introSkippable by remember { derivedStateOf { pos < 15000 && dur > 45000 } }
         val tablet = metrics.isTablet
         /** Landscape phones and every tablet get the floating console layout; portrait phones keep the short-drama layout. */
         val wideHud = landscape || tablet
@@ -714,7 +743,6 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                     Spacer(Modifier.width(12.dp))
                 } else Spacer(Modifier.weight(1f))
                 Row(horizontalArrangement = Arrangement.spacedBy(if (tablet) 10.dp else 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    if (wideHud) EnhancePill(enhanceOn, hdrOn, nativeRange, btnSize, chromeOn) { togglePanel("more") }
                     CircleBtn(Icons.Filled.PictureInPictureAlt, "画中画", chromeOn, btnSize, btnIcon) { enterPip() }
                     if (queue == null) {
                         val fav = lib.isFavorite(seriesId)
@@ -794,40 +822,37 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                 // swallow taps on the console background so they never toggle the HUD underneath
                 .pointerInput(Unit) { detectTapGestures { } }) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    val tStyle = androidx.compose.ui.text.TextStyle(color = Color.White.copy(0.86f), fontSize = if (tablet) 13.sp else 12.sp, fontWeight = FontWeight.Medium,
-                        fontFeatureSettings = "tnum", shadow = androidx.compose.ui.graphics.Shadow(Color.Black.copy(0.6f), blurRadius = 4f))
-                    Text(fmt(pos), style = tStyle)
-                    Spacer(Modifier.width(10.dp))
-                    Box(Modifier.weight(1f)) { ProgressBar(pos, dur, buffered, thick = tablet) { if (!locked) { player.seekTo(it); showChrome = true } } }
-                    Spacer(Modifier.width(10.dp))
-                    Text(if (dur > 0) "−" + fmt(dur - pos) else "−0:00", style = tStyle)
-                    Spacer(Modifier.width(if (tablet) 12.dp else 8.dp))
-                    HudIcon(Icons.Filled.AspectRatio, if (fillMode) "铺满" else "适应", fillMode) {
-                        val fill = !fillMode
-                        fillMode = fill
-                        PlayerPrefs.setFillMode(ctx, fill)
-                        seekHint = if (fill) "画面：铺满裁剪" else "画面：完整适应"
-                    }
+                    // Reads pos / buffered itself, so 250 ms ticks only recompose the scrubber.
+                    PlayerTimeBar(
+                        posProvider = { pos },
+                        durProvider = { dur },
+                        bufferedProvider = { buffered },
+                        thick = tablet,
+                        modifier = Modifier.weight(1f),
+                    ) { if (!locked) { player.seekTo(it); showChrome = true } }
                     // A tablet held in landscape has nothing to exit; only offer the toggle where it can act.
                     if (!(tablet && landscape && !forcedLandscape)) {
-                        Spacer(Modifier.width(4.dp))
+                        Spacer(Modifier.width(if (tablet) 12.dp else 8.dp))
                         HudIcon(if (landscape) Icons.Filled.FullscreenExit else Icons.Filled.Fullscreen, null, false) { setLandscape(!landscape) }
                     }
                 }
-                Row(Modifier.fillMaxWidth().padding(top = if (wideHud) 6.dp else 8.dp).horizontalScroll(rememberScrollState()),
+                // Playback actions only. 画面比例 / 氛围光晕 / AI 超分 / SDR→HDR / 定时 / 连播 live solely in 更多设置 (top-right ⋯).
+                val speedLabel = if (speed == 1f) "1.0×" else "${speed}×".replace(".0×", "×")
+                if (landscape) Row(Modifier.fillMaxWidth().padding(top = 6.dp),
                     verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    val ph = if (tablet) 36.dp else 32.dp
-                    if (pos < 15000 && dur > 45000) HudPill(Icons.Filled.SkipNext, "跳过片头", null, false, ph) { player.seekTo(15000) }
-                    HudPill(Icons.Filled.GridView, "选集", null, panel == "episodes", ph) { togglePanel("episodes") }
-                    HudPill(Icons.Filled.Speed, "倍速", if (speed == 1f) "1.0×" else "${speed}×", panel == "speed" || speed != 1f, ph) { togglePanel("speed") }
-                    HudPill(Icons.Filled.AutoAwesome, "AI超分", if (enhanceOn) (if (enhanceLevel >= 2) "强效" else "标准") else "关", enhanceOn, ph) {
-                        applyEnhance(if (enhanceOn) 0 else lastEnhance)
-                    }
-                    HudPill(Icons.Filled.HdrOn, if (nativeRange != null) "HDR" else "SDR→HDR",
-                        nativeRange ?: if (hdrOn) "开" else "关", hdrOn || nativeRange != null, ph) { applySdrToHdr(!sdrToHdr) }
-                    HudPill(Icons.Filled.HighQuality, "画质", quality ?: tags.res, panel == "quality", ph) { togglePanel("quality") }
-                    if (dmOK) HudPill(Icons.Filled.Subtitles, "弹幕", if (danmaku) "开" else "关", danmaku, ph) { danmaku = !danmaku }
-                    HudPill(Icons.Filled.ClosedCaption, "音轨字幕", null, panel == "audio", ph) { togglePanel("audio") }
+                    if (introSkippable) LandChip(Icons.Filled.SkipNext, "跳过片头", null, false, chromeOn) { player.seekTo(15000) }
+                    Spacer(Modifier.weight(1f))
+                    LandChip(Icons.Filled.GridView, "选集", null, panel == "episodes", chromeOn) { togglePanel("episodes") }
+                    LandChip(Icons.Filled.Speed, "倍速", speedLabel, panel == "speed" || speed != 1f, chromeOn) { togglePanel("speed") }
+                    LandChip(Icons.Filled.HighQuality, "画质", quality ?: tags.res, panel == "quality", chromeOn) { togglePanel("quality") }
+                    LandChip(Icons.Filled.Subtitles, "弹幕", if (dmOK) (if (danmaku) "开" else "关") else null, dmOK && danmaku, chromeOn && dmOK) { danmaku = !danmaku }
+                    LandChip(Icons.Filled.ClosedCaption, "音轨字幕", null, panel == "audio", chromeOn) { togglePanel("audio") }
+                } else Row(Modifier.fillMaxWidth().padding(top = 10.dp)) {
+                    ActionBtn(Icons.Filled.GridView, "选集", null, panel == "episodes", false, chromeOn) { togglePanel("episodes") }
+                    ActionBtn(Icons.Filled.Speed, "倍速", speedLabel, panel == "speed", speed != 1f, chromeOn) { togglePanel("speed") }
+                    ActionBtn(Icons.Filled.HighQuality, "画质", quality ?: tags.res, panel == "quality", false, chromeOn) { togglePanel("quality") }
+                    ActionBtn(Icons.Filled.Subtitles, "弹幕", if (dmOK) (if (danmaku) "开" else "关") else null, false, dmOK && danmaku, chromeOn) { if (dmOK) danmaku = !danmaku }
+                    ActionBtn(Icons.Filled.ClosedCaption, "音轨字幕", null, panel == "audio", false, chromeOn) { togglePanel("audio") }
                 }
             }
         }
@@ -837,9 +862,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                 fontWeight = FontWeight.Medium, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                 style = androidx.compose.ui.text.TextStyle(shadow = androidx.compose.ui.graphics.Shadow(Color.Black.copy(0.7f), blurRadius = 4f)),
                 modifier = Modifier.align(Alignment.TopStart).statusBarsPadding().padding(horizontal = if (wideHud) hudPad else 16.dp, vertical = 10.dp))
-            Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(2.dp).background(Color.White.copy(0.18f))) {
-                Box(Modifier.fillMaxWidth(if (dur > 0) (pos.toFloat() / dur).coerceIn(0f, 1f) else 0f).fillMaxHeight().background(Color.White.copy(0.6f)))
-            }
+            EdgeProgressBar(posProvider = { pos }, durProvider = { dur }, modifier = Modifier.align(Alignment.BottomCenter))
         }
         // Settings sheet: one style for 选集 / 倍速 / 画质 / 音轨字幕 / 更多. Tablets get a centred floating glass modal
         // over a light scrim; phones keep the sheet just above the console.
@@ -1047,28 +1070,6 @@ private fun StatusBadges(t: TechTags, enhanceOn: Boolean, hdrOn: Boolean, native
     }
 }
 
-/** Top-bar quick pill: shows the active enhancement (AI超分 / HDR / native range); tap opens the 更多设置 panel. */
-@Composable
-private fun EnhancePill(enhanceOn: Boolean, hdrOn: Boolean, nativeRange: String?, height: androidx.compose.ui.unit.Dp, enabled: Boolean, onClick: () -> Unit) {
-    val pc = IdjDarkColors
-    val active = enhanceOn || hdrOn || nativeRange != null
-    val label = when {
-        enhanceOn && hdrOn -> "AI超分 · HDR"
-        enhanceOn -> "AI超分"
-        hdrOn -> "HDR"
-        nativeRange != null -> nativeRange
-        else -> "画质增强"
-    }
-    Row(Modifier.height(height)
-        .then(if (active) Modifier.clip(CircleShape).background(pc.accentSoft).border(1.dp, pc.accentLine, CircleShape)
-            else Modifier.glassSurface(CircleShape, dark = true, shadowRadius = 8.dp, fallbackAlpha = 0.42f))
-        .pressClick(0.94f, enabled = enabled, label = "画质增强", onClick = onClick).padding(horizontal = 14.dp),
-        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        Icon(Icons.Filled.AutoAwesome, null, tint = if (active) pc.accent else Color.White, modifier = Modifier.size(18.dp))
-        Text(label, color = if (active) pc.accent else Color.White.copy(0.9f), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, softWrap = false)
-    }
-}
-
 @Composable
 private fun CircleBtn(
     icon: ImageVector,
@@ -1085,23 +1086,36 @@ private fun CircleBtn(
         fallbackAlpha = 0.42f, enabled = enabled, onClick = onClick)
 }
 
-/** SenPlayer console pill: icon + title + value; accent capsule when on. */
+/** Landscape console chip: icon + title + value; accent capsule when on. */
 @Composable
-private fun HudPill(icon: ImageVector, title: String, value: String?, on: Boolean, height: androidx.compose.ui.unit.Dp, onClick: () -> Unit) {
+private fun LandChip(icon: ImageVector, title: String, value: String?, on: Boolean, enabled: Boolean, onClick: () -> Unit) {
     val pc = IdjDarkColors
-    Row(Modifier.height(height)
+    Row(Modifier.height(34.dp).graphicsLayer { alpha = if (enabled) 1f else 0.45f }
         .then(if (on) Modifier.clip(CircleShape).background(pc.accentSoft).border(1.dp, pc.accentLine, CircleShape)
-            else Modifier.clip(CircleShape).background(Color.White.copy(0.10f)).border(0.6.dp, Color.White.copy(0.12f), CircleShape))
-        .pressClick(0.95f, label = title, onClick = onClick).padding(horizontal = 13.dp),
+            else Modifier.glassSurface(CircleShape, dark = true, shadowRadius = 0.dp, fallbackAlpha = 0.46f))
+        .pressClick(enabled = enabled, label = title, onClick = onClick).padding(horizontal = 13.dp),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
         Icon(icon, null, tint = if (on) pc.accent else Color.White, modifier = Modifier.size(17.dp))
+        Text(title + (value?.let { " $it" } ?: ""), color = if (on) pc.accent else Color.White.copy(0.8f), fontSize = 13.sp, maxLines = 1, softWrap = false)
+    }
+}
+
+/** Portrait action row cell (spec `.pact`): 23 dp icon over an 11 sp caption that carries the current value. */
+@Composable
+private fun RowScope.ActionBtn(icon: ImageVector, title: String, value: String?, active: Boolean, accent: Boolean, enabled: Boolean, onClick: () -> Unit) {
+    val pc = IdjDarkColors
+    val bg by androidx.compose.animation.animateColorAsState(if (active) Color.White.copy(0.15f) else Color.Transparent, DS.select(), label = "pact")
+    Column(Modifier.weight(1f).clip(RoundedCornerShape(14.dp)).background(bg).pressClick(enabled = enabled, label = title, onClick = onClick)
+        .padding(top = 7.dp, bottom = 6.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        Icon(icon, title, tint = if (accent) pc.accent else Color.White, modifier = Modifier.size(23.dp))
+        Spacer(Modifier.height(4.dp))
         Text(androidx.compose.ui.text.buildAnnotatedString {
             append(title)
             if (value != null) {
                 append(" ")
-                pushStyle(androidx.compose.ui.text.SpanStyle(fontWeight = FontWeight.SemiBold, color = if (on) pc.accent else Color.White)); append(value); pop()
+                pushStyle(androidx.compose.ui.text.SpanStyle(fontWeight = FontWeight.SemiBold, color = if (accent) pc.accent else Color.White)); append(value); pop()
             }
-        }, color = if (on) pc.accent else Color.White.copy(0.82f), fontSize = 13.sp, maxLines = 1, softWrap = false)
+        }, color = Color.White.copy(0.72f), fontSize = 11.sp, lineHeight = 14.sp, maxLines = 1, softWrap = false)
     }
 }
 
@@ -1170,6 +1184,43 @@ private fun EpisodesPanel(d: HGSeriesDetail, epIndex: Int, pc: IdjColors, onPick
             }
         }
     }
+}
+
+/**
+ * Elapsed · scrubber · remaining. Position / duration / buffer come in as providers so the 250 ms playback ticks
+ * recompose only this row, never the whole PlayerScreen.
+ */
+@Composable
+private fun PlayerTimeBar(
+    posProvider: () -> Long,
+    durProvider: () -> Long,
+    bufferedProvider: () -> Long,
+    thick: Boolean,
+    modifier: Modifier = Modifier,
+    onSeek: (Long) -> Unit,
+) {
+    val pos = posProvider()
+    val dur = durProvider()
+    val tStyle = androidx.compose.ui.text.TextStyle(color = Color.White.copy(0.86f), fontSize = if (thick) 13.sp else 12.sp, fontWeight = FontWeight.Medium,
+        fontFeatureSettings = "tnum", shadow = androidx.compose.ui.graphics.Shadow(Color.Black.copy(0.6f), blurRadius = 4f))
+    Row(modifier, verticalAlignment = Alignment.CenterVertically) {
+        Text(fmt(pos), style = tStyle)
+        Spacer(Modifier.width(10.dp))
+        Box(Modifier.weight(1f)) { ProgressBar(pos, dur, bufferedProvider(), thick = thick, onSeek = onSeek) }
+        Spacer(Modifier.width(10.dp))
+        Text(if (dur > 0) "−" + fmt(dur - pos) else "−0:00", style = tStyle)
+    }
+}
+
+/** 2 dp always-on edge progress while the HUD is hidden; reads position in the draw phase only (no recomposition). */
+@Composable
+private fun EdgeProgressBar(posProvider: () -> Long, durProvider: () -> Long, modifier: Modifier = Modifier) {
+    Box(modifier.fillMaxWidth().height(2.dp).drawBehind {
+        drawRect(Color.White.copy(0.18f))
+        val d = durProvider()
+        val f = if (d > 0) (posProvider().toFloat() / d).coerceIn(0f, 1f) else 0f
+        if (f > 0f) drawRect(Color.White.copy(0.6f), size = androidx.compose.ui.geometry.Size(size.width * f, size.height))
+    })
 }
 
 /** spec `.ptrack`: 4 dp track, buffered white 30 %, 14 dp round knob; grows while dragging. Tap/drag to seek. */

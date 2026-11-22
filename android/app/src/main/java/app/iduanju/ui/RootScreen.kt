@@ -48,7 +48,10 @@ fun RootScreen(initialRoute: String? = null) {
     val searchDockState = remember { SearchDockState() }
     val back = nav.currentBackStackEntryAsState().value
     val route = back?.destination?.route ?: "home"
-    LaunchedEffect(route) { when (route) { "home" -> tab = 0; "tvbox" -> tab = 1; "category" -> tab = 2; "profile" -> tab = 3 } }
+    LaunchedEffect(route) {
+        when (route) { "home" -> tab = 0; "tvbox" -> tab = 1; "category" -> tab = 2; "profile" -> tab = 3 }
+        if (route != "search") searchDockState.isTyping = false
+    }
     val atRoot = route in setOf("home", "tvbox", "search", "category", "profile")
     /** Backdrop for the floating liquid-glass navigation bar: everything the NavHost draws. */
     val bgColor = IdjThemeColors.bg
@@ -273,7 +276,16 @@ fun RootScreen(initialRoute: String? = null) {
             }
             }
         }
-        if (showChromeNav && !metrics.useRail) {
+        // While typing, SearchScreen owns the input bar at the top, so the dock steps aside instead of floating
+        // over the content above the keyboard.
+        if (showChromeNav && !metrics.useRail) androidx.compose.animation.AnimatedVisibility(
+            visible = !(route == "search" && searchDockState.isTyping),
+            modifier = Modifier.align(Alignment.BottomCenter),
+            enter = androidx.compose.animation.fadeIn(androidx.compose.animation.core.tween(180)) +
+                androidx.compose.animation.slideInVertically(androidx.compose.animation.core.tween(220)) { it / 2 },
+            exit = androidx.compose.animation.fadeOut(androidx.compose.animation.core.tween(140)) +
+                androidx.compose.animation.slideOutVertically(androidx.compose.animation.core.tween(180)) { it / 2 },
+        ) {
             GlassTabBar(
                 selected = tab,
                 items = navItems,
@@ -285,7 +297,6 @@ fun RootScreen(initialRoute: String? = null) {
                 onCloseSearch = { onSelectTab(tab) },
                 backdrop = backdrop,
                 modifier = Modifier
-                    .align(Alignment.BottomCenter)
                     .windowInsetsPadding(WindowInsets.navigationBars.union(WindowInsets.ime))
                     .padding(bottom = 6.dp),
             )

@@ -19,6 +19,7 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.History
@@ -32,6 +33,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
@@ -157,12 +159,46 @@ fun SearchScreen(
         }
     }
 
-    BackHandler(enabled = useBottomSearchDock && submitted.isNotEmpty()) {
-        dockState?.clear()
+    /** Dock mode + the user tapped the dock capsule: input bar at the top, 历史搜索 / 建议 directly below it. */
+    val dockTyping = useBottomSearchDock && dockState?.isTyping == true
+    val focusManager = LocalFocusManager.current
+    val keyboard = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
+    val inputFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    fun leaveTyping() {
+        focusManager.clearFocus()
+        keyboard?.hide()
+        dockState?.cancelTyping()
+    }
+    LaunchedEffect(dockTyping) {
+        if (dockTyping) {
+            // wait one frame for the top bar to attach before focusing it
+            kotlinx.coroutines.delay(60)
+            runCatching { inputFocus.requestFocus(); keyboard?.show() }
+        } else {
+            focusManager.clearFocus()
+        }
     }
 
+    BackHandler(enabled = useBottomSearchDock && !dockTyping && submitted.isNotEmpty()) {
+        dockState?.clear()
+    }
+    BackHandler(enabled = dockTyping) { leaveTyping() }
+
     Column(Modifier.fillMaxSize().background(c.bg).statusBarsPadding()) {
-        if (!useBottomSearchDock) {
+        if (dockTyping) {
+            DockTypingBar(
+                query = dockState.query,
+                onQuery = { dockState.query = it },
+                focusRequester = inputFocus,
+                onBack = { leaveTyping() },
+                onSubmit = {
+                    if (dockState.query.isNotBlank()) {
+                        focusManager.clearFocus()
+                        dockState.submit()
+                    }
+                },
+            )
+        } else if (!useBottomSearchDock) {
             // Standalone / Tablet Rail SearchField: elevated capsule 38 high + 取消/搜索
             Row(Modifier.padding(horizontal = 16.dp).padding(top = 6.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
                 // On the tablet rail the field matches the rail's 46 dp search button so both tops line up.
@@ -213,8 +249,11 @@ fun SearchScreen(
         val bottomInsetDp = with(androidx.compose.ui.platform.LocalDensity.current) {
             WindowInsets.navigationBars.union(WindowInsets.ime).getBottom(this).toDp()
         }
-        val gridBottomPadding = if (useBottomSearchDock) (bottomInsetDp + 96.dp) else 110.dp
-        val focusManager = LocalFocusManager.current
+        val gridBottomPadding = when {
+            dockTyping -> bottomInsetDp + 16.dp // dock hidden while typing; only clear the keyboard
+            useBottomSearchDock -> bottomInsetDp + 96.dp
+            else -> 110.dp
+        }
         val pick: (String) -> Unit = { t ->
             focusManager.clearFocus()
             if (dockState != null) dockState.submit(t) else submit(t)
@@ -223,7 +262,31 @@ fun SearchScreen(
         // 搜索发现 / 搜索实时排行 come back as soon as the query is cleared.
         val typing = submitted.isEmpty() && query.isNotBlank()
         val discoverGrid = rememberLazyGridState()
-        if (submitted.isEmpty()) androidx.compose.animation.Crossfade(typing, label = "searchMode") { isTyping ->
+        if (dockTyping) {
+            // Dock typing mode: history (empty query) or live suggestions, directly under the top input bar.
+            val q = dockState?.query.orEmpty().trim()
+            if (q.isEmpty()) {
+                TypingHistory(
+                    history = lib.searchHistory,
+                    hot = hot,
+                    editing = editing,
+                    onEditing = { editing = it },
+                    onClear = { lib.clearSearch(); editing = false },
+                    onRemove = { lib.removeSearch(it) },
+                    bottomPadding = gridBottomPadding,
+                    onPick = pick,
+                )
+            } else {
+                SearchSuggestions(
+                    query = q,
+                    history = lib.searchHistory,
+                    hot = hot,
+                    bottomPadding = gridBottomPadding,
+                    onPick = pick,
+                    onOpenDetail = onOpenDetail,
+                )
+            }
+        } else if (submitted.isEmpty()) androidx.compose.animation.Crossfade(typing && !useBottomSearchDock, label = "searchMode") { isTyping ->
           if (isTyping) {
             SearchSuggestions(
                 query = query.trim(),
@@ -243,7 +306,8 @@ fun SearchScreen(
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                if (lib.searchHistory.isNotEmpty()) item(span = { GridItemSpan(maxLineSpan) }) {
+                // Dock mode keeps 历史搜索 under the top input bar (typing mode), never above a bottom search bar.
+                if (!useBottomSearchDock && lib.searchHistory.isNotEmpty()) item(span = { GridItemSpan(maxLineSpan) }) {
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text("历史搜索", color = c.text, fontSize = 20.sp, fontWeight = FontWeight.Bold); Spacer(Modifier.weight(1f))
@@ -332,6 +396,106 @@ fun SearchScreen(
                             !hasMore -> Text("没有更多了", color = c.secondary, fontSize = 12.sp)
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+/** Top Liquid Glass input bar shown while typing in dock mode: `[←] [🔍 field ⓧ] [搜索]`. */
+@Composable
+private fun DockTypingBar(
+    query: String,
+    onQuery: (String) -> Unit,
+    focusRequester: androidx.compose.ui.focus.FocusRequester,
+    onBack: () -> Unit,
+    onSubmit: () -> Unit,
+) {
+    val c = IdjThemeColors
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 12.dp).padding(top = 6.dp, bottom = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        app.iduanju.ui.components.GlassIconButton(
+            Icons.AutoMirrored.Filled.ArrowBack, "返回",
+            size = 46.dp, iconSize = 22.dp, onClick = onBack,
+        )
+        Spacer(Modifier.width(10.dp))
+        Row(
+            Modifier.weight(1f).height(46.dp)
+                .glassSurface(RoundedCornerShape(50), shadowRadius = 10.dp, activeOverlay = c.accent.copy(alpha = if (c.dark) 0.06f else 0.04f))
+                .padding(horizontal = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(Icons.Filled.Search, null, tint = c.accent, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(10.dp))
+            Box(Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
+                if (query.isEmpty()) Text("搜索短剧 / 演员 / 频道…", color = c.secondary, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                BasicTextField(
+                    query, onQuery, singleLine = true,
+                    textStyle = TextStyle(color = c.text, fontSize = 15.sp, fontWeight = FontWeight.Medium),
+                    cursorBrush = SolidColor(c.accent),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                    keyboardActions = KeyboardActions(onSearch = { onSubmit() }),
+                    modifier = Modifier.fillMaxWidth().focusRequester(focusRequester),
+                )
+            }
+            if (query.isNotEmpty()) {
+                Spacer(Modifier.width(6.dp))
+                Icon(Icons.Filled.Cancel, "清除", tint = c.secondary, modifier = Modifier.size(18.dp).clip(RoundedCornerShape(50)).clickable { onQuery("") })
+            }
+        }
+        Spacer(Modifier.width(10.dp))
+        Text(
+            "搜索",
+            color = if (query.isBlank()) c.secondary else c.accent,
+            fontSize = 15.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.clip(RoundedCornerShape(50)).clickable(enabled = query.isNotBlank(), onClick = onSubmit)
+                .padding(horizontal = 6.dp, vertical = 8.dp),
+        )
+    }
+}
+
+/** Typing mode with an empty query: 历史搜索 (editable) + 搜索发现 chips, right under the top input bar. */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun TypingHistory(
+    history: List<String>,
+    hot: List<HGSeries>,
+    editing: Boolean,
+    onEditing: (Boolean) -> Unit,
+    onClear: () -> Unit,
+    onRemove: (String) -> Unit,
+    bottomPadding: androidx.compose.ui.unit.Dp,
+    onPick: (String) -> Unit,
+) {
+    val c = IdjThemeColors
+    LazyColumn(
+        Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 6.dp, bottom = bottomPadding),
+        verticalArrangement = Arrangement.spacedBy(18.dp),
+    ) {
+        if (history.isNotEmpty()) item(key = "history") {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("历史搜索", color = c.text, fontSize = 17.sp, fontWeight = FontWeight.Bold); Spacer(Modifier.weight(1f))
+                    if (editing) {
+                        Text("全部删除", color = c.accent, fontSize = 14.sp, modifier = Modifier.clickable(onClick = onClear))
+                        Spacer(Modifier.width(16.dp)); Text("完成", color = c.text, fontSize = 14.sp, modifier = Modifier.clickable { onEditing(false) })
+                    } else Icon(Icons.Filled.Delete, "编辑", tint = c.secondary, modifier = Modifier.size(20.dp).clickable { onEditing(true) })
+                }
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    history.take(16).forEach { t -> Chip(t, null, editing) { if (editing) onRemove(t) else onPick(t) } }
+                }
+            }
+        }
+        val discover = hot.take(8).map { it.title }
+        if (discover.isNotEmpty()) item(key = "discover") {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("热门搜索", color = c.text, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    discover.forEachIndexed { i, t -> Chip(t, if (i == 0) "热" else null, false) { onPick(t) } }
                 }
             }
         }

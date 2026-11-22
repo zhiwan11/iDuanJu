@@ -9,9 +9,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.CornerBasedShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Cancel
@@ -23,16 +20,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
-import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalFocusManager
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.DpOffset
@@ -62,6 +54,11 @@ class SearchDockState(initialQuery: String = "") {
     var submitted by mutableStateOf(initialQuery.trim())
     var submitVersion by mutableIntStateOf(if (initialQuery.isNotBlank()) 1 else 0)
     var clearVersion by mutableIntStateOf(0)
+    /**
+     * true while the user is editing the query: the bottom dock hides and SearchScreen shows its own input bar at the
+     * top with 历史搜索 / 搜索建议 directly below it. false = the dock rests at the bottom as `[←] [🔍 搜索…]`.
+     */
+    var isTyping by mutableStateOf(false)
 
     fun submit(q: String = query) {
         val trimmed = q.trim()
@@ -69,6 +66,13 @@ class SearchDockState(initialQuery: String = "") {
         query = trimmed
         submitted = trimmed
         submitVersion++
+        isTyping = false
+    }
+
+    /** Leave typing mode without searching: the dock shows the last submitted query again. */
+    fun cancelTyping() {
+        query = submitted
+        isTyping = false
     }
 
     fun clear() {
@@ -285,7 +289,6 @@ fun GlassTabBar(
 ) {
     val c = IdjThemeColors
     val focusManager = LocalFocusManager.current
-    val focusRequester = remember { FocusRequester() }
     val hasSearch = onSearch != null && searchIcon != null
     val morph by animateFloatAsState(
         targetValue = if (hasSearch && searchSelected) 1f else 0f,
@@ -293,14 +296,8 @@ fun GlassTabBar(
         label = "dockMorph",
     )
 
-    LaunchedEffect(searchSelected) {
-        if (searchSelected && hasSearch) {
-            kotlinx.coroutines.delay(140)
-            runCatching { focusRequester.requestFocus() }
-        } else {
-            focusManager.clearFocus()
-        }
-    }
+    // The morphed dock never grabs focus / pops the keyboard by itself; tapping its capsule enters typing mode.
+    LaunchedEffect(searchSelected) { if (!searchSelected) focusManager.clearFocus() }
 
     Box(modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
         BoxWithConstraints(
@@ -394,13 +391,9 @@ fun GlassTabBar(
                             .width(rightW)
                             .height(circleSize)
                             .glassSurface(shape = PillShape, backdrop = backdrop, shadowRadius = 18.dp, activeOverlay = if (searchSelected) c.accent.copy(alpha = if (c.dark) 0.06f else 0.04f) else Color.Transparent)
-                            .then(
-                                if (!searchSelected) {
-                                    Modifier.clickable { onSearch?.invoke() }
-                                } else {
-                                    Modifier
-                                },
-                            ),
+                            .clickable {
+                                if (!searchSelected) onSearch?.invoke() else searchDockState?.isTyping = true
+                            },
                         contentAlignment = Alignment.Center,
                     ) {
                         if (t < 0.38f && !searchSelected) {
@@ -424,43 +417,16 @@ fun GlassTabBar(
                                     modifier = Modifier.size(20.dp),
                                 )
                                 Spacer(Modifier.width(10.dp))
-                                Box(Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
-                                    if (searchQuery.isEmpty()) {
-                                        Text(
-                                            "搜索短剧 / 演员 / 频道…",
-                                            color = c.secondary,
-                                            fontSize = 15.sp,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis,
-                                        )
-                                    }
-                                    BasicTextField(
-                                        value = searchQuery,
-                                        onValueChange = { newText ->
-                                            if (searchDockState != null) {
-                                                searchDockState.query = newText
-                                                if (newText.isEmpty() && searchDockState.submitted.isNotEmpty()) {
-                                                    searchDockState.clear()
-                                                }
-                                            }
-                                        },
-                                        singleLine = true,
-                                        textStyle = TextStyle(
-                                            color = c.text,
-                                            fontSize = 15.sp,
-                                            fontWeight = FontWeight.Medium,
-                                        ),
-                                        cursorBrush = SolidColor(c.accent),
-                                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                                        keyboardActions = KeyboardActions(
-                                            onSearch = {
-                                                focusManager.clearFocus()
-                                                searchDockState?.submit()
-                                            },
-                                        ),
-                                        modifier = Modifier.fillMaxWidth().focusRequester(focusRequester),
-                                    )
-                                }
+                                // At rest the dock is a tap target, not a text field: tapping it opens the top input bar.
+                                Text(
+                                    searchQuery.ifEmpty { "搜索短剧 / 演员 / 频道…" },
+                                    color = if (searchQuery.isEmpty()) c.secondary else c.text,
+                                    fontSize = 15.sp,
+                                    fontWeight = if (searchQuery.isEmpty()) FontWeight.Normal else FontWeight.Medium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f),
+                                )
                                 if (searchQuery.isNotEmpty()) {
                                     Spacer(Modifier.width(6.dp))
                                     Icon(
@@ -471,26 +437,6 @@ fun GlassTabBar(
                                             .size(18.dp)
                                             .clickable { searchDockState?.clear() },
                                     )
-                                    Spacer(Modifier.width(8.dp))
-                                    Box(
-                                        Modifier
-                                            .clip(PillShape)
-                                            .background(c.accent)
-                                            .clickable {
-                                                focusManager.clearFocus()
-                                                searchDockState?.submit()
-                                            }
-                                            .padding(horizontal = 12.dp, vertical = 6.dp),
-                                        contentAlignment = Alignment.Center,
-                                    ) {
-                                        Text(
-                                            "搜索",
-                                            color = c.onAccent,
-                                            fontSize = 13.sp,
-                                            fontWeight = FontWeight.SemiBold,
-                                            maxLines = 1,
-                                        )
-                                    }
                                 }
                             }
                         }
