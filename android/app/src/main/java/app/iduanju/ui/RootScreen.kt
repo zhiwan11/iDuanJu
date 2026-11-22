@@ -25,6 +25,7 @@ import app.iduanju.ui.components.GlassNavigationRail
 import app.iduanju.ui.components.GlassTabBar
 import app.iduanju.ui.components.LayoutMetrics
 import app.iduanju.ui.components.LocalLayoutMetrics
+import app.iduanju.ui.components.SearchDockState
 import app.iduanju.ui.detail.DetailScreen
 import app.iduanju.ui.home.HomeScreen
 import app.iduanju.ui.player.PlayerScreen
@@ -43,6 +44,7 @@ fun RootScreen(initialRoute: String? = null) {
     LaunchedEffect(Unit) { updater.autoCheck() }
     var tab by remember { mutableIntStateOf(0) }
     var novelImmersive by remember { mutableStateOf(false) }
+    val searchDockState = remember { SearchDockState() }
     val back = nav.currentBackStackEntryAsState().value
     val route = back?.destination?.route ?: "home"
     LaunchedEffect(route) { when (route) { "home" -> tab = 0; "tvbox" -> tab = 1; "category" -> tab = 2; "profile" -> tab = 3 } }
@@ -183,7 +185,12 @@ fun RootScreen(initialRoute: String? = null) {
                         onBack = { nav.popBackStack() },
                     )
                 }
-                composable("search") { SearchScreen(onOpenDetail = { nav.navigate("detail/$it") }) }
+                composable("search") {
+                    SearchScreen(
+                        onOpenDetail = { nav.navigate("detail/$it") },
+                        dockState = searchDockState,
+                    )
+                }
                 composable("category") { CategoryScreen(onOpenDetail = { nav.navigate("detail/$it") }) }
                 composable("library/{kind}") { e -> app.iduanju.ui.library.LibraryListScreen(e.arguments!!.getString("kind")!!, onBack = { nav.popBackStack() }, onOpenDetail = { nav.navigate("detail/$it") }) }
                 composable("profile") { ProfileScreen(onOpenDetail = { nav.navigate("detail/$it") }) }
@@ -245,8 +252,13 @@ fun RootScreen(initialRoute: String? = null) {
                 searchSelected = route == "search",
                 onSearch = onSelectSearch,
                 searchIcon = searchIcon,
+                searchDockState = searchDockState,
+                onCloseSearch = { onSelectTab(tab) },
                 backdrop = backdrop,
-                modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 4.dp),
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .windowInsetsPadding(WindowInsets.navigationBars.union(WindowInsets.ime))
+                    .padding(bottom = 6.dp),
             )
         }
         app.iduanju.update.UpdateDialog(updater)

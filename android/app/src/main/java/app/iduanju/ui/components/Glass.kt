@@ -1,23 +1,42 @@
 package app.iduanju.ui.components
 
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CornerBasedShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Cancel
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.lerp
 import androidx.compose.ui.unit.sp
 import com.kyant.backdrop.Backdrop
 import com.kyant.backdrop.drawBackdrop
@@ -32,17 +51,44 @@ import app.iduanju.ui.theme.IdjThemeColors
 private val PillShape = RoundedCornerShape(percent = 50)
 private val RailShape = RoundedCornerShape(28.dp)
 
+/**
+ * Shared search input state bridging the Yamby-style morphing bottom Liquid Glass search dock
+ * and [app.iduanju.ui.search.SearchScreen].
+ */
+@Stable
+class SearchDockState(initialQuery: String = "") {
+    var query by mutableStateOf(initialQuery)
+    var submitted by mutableStateOf(initialQuery.trim())
+    var submitVersion by mutableIntStateOf(if (initialQuery.isNotBlank()) 1 else 0)
+    var clearVersion by mutableIntStateOf(0)
+
+    fun submit(q: String = query) {
+        val trimmed = q.trim()
+        if (trimmed.isEmpty()) return
+        query = trimmed
+        submitted = trimmed
+        submitVersion++
+    }
+
+    fun clear() {
+        query = ""
+        submitted = ""
+        clearVersion++
+    }
+}
+
 @Composable
 private fun Modifier.liquidGlassSurface(
     shape: CornerBasedShape,
     backdrop: Backdrop?,
     surfaceTint: Color,
+    noLensSurfaceTint: Color,
     fallbackColor: Color,
     borderTopColor: Color,
     borderBottomColor: Color,
     shadowRadius: Dp = 18.dp,
-    shadowColor: Color = Color.Black.copy(alpha = 0.18f),
-    highlightAlpha: Float = 0.75f,
+    shadowColor: Color = Color.Black.copy(alpha = 0.14f),
+    highlightAlpha: Float = 0.50f,
     activeOverlay: Color = Color.Transparent,
 ): Modifier {
     val canBlur = backdrop != null && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S
@@ -54,13 +100,16 @@ private fun Modifier.liquidGlassSurface(
                 shape = { shape },
                 effects = {
                     vibrancy()
-                    blur(16f.dp.toPx())
                     if (hasLens) {
+                        blur(1.5f.dp.toPx())
                         lens(
-                            refractionHeight = 14f.dp.toPx(),
-                            refractionAmount = 28f.dp.toPx(),
+                            refractionHeight = 12f.dp.toPx(),
+                            refractionAmount = 26f.dp.toPx(),
                             depthEffect = true,
+                            chromaticAberration = true,
                         )
+                    } else {
+                        blur(12f.dp.toPx())
                     }
                 },
                 highlight = {
@@ -75,7 +124,7 @@ private fun Modifier.liquidGlassSurface(
                         Highlight(
                             width = 0.75.dp,
                             blurRadius = 0.dp,
-                            alpha = highlightAlpha * 0.6f,
+                            alpha = highlightAlpha * 0.8f,
                             style = HighlightStyle.Plain,
                         )
                     }
@@ -88,16 +137,22 @@ private fun Modifier.liquidGlassSurface(
                     )
                 },
                 onDrawSurface = {
-                    drawRect(surfaceTint)
+                    drawRect(if (hasLens) surfaceTint else noLensSurfaceTint)
                     if (activeOverlay.alpha > 0f) {
                         drawRect(activeOverlay)
                     }
                 },
             )
-            .border(
-                0.6.dp,
-                Brush.verticalGradient(listOf(borderTopColor, borderBottomColor)),
-                shape,
+            .then(
+                if (!hasLens) {
+                    Modifier.border(
+                        0.7.dp,
+                        Brush.verticalGradient(listOf(borderTopColor, borderBottomColor)),
+                        shape,
+                    )
+                } else {
+                    Modifier
+                },
             )
     } else {
         this
@@ -117,6 +172,7 @@ private fun Modifier.liquidGlassSurface(
 fun GlassCapsule(
     modifier: Modifier = Modifier,
     backdrop: Backdrop? = null,
+    contentPadding: PaddingValues = PaddingValues(6.dp),
     content: @Composable RowScope.() -> Unit,
 ) {
     val c = IdjThemeColors
@@ -125,15 +181,16 @@ fun GlassCapsule(
             .liquidGlassSurface(
                 shape = PillShape,
                 backdrop = backdrop,
-                surfaceTint = c.surface.copy(alpha = if (c.dark) 0.56f else 0.68f),
-                fallbackColor = c.surface.copy(alpha = 0.94f),
-                borderTopColor = c.text.copy(alpha = if (c.dark) 0.20f else 0.14f),
-                borderBottomColor = c.text.copy(alpha = 0.05f),
+                surfaceTint = if (c.dark) Color.Black.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.08f),
+                noLensSurfaceTint = c.surface.copy(alpha = if (c.dark) 0.50f else 0.54f),
+                fallbackColor = c.surface.copy(alpha = 0.90f),
+                borderTopColor = Color.White.copy(alpha = if (c.dark) 0.24f else 0.55f),
+                borderBottomColor = Color.White.copy(alpha = if (c.dark) 0.06f else 0.20f),
                 shadowRadius = 18.dp,
-                shadowColor = Color.Black.copy(alpha = if (c.dark) 0.28f else 0.14f),
-                highlightAlpha = if (c.dark) 0.65f else 0.85f,
+                shadowColor = Color.Black.copy(alpha = if (c.dark) 0.24f else 0.12f),
+                highlightAlpha = 0.50f,
             )
-            .padding(6.dp),
+            .padding(contentPadding),
         verticalAlignment = Alignment.CenterVertically,
         content = content,
     )
@@ -149,59 +206,244 @@ fun GlassTabBar(
     searchSelected: Boolean = false,
     onSearch: (() -> Unit)? = null,
     searchIcon: (@Composable (Boolean) -> Unit)? = null,
+    searchDockState: SearchDockState? = null,
+    onCloseSearch: () -> Unit = {},
 ) {
     val c = IdjThemeColors
+    val focusManager = LocalFocusManager.current
+    val focusRequester = remember { FocusRequester() }
+    val hasSearch = onSearch != null && searchIcon != null
+    val morph by animateFloatAsState(
+        targetValue = if (hasSearch && searchSelected) 1f else 0f,
+        animationSpec = spring(dampingRatio = 0.78f, stiffness = 360f),
+        label = "dockMorph",
+    )
+
+    LaunchedEffect(searchSelected) {
+        if (searchSelected && hasSearch) {
+            kotlinx.coroutines.delay(140)
+            runCatching { focusRequester.requestFocus() }
+        } else {
+            focusManager.clearFocus()
+        }
+    }
+
     Box(modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-        Row(
+        BoxWithConstraints(
             Modifier.widthIn(max = 420.dp).fillMaxWidth().padding(horizontal = 16.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            GlassCapsule(Modifier.weight(1f), backdrop = backdrop) {
-                items.forEachIndexed { i, (label, icon) ->
-                    val on = i == selected && !searchSelected
-                    Box(
-                        Modifier
-                            .weight(1f)
-                            .height(48.dp)
-                            .clip(PillShape)
-                            .background(if (on) c.text.copy(alpha = if (c.dark) 0.12f else 0.09f) else Color.Transparent)
-                            .clickable { onSelect(i) },
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            icon(on)
-                            Spacer(Modifier.height(2.dp))
-                            Text(
-                                label,
-                                color = if (on) c.text else c.secondary,
-                                fontSize = 11.sp,
-                                fontWeight = if (on) FontWeight.SemiBold else FontWeight.Medium,
-                            )
-                        }
-                    }
-                }
-            }
-            if (onSearch != null && searchIcon != null) {
+            val gap = 10.dp
+            val circleSize = 58.dp
+            val totalW = maxWidth
+            val expandedW = if (hasSearch) (totalW - gap - circleSize).coerceAtLeast(circleSize) else totalW
+            val t = morph.coerceIn(0f, 1f)
+            val leftW = if (hasSearch) lerp(expandedW, circleSize, t) else totalW
+            val rightW = lerp(circleSize, expandedW, t)
+
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(gap),
+            ) {
+                // Left Liquid Glass Capsule: 4 navigation tabs (t -> 0) morphing into circular Back button (t -> 1)
                 Box(
                     Modifier
-                        .size(60.dp)
+                        .width(leftW)
+                        .height(circleSize)
                         .liquidGlassSurface(
                             shape = PillShape,
                             backdrop = backdrop,
-                            surfaceTint = c.surface.copy(alpha = if (c.dark) 0.56f else 0.68f),
-                            fallbackColor = c.surface.copy(alpha = 0.94f),
-                            borderTopColor = c.text.copy(alpha = if (c.dark) 0.20f else 0.14f),
-                            borderBottomColor = c.text.copy(alpha = 0.05f),
+                            surfaceTint = if (c.dark) Color.Black.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.08f),
+                            noLensSurfaceTint = c.surface.copy(alpha = if (c.dark) 0.50f else 0.54f),
+                            fallbackColor = c.surface.copy(alpha = 0.90f),
+                            borderTopColor = Color.White.copy(alpha = if (c.dark) 0.24f else 0.55f),
+                            borderBottomColor = Color.White.copy(alpha = if (c.dark) 0.06f else 0.20f),
                             shadowRadius = 18.dp,
-                            shadowColor = Color.Black.copy(alpha = if (c.dark) 0.28f else 0.14f),
-                            highlightAlpha = if (c.dark) 0.65f else 0.85f,
-                            activeOverlay = if (searchSelected) c.text.copy(alpha = if (c.dark) 0.14f else 0.10f) else Color.Transparent,
+                            shadowColor = Color.Black.copy(alpha = if (c.dark) 0.24f else 0.12f),
+                            highlightAlpha = 0.50f,
                         )
-                        .clickable(onClick = onSearch),
+                        .then(
+                            if (searchSelected) {
+                                Modifier.clickable {
+                                    focusManager.clearFocus()
+                                    onCloseSearch()
+                                }
+                            } else {
+                                Modifier
+                            },
+                        )
+                        .padding(if (t < 0.5f) 5.dp else 0.dp),
                     contentAlignment = Alignment.Center,
                 ) {
-                    searchIcon(searchSelected)
+                    if (t < 0.5f) {
+                        val tabsAlpha = (1f - t * 2f).coerceIn(0f, 1f)
+                        Row(
+                            Modifier.fillMaxSize().graphicsLayer { alpha = tabsAlpha },
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            items.forEachIndexed { i, (label, icon) ->
+                                val on = i == selected && !searchSelected
+                                Box(
+                                    Modifier
+                                        .weight(1f)
+                                        .height(48.dp)
+                                        .clip(PillShape)
+                                        .background(
+                                            if (on) {
+                                                if (c.dark) Color.White.copy(alpha = 0.14f) else Color.Black.copy(alpha = 0.08f)
+                                            } else {
+                                                Color.Transparent
+                                            },
+                                        )
+                                        .clickable { onSelect(i) },
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                        icon(on)
+                                        Spacer(Modifier.height(2.dp))
+                                        Text(
+                                            label,
+                                            color = if (on) c.text else c.secondary,
+                                            fontSize = 11.sp,
+                                            fontWeight = if (on) FontWeight.SemiBold else FontWeight.Medium,
+                                            maxLines = 1,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        val backAlpha = ((t - 0.5f) * 2f).coerceIn(0f, 1f)
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "返回",
+                            tint = c.text,
+                            modifier = Modifier.size(22.dp).graphicsLayer { alpha = backAlpha },
+                        )
+                    }
+                }
+
+                // Right Liquid Glass Capsule: circular Search button (t -> 0) morphing into full Liquid Glass Search Input Bar (t -> 1)
+                if (hasSearch) {
+                    val searchQuery = searchDockState?.query.orEmpty()
+                    Box(
+                        Modifier
+                            .width(rightW)
+                            .height(circleSize)
+                            .liquidGlassSurface(
+                                shape = PillShape,
+                                backdrop = backdrop,
+                                surfaceTint = if (c.dark) Color.Black.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.08f),
+                                noLensSurfaceTint = c.surface.copy(alpha = if (c.dark) 0.50f else 0.54f),
+                                fallbackColor = c.surface.copy(alpha = 0.90f),
+                                borderTopColor = Color.White.copy(alpha = if (c.dark) 0.24f else 0.55f),
+                                borderBottomColor = Color.White.copy(alpha = if (c.dark) 0.06f else 0.20f),
+                                shadowRadius = 18.dp,
+                                shadowColor = Color.Black.copy(alpha = if (c.dark) 0.24f else 0.12f),
+                                highlightAlpha = 0.50f,
+                                activeOverlay = if (searchSelected) c.accent.copy(alpha = if (c.dark) 0.06f else 0.04f) else Color.Transparent,
+                            )
+                            .then(
+                                if (!searchSelected) {
+                                    Modifier.clickable { onSearch?.invoke() }
+                                } else {
+                                    Modifier
+                                },
+                            ),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        if (t < 0.38f && !searchSelected) {
+                            val iconAlpha = (1f - t / 0.38f).coerceIn(0f, 1f)
+                            Box(Modifier.graphicsLayer { alpha = iconAlpha }, contentAlignment = Alignment.Center) {
+                                searchIcon?.invoke(false)
+                            }
+                        } else {
+                            val fieldAlpha = ((t - 0.25f) / 0.75f).coerceIn(0f, 1f)
+                            Row(
+                                Modifier
+                                    .fillMaxSize()
+                                    .padding(horizontal = 16.dp)
+                                    .graphicsLayer { alpha = fieldAlpha },
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Icon(
+                                    Icons.Filled.Search,
+                                    contentDescription = "搜索",
+                                    tint = c.accent,
+                                    modifier = Modifier.size(20.dp),
+                                )
+                                Spacer(Modifier.width(10.dp))
+                                Box(Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
+                                    if (searchQuery.isEmpty()) {
+                                        Text(
+                                            "搜索短剧 / 演员 / 频道…",
+                                            color = c.secondary,
+                                            fontSize = 15.sp,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                    }
+                                    BasicTextField(
+                                        value = searchQuery,
+                                        onValueChange = { newText ->
+                                            if (searchDockState != null) {
+                                                searchDockState.query = newText
+                                                if (newText.isEmpty() && searchDockState.submitted.isNotEmpty()) {
+                                                    searchDockState.clear()
+                                                }
+                                            }
+                                        },
+                                        singleLine = true,
+                                        textStyle = TextStyle(
+                                            color = c.text,
+                                            fontSize = 15.sp,
+                                            fontWeight = FontWeight.Medium,
+                                        ),
+                                        cursorBrush = SolidColor(c.accent),
+                                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                                        keyboardActions = KeyboardActions(
+                                            onSearch = {
+                                                focusManager.clearFocus()
+                                                searchDockState?.submit()
+                                            },
+                                        ),
+                                        modifier = Modifier.fillMaxWidth().focusRequester(focusRequester),
+                                    )
+                                }
+                                if (searchQuery.isNotEmpty()) {
+                                    Spacer(Modifier.width(6.dp))
+                                    Icon(
+                                        Icons.Filled.Cancel,
+                                        contentDescription = "清除",
+                                        tint = c.secondary,
+                                        modifier = Modifier
+                                            .size(18.dp)
+                                            .clickable { searchDockState?.clear() },
+                                    )
+                                    Spacer(Modifier.width(8.dp))
+                                    Box(
+                                        Modifier
+                                            .clip(PillShape)
+                                            .background(c.accent)
+                                            .clickable {
+                                                focusManager.clearFocus()
+                                                searchDockState?.submit()
+                                            }
+                                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        Text(
+                                            "搜索",
+                                            color = c.onAccent,
+                                            fontSize = 13.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            maxLines = 1,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -238,13 +480,14 @@ fun GlassNavigationRail(
                     .liquidGlassSurface(
                         shape = PillShape,
                         backdrop = backdrop,
-                        surfaceTint = c.surface.copy(alpha = if (c.dark) 0.72f else 0.85f),
-                        fallbackColor = c.surface.copy(alpha = 0.94f),
-                        borderTopColor = c.text.copy(alpha = if (c.dark) 0.20f else 0.14f),
-                        borderBottomColor = c.text.copy(alpha = 0.05f),
+                        surfaceTint = if (c.dark) Color.Black.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.08f),
+                        noLensSurfaceTint = c.surface.copy(alpha = if (c.dark) 0.50f else 0.54f),
+                        fallbackColor = c.surface.copy(alpha = 0.90f),
+                        borderTopColor = Color.White.copy(alpha = if (c.dark) 0.24f else 0.55f),
+                        borderBottomColor = Color.White.copy(alpha = if (c.dark) 0.06f else 0.20f),
                         shadowRadius = 14.dp,
-                        shadowColor = Color.Black.copy(alpha = if (c.dark) 0.24f else 0.14f),
-                        highlightAlpha = if (c.dark) 0.6f else 0.8f,
+                        shadowColor = Color.Black.copy(alpha = if (c.dark) 0.24f else 0.12f),
+                        highlightAlpha = 0.50f,
                         activeOverlay = if (searchSelected) c.text.copy(alpha = if (c.dark) 0.14f else 0.10f) else Color.Transparent,
                     )
                     .clickable(onClick = onSearch),
@@ -260,13 +503,14 @@ fun GlassNavigationRail(
                 .liquidGlassSurface(
                     shape = RailShape,
                     backdrop = backdrop,
-                    surfaceTint = c.surface.copy(alpha = if (c.dark) 0.72f else 0.85f),
-                    fallbackColor = c.surface.copy(alpha = 0.94f),
-                    borderTopColor = c.text.copy(alpha = if (c.dark) 0.20f else 0.14f),
-                    borderBottomColor = c.text.copy(alpha = 0.05f),
+                    surfaceTint = if (c.dark) Color.Black.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.08f),
+                    noLensSurfaceTint = c.surface.copy(alpha = if (c.dark) 0.50f else 0.54f),
+                    fallbackColor = c.surface.copy(alpha = 0.90f),
+                    borderTopColor = Color.White.copy(alpha = if (c.dark) 0.24f else 0.55f),
+                    borderBottomColor = Color.White.copy(alpha = if (c.dark) 0.06f else 0.20f),
                     shadowRadius = 14.dp,
-                    shadowColor = Color.Black.copy(alpha = if (c.dark) 0.24f else 0.14f),
-                    highlightAlpha = if (c.dark) 0.6f else 0.8f,
+                    shadowColor = Color.Black.copy(alpha = if (c.dark) 0.24f else 0.12f),
+                    highlightAlpha = 0.50f,
                 )
                 .padding(6.dp),
             horizontalAlignment = Alignment.CenterHorizontally,

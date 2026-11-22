@@ -1,13 +1,17 @@
 package app.iduanju.ui.search
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
@@ -31,8 +35,6 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -40,6 +42,8 @@ import app.iduanju.IdjApp
 import app.iduanju.core.hongguo.HGRankGenre
 import app.iduanju.core.hongguo.HGRankSub
 import app.iduanju.core.hongguo.HGSeries
+import app.iduanju.ui.components.LocalLayoutMetrics
+import app.iduanju.ui.components.SearchDockState
 import app.iduanju.ui.home.HomeFmt
 import app.iduanju.ui.home.HomePosterCard
 import app.iduanju.ui.theme.IdjThemeColors
@@ -52,11 +56,17 @@ private object HotCache { var hot: List<HGSeries> = emptyList() }
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-fun SearchScreen(onOpenDetail: (String) -> Unit, initialQuery: String = "") {
+fun SearchScreen(
+    onOpenDetail: (String) -> Unit,
+    initialQuery: String = "",
+    dockState: SearchDockState? = null,
+) {
     val c = IdjThemeColors
+    val metrics = LocalLayoutMetrics.current
+    val useBottomSearchDock = dockState != null && !metrics.useRail
     val lib = IdjApp.instance.library
     val scope = rememberCoroutineScope()
-    var query by remember { mutableStateOf(initialQuery) }
+    var query by remember { mutableStateOf(initialQuery.ifBlank { dockState?.query.orEmpty() }) }
     var submitted by remember { mutableStateOf("") }
     var hot by remember { mutableStateOf(HotCache.hot) }
     var hotErr by remember { mutableStateOf<String?>(null) }
@@ -112,32 +122,98 @@ fun SearchScreen(onOpenDetail: (String) -> Unit, initialQuery: String = "") {
     }
     fun submit(q0: String = query) {
         val q = q0.trim(); if (q.isEmpty()) return
-        query = q; lib.addSearch(q); submitted = q; cursor = null; items.clear(); loadMore(true)
+        query = q
+        if (dockState != null) {
+            dockState.query = q
+            dockState.submitted = q
+        }
+        lib.addSearch(q); submitted = q; cursor = null; items.clear(); loadMore(true)
     }
     LaunchedEffect(initialQuery) { if (initialQuery.isNotBlank()) submit(initialQuery) }
 
-    Column(Modifier.fillMaxSize().background(c.bg).statusBarsPadding()) {
-        // SearchField: elevated capsule 38 high + 取消/搜索
-        Row(Modifier.padding(horizontal = 16.dp).padding(top = 6.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-            Row(Modifier.weight(1f).height(38.dp).clip(RoundedCornerShape(50)).background(c.elevated).padding(horizontal = 14.dp), verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Filled.Search, null, tint = c.secondary, modifier = Modifier.size(18.dp))
-                Spacer(Modifier.width(8.dp))
-                Box(Modifier.weight(1f)) {
-                    if (query.isEmpty()) Text("搜索短剧 / 演员", color = c.secondary, fontSize = 15.sp)
-                    BasicTextField(query, { query = it }, singleLine = true, textStyle = TextStyle(color = c.text, fontSize = 15.sp),
-                        cursorBrush = SolidColor(c.accent), keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                        keyboardActions = KeyboardActions(onSearch = { submit() }), modifier = Modifier.fillMaxWidth())
-                }
-                if (query.isNotEmpty()) Icon(Icons.Filled.Cancel, "清除", tint = c.secondary, modifier = Modifier.size(16.dp).clickable { query = "" })
+    if (dockState != null) {
+        LaunchedEffect(dockState.query) {
+            if (query != dockState.query) query = dockState.query
+        }
+        LaunchedEffect(dockState.submitVersion) {
+            if (dockState.submitVersion > 0 && dockState.submitted.isNotBlank()) {
+                submit(dockState.submitted)
             }
-            Spacer(Modifier.width(12.dp))
-            if (submitted.isNotEmpty()) Text("取消", color = c.text, fontSize = 15.sp, modifier = Modifier.clickable { query = ""; submitted = ""; items.clear() })
-            else Text("搜索", color = c.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.clickable { submit() })
+        }
+        LaunchedEffect(dockState.clearVersion) {
+            if (dockState.clearVersion > 0) {
+                query = ""
+                submitted = ""
+                cursor = null
+                items.clear()
+            }
+        }
+    }
+
+    BackHandler(enabled = useBottomSearchDock && submitted.isNotEmpty()) {
+        dockState?.clear()
+    }
+
+    Column(Modifier.fillMaxSize().background(c.bg).statusBarsPadding()) {
+        if (!useBottomSearchDock) {
+            // Standalone / Tablet Rail SearchField: elevated capsule 38 high + 取消/搜索
+            Row(Modifier.padding(horizontal = 16.dp).padding(top = 6.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                Row(Modifier.weight(1f).height(38.dp).clip(RoundedCornerShape(50)).background(c.elevated).padding(horizontal = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Filled.Search, null, tint = c.secondary, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Box(Modifier.weight(1f)) {
+                        if (query.isEmpty()) Text("搜索短剧 / 演员", color = c.secondary, fontSize = 15.sp)
+                        BasicTextField(query, { query = it }, singleLine = true, textStyle = TextStyle(color = c.text, fontSize = 15.sp),
+                            cursorBrush = SolidColor(c.accent), keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                            keyboardActions = KeyboardActions(onSearch = { submit() }), modifier = Modifier.fillMaxWidth())
+                    }
+                    if (query.isNotEmpty()) Icon(Icons.Filled.Cancel, "清除", tint = c.secondary, modifier = Modifier.size(16.dp).clickable { query = "" })
+                }
+                Spacer(Modifier.width(12.dp))
+                if (submitted.isNotEmpty()) Text("取消", color = c.text, fontSize = 15.sp, modifier = Modifier.clickable { query = ""; submitted = ""; items.clear() })
+                else Text("搜索", color = c.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.clickable { submit() })
+            }
+        } else if (submitted.isNotEmpty()) {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(top = 10.dp, bottom = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "「$submitted」的搜索结果",
+                    color = c.text,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                Spacer(Modifier.width(10.dp))
+                Text(
+                    "返回热榜",
+                    color = c.accent,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(50))
+                        .background(c.accentSoft)
+                        .clickable { dockState?.clear() }
+                        .padding(horizontal = 12.dp, vertical = 5.dp),
+                )
+            }
         }
         val grid = rememberLazyGridState()
+        val bottomInsetDp = with(androidx.compose.ui.platform.LocalDensity.current) {
+            WindowInsets.navigationBars.union(WindowInsets.ime).getBottom(this).toDp()
+        }
+        val gridBottomPadding = if (useBottomSearchDock) (bottomInsetDp + 96.dp) else 110.dp
         if (submitted.isEmpty()) {
-            LazyVerticalGrid(GridCells.Fixed(app.iduanju.ui.components.LocalLayoutMetrics.current.wideCardCols), Modifier.fillMaxSize(), contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 110.dp),
-                horizontalArrangement = Arrangement.spacedBy(14.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            LazyVerticalGrid(
+                GridCells.Fixed(metrics.wideCardCols),
+                Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 10.dp, bottom = gridBottomPadding),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
                 if (lib.searchHistory.isNotEmpty()) item(span = { GridItemSpan(maxLineSpan) }) {
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -149,7 +225,13 @@ fun SearchScreen(onOpenDetail: (String) -> Unit, initialQuery: String = "") {
                         }
                         // iOS ChipFlow: one horizontally scrolling row
                         Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            lib.searchHistory.forEach { t -> Chip(t, null, editing) { if (editing) lib.removeSearch(t) else submit(t) } }
+                            lib.searchHistory.forEach { t ->
+                                Chip(t, null, editing) {
+                                    if (editing) lib.removeSearch(t)
+                                    else if (dockState != null) dockState.submit(t)
+                                    else submit(t)
+                                }
+                            }
                         }
                     }
                 }
@@ -161,7 +243,11 @@ fun SearchScreen(onOpenDetail: (String) -> Unit, initialQuery: String = "") {
                             Icon(Icons.Filled.Refresh, "换一批", tint = c.secondary, modifier = Modifier.size(20.dp).clickable { seed++ })
                         }
                         Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            discover.forEachIndexed { i, t -> Chip(t, if (i == 0) "热" else if (i == 1) "荐" else null, false) { submit(t) } }
+                            discover.forEachIndexed { i, t ->
+                                Chip(t, if (i == 0) "热" else if (i == 1) "荐" else null, false) {
+                                    if (dockState != null) dockState.submit(t) else submit(t)
+                                }
+                            }
                         }
                     }
                 }
@@ -193,8 +279,14 @@ fun SearchScreen(onOpenDetail: (String) -> Unit, initialQuery: String = "") {
                     if (hasMore && !loading && last >= items.size - 4) loadMore(false)
                 }
             }
-            LazyVerticalGrid(GridCells.Fixed(app.iduanju.ui.components.LocalLayoutMetrics.current.posterCols), Modifier.fillMaxSize(), state = grid, contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 110.dp),
-                horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            LazyVerticalGrid(
+                GridCells.Fixed(metrics.posterCols),
+                Modifier.fillMaxSize(),
+                state = grid,
+                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = gridBottomPadding),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
                 items(items, key = { it.seriesId + it.title }) { s -> HomePosterCard(s, onOpenDetail) }
                 item(span = { GridItemSpan(maxLineSpan) }) {
                     Box(Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) {
@@ -249,17 +341,47 @@ private fun TopRankCard(s: HGSeries, rank: Int, onOpen: (String) -> Unit) {
 @Composable
 private fun CompactRankRow(s: HGSeries, rank: Int, onOpen: (String) -> Unit) {
     val c = IdjThemeColors
-    Row(Modifier.clickable { onOpen(s.seriesId) }, verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        Box(Modifier.size(46.dp, 62.dp).clip(RoundedCornerShape(6.dp)).background(c.elevated)) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(c.card)
+            .border(0.6.dp, c.cardBorder, RoundedCornerShape(12.dp))
+            .clickable { onOpen(s.seriesId) }
+            .padding(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Box(Modifier.size(52.dp, 70.dp).clip(RoundedCornerShape(8.dp)).background(c.elevated)) {
             AsyncImage(s.cover, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
-            Text("$rank", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Black,
-                modifier = Modifier.align(Alignment.TopEnd).clip(RoundedCornerShape(3.dp)).background(rankColor(rank)).padding(horizontal = 4.dp, vertical = 1.dp))
+            Text(
+                "$rank",
+                color = Color.White,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Black,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .clip(RoundedCornerShape(bottomEnd = 6.dp))
+                    .background(rankColor(rank))
+                    .padding(horizontal = 5.dp, vertical = 1.dp),
+            )
         }
-        Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-            Text(s.title, color = c.text, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                if (s.playCount > 0) Text(HomeFmt.count(s.playCount), color = Color(0.95f, 0.3f, 0.3f), fontSize = 12.sp)
-                Text(if (s.episodeCount > 0) "${s.episodeCount}集" else "短剧", color = c.secondary, fontSize = 12.sp)
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(s.title, color = c.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            val meta = s.tags.take(2).joinToString(" · ").ifBlank { s.subtitle.orEmpty() }
+            if (meta.isNotBlank()) {
+                Text(meta, color = c.secondary, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                if (s.playCount > 0) {
+                    Text(
+                        HomeFmt.count(s.playCount) + "热度",
+                        color = Color(0.95f, 0.30f, 0.30f),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                }
+                Text(if (s.episodeCount > 0) "全${s.episodeCount}集" else "热播短剧", color = c.secondary, fontSize = 12.sp)
             }
         }
     }

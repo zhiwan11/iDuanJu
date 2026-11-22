@@ -15,23 +15,27 @@ import androidx.media3.effect.GlShaderProgram
  * Lightweight GPU real-time video enhancer using AMD FidelityFX CAS
  * (Contrast Adaptive Sharpening) via Media3 GlEffect.
  *
+ * Installed once before `player.prepare()` and controlled live via `@Volatile var level`
+ * so switching between Off (0), Standard (1), and Strong (2) happens on the very next
+ * video frame with zero pipeline rebuild and zero black frames.
+ *
  * Levels:
- * - 0: Off (no GlEffect attached, zero GPU overhead)
- * - 1: Standard CAS sharpening (sharpness = 0.55)
- * - 2: Strong CAS sharpening + subtle micro-contrast (sharpness = 0.92, contrast = 1.04)
+ * - 0: Off (`uStrength = 0.0`, exact single-read passthrough)
+ * - 1: Standard CAS sharpening (`uStrength = 0.68`, sharpness = 0.62)
+ * - 2: Strong CAS sharpening + micro-contrast (`uStrength = 1.0`, sharpness = 0.96, contrast = 1.075)
  */
 @UnstableApi
-class CasSharpenEffect(private val level: Int) : GlEffect {
+class CasSharpenEffect(@Volatile var level: Int) : GlEffect {
 
     override fun toGlShaderProgram(context: Context, useHdr: Boolean): GlShaderProgram {
-        return CasSharpenShaderProgram(useHdr, level)
+        return CasSharpenShaderProgram(useHdr, this)
     }
 
-    override fun isNoOp(inputWidth: Int, inputHeight: Int): Boolean = level <= 0
+    override fun isNoOp(inputWidth: Int, inputHeight: Int): Boolean = false
 
     private class CasSharpenShaderProgram(
-        useHdr: Boolean,
-        private val level: Int,
+        private val useHdr: Boolean,
+        private val owner: CasSharpenEffect,
     ) : BaseGlShaderProgram(useHdr, /* texturePoolCapacity= */ 1) {
 
         private val glProgram: GlProgram
@@ -59,16 +63,31 @@ class CasSharpenEffect(private val level: Int) : GlEffect {
 
         override fun drawFrame(inputTexId: Int, presentationTimeUs: Long) {
             try {
+                // HDR streams are passed through unchanged because the SDR CAS shader clamps to [0, 1].
+                val curLevel = if (useHdr) 0 else owner.level
+                val strong = curLevel >= 2
+                val strength = when {
+                    curLevel <= 0 -> 0.0f
+                    strong -> 1.0f
+                    else -> 0.68f
+                }
                 glProgram.use()
                 glProgram.setSamplerTexIdUniform("uTexSampler", inputTexId, /* texUnitIndex= */ 0)
                 glProgram.setFloatsUniform(
                     "uTexelSize",
                     floatArrayOf(1.0f / inputWidth, 1.0f / inputHeight),
                 )
-                val sharpness = if (level >= 2) 0.92f else 0.55f
-                val contrast = if (level >= 2) 1.04f else 1.015f
+                val sharpness = if (strong) 0.96f else 0.62f
+                val detailBoost = if (strong) 0.58f else 0.28f
+                val contrast = if (strong) 1.075f else 1.035f
+                val saturation = if (strong) 1.09f else 1.04f
+                val radius = if (strong) 1.35f else 1.12f
+                glProgram.setFloatUniform("uStrength", strength)
                 glProgram.setFloatUniform("uSharpness", sharpness)
+                glProgram.setFloatUniform("uDetailBoost", detailBoost)
                 glProgram.setFloatUniform("uContrast", contrast)
+                glProgram.setFloatUniform("uSaturation", saturation)
+                glProgram.setFloatUniform("uRadius", radius)
                 glProgram.bindAttributesAndUniforms()
                 GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
                 GlUtil.checkGlError()
@@ -90,6 +109,7 @@ class CasSharpenEffect(private val level: Int) : GlEffect {
     companion object {
         private const val VERTEX_SHADER = """
             #version 100
+            precision highp float;
             attribute vec4 aFramePosition;
             varying vec2 vTexSamplingCoord;
             void main() {
@@ -98,38 +118,68 @@ class CasSharpenEffect(private val level: Int) : GlEffect {
             }
         """
 
-        // Contrast Adaptive Sharpening (5-tap cross filter with local dynamic-range weighting)
+        // 9-tap 3x3 AMD FidelityFX Contrast Adaptive Sharpening + local high-frequency detail recovery + vibrance
         private const val FRAGMENT_SHADER = """
             #version 100
-            precision mediump float;
+            precision highp float;
             uniform sampler2D uTexSampler;
             uniform vec2 uTexelSize;
+            uniform float uStrength;
             uniform float uSharpness;
+            uniform float uDetailBoost;
             uniform float uContrast;
+            uniform float uSaturation;
+            uniform float uRadius;
             varying vec2 vTexSamplingCoord;
 
             void main() {
                 vec4 cSample = texture2D(uTexSampler, vTexSamplingCoord);
+                if (uStrength <= 0.001) {
+                    gl_FragColor = cSample;
+                    return;
+                }
                 vec3 e = cSample.rgb;
-                vec3 b = texture2D(uTexSampler, vTexSamplingCoord + vec2(0.0, -uTexelSize.y)).rgb;
-                vec3 d = texture2D(uTexSampler, vTexSamplingCoord + vec2(-uTexelSize.x, 0.0)).rgb;
-                vec3 f = texture2D(uTexSampler, vTexSamplingCoord + vec2(uTexelSize.x, 0.0)).rgb;
-                vec3 h = texture2D(uTexSampler, vTexSamplingCoord + vec2(0.0, uTexelSize.y)).rgb;
+                vec2 step = uTexelSize * uRadius;
 
-                vec3 mnRGB = min(min(min(d, e), min(f, b)), h);
-                vec3 mxRGB = max(max(max(d, e), max(f, b)), h);
+                vec3 a = texture2D(uTexSampler, vTexSamplingCoord + vec2(-step.x, -step.y)).rgb;
+                vec3 b = texture2D(uTexSampler, vTexSamplingCoord + vec2(0.0, -step.y)).rgb;
+                vec3 c = texture2D(uTexSampler, vTexSamplingCoord + vec2(step.x, -step.y)).rgb;
+                vec3 d = texture2D(uTexSampler, vTexSamplingCoord + vec2(-step.x, 0.0)).rgb;
+                vec3 f = texture2D(uTexSampler, vTexSamplingCoord + vec2(step.x, 0.0)).rgb;
+                vec3 g = texture2D(uTexSampler, vTexSamplingCoord + vec2(-step.x, step.y)).rgb;
+                vec3 h = texture2D(uTexSampler, vTexSamplingCoord + vec2(0.0, step.y)).rgb;
+                vec3 i = texture2D(uTexSampler, vTexSamplingCoord + vec2(step.x, step.y)).rgb;
+
+                // Soft 3x3 neighborhood min/max (cross blended with full 3x3 box)
+                vec3 mnCross = min(min(min(d, e), min(f, b)), h);
+                vec3 mxCross = max(max(max(d, e), max(f, b)), h);
+                vec3 mnBox = min(mnCross, min(min(a, c), min(g, i)));
+                vec3 mxBox = max(mxCross, max(max(a, c), max(g, i)));
+                vec3 mnRGB = (mnCross + mnBox) * 0.5;
+                vec3 mxRGB = (mxCross + mxBox) * 0.5;
 
                 vec3 rcpMRGB = 1.0 / max(mxRGB, vec3(0.0001));
                 vec3 ampRGB = clamp(min(mnRGB, 1.0 - mxRGB) * rcpMRGB, 0.0, 1.0);
                 ampRGB = sqrt(ampRGB);
 
-                float peak = -1.0 / mix(8.0, 5.0, clamp(uSharpness, 0.0, 1.0));
+                float peak = -1.0 / mix(8.0, 4.2, clamp(uSharpness, 0.0, 1.0));
                 vec3 wRGB = ampRGB * peak;
                 vec3 rcpWeightRGB = 1.0 / (1.0 + 4.0 * wRGB);
 
-                vec3 sharpened = clamp(((b + d + f + h) * wRGB + e) * rcpWeightRGB, 0.0, 1.0);
-                // Subtle micro-contrast around midpoint without clipping
-                vec3 outColor = clamp((sharpened - 0.5) * uContrast + 0.5, 0.0, 1.0);
+                vec3 casColor = clamp(((b + d + f + h) * wRGB + e) * rcpWeightRGB, 0.0, 1.0);
+
+                // Local high-frequency detail recovery clamped to neighborhood bounds to avoid haloing
+                vec3 blur3x3 = (b + d + f + h) * 0.15 + (a + c + g + i) * 0.05 + e * 0.20;
+                vec3 highFreq = e - blur3x3;
+                vec3 minBound = max(mnBox - vec3(0.04), vec3(0.0));
+                vec3 maxBound = min(mxBox + vec3(0.04), vec3(1.0));
+                vec3 sharpened = clamp(casColor + highFreq * (uDetailBoost * ampRGB), minBound, maxBound);
+
+                // Micro-contrast around midpoint + subtle luma-preserving saturation boost
+                vec3 contrasted = clamp((sharpened - 0.5) * uContrast + 0.5, 0.0, 1.0);
+                float luma = dot(contrasted, vec3(0.299, 0.587, 0.114));
+                vec3 enhanced = clamp(mix(vec3(luma), contrasted, uSaturation), 0.0, 1.0);
+                vec3 outColor = mix(e, enhanced, clamp(uStrength, 0.0, 1.0));
                 gl_FragColor = vec4(outColor, cSample.a);
             }
         """
@@ -174,10 +224,13 @@ object PlayerPrefs {
 }
 
 @androidx.annotation.OptIn(UnstableApi::class)
-fun applyVideoEnhance(player: androidx.media3.exoplayer.ExoPlayer, level: Int) {
+fun installVideoEnhance(
+    player: androidx.media3.exoplayer.ExoPlayer,
+    effect: CasSharpenEffect?,
+) {
     runCatching {
         val effects: List<androidx.media3.common.Effect> =
-            if (level > 0) listOf(CasSharpenEffect(level)) else emptyList()
+            if (effect != null) listOf(effect) else emptyList()
         player.setVideoEffects(effects)
     }.onFailure {
         android.util.Log.w("IDJ", "setVideoEffects failed", it)

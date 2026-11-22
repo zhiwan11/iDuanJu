@@ -27,10 +27,13 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.BlurredEdgeTreatment
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.animation.togetherWith
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
@@ -96,6 +99,9 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
     var ambientBottom by remember { mutableStateOf(Color.Black) }
     var ambientLeft by remember { mutableStateOf(Color.Black) }
     var ambientRight by remember { mutableStateOf(Color.Black) }
+    var ambientBitmap by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    var ambientSampleTick by remember { mutableIntStateOf(0) }
+    var videoAspectRatio by remember { mutableFloatStateOf(0f) }
     /** 0 = off, -1 = after current episode, >0 = minutes countdown. */
     var sleepMode by remember { mutableIntStateOf(0) }
     var sleepEndMs by remember { mutableLongStateOf(0L) }
@@ -132,6 +138,15 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
             androidx.media3.exoplayer.source.DefaultMediaSourceFactory(androidx.media3.datasource.DefaultDataSource.Factory(ctx, httpFactory))
         ).build().also { it.playWhenReady = true }
     }
+    val casEffect = remember(player) { CasSharpenEffect(enhanceLevel) }
+    var casFailed by remember(player) { mutableStateOf(false) }
+    LaunchedEffect(player, casFailed) {
+        installVideoEnhance(player, if (casFailed) null else casEffect)
+    }
+    LaunchedEffect(enhanceLevel) {
+        casEffect.level = if (casFailed) 0 else enhanceLevel
+    }
+
     DisposableEffect(player) {
         val l = object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
@@ -147,34 +162,68 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                     if (epIndex + 1 < n) epIndex += 1
                 }
             }
-            override fun onPlayerError(e: PlaybackException) { if (queue == null) error = "播放失败：${e.errorCodeName}"; keepScreenOn(activity, false) }
+            override fun onPlayerError(e: PlaybackException) {
+                if (e.errorCode in 7000..7009 && !casFailed) {
+                    android.util.Log.w("IDJ", "VideoFrameProcessor error ${e.errorCode}, falling back to direct surface", e)
+                    casFailed = true
+                    casEffect.level = 0
+                    enhanceLevel = 0
+                    PlayerPrefs.setEnhanceLevel(ctx, 0)
+                    val resumePos = player.currentPosition.coerceAtLeast(0L)
+                    val shouldPlay = player.playWhenReady
+                    installVideoEnhance(player, null)
+                    if (resumePos > 0L) player.seekTo(resumePos)
+                    player.prepare()
+                    player.playWhenReady = shouldPlay
+                    seekHint = "当前设备不支持 GPU 锐化，已自动回退"
+                    return
+                }
+                if (queue == null) error = "播放失败：${e.errorCodeName}"
+                keepScreenOn(activity, false)
+            }
             // Keep the display awake only while frames are actually playing (portrait, landscape, same activity window).
             override fun onIsPlayingChanged(isPlaying: Boolean) { keepScreenOn(activity, isPlaying) }
             override fun onTracksChanged(t: androidx.media3.common.Tracks) {
                 tags = TechTags.from(player, quality)
             }
             // videoFormat/audioFormat are populated once the renderers start, after onTracksChanged
-            override fun onRenderedFirstFrame() { tags = TechTags.from(player, quality) }
-            override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) { tags = TechTags.from(player, quality) }
+            override fun onRenderedFirstFrame() {
+                tags = TechTags.from(player, quality)
+                ambientSampleTick++
+            }
+            override fun onPositionDiscontinuity(
+                oldPosition: Player.PositionInfo,
+                newPosition: Player.PositionInfo,
+                reason: Int,
+            ) {
+                ambientSampleTick++
+            }
+            override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+                tags = TechTags.from(player, quality)
+                videoAspectRatio = if (videoSize.width > 0 && videoSize.height > 0) {
+                    (videoSize.width * videoSize.pixelWidthHeightRatio) / videoSize.height.toFloat()
+                } else {
+                    0f
+                }
+                ambientSampleTick++
+            }
         }
         player.addListener(l)
         onDispose { keepScreenOn(activity, false); player.removeListener(l); if (queue == null) player.release() }
     }
 
-    LaunchedEffect(player, enhanceLevel) {
-        applyVideoEnhance(player, enhanceLevel)
-    }
     LaunchedEffect(seriesId, epIndex) {
         ambientTop = Color.Black
         ambientBottom = Color.Black
         ambientLeft = Color.Black
         ambientRight = Color.Black
+        ambientBitmap = null
     }
-    LaunchedEffect(ambientMode, fillMode, inPip, playing, textureView) {
-        if (!ambientMode || fillMode || inPip || !playing) return@LaunchedEffect
+    LaunchedEffect(ambientMode, fillMode, inPip, playing, textureView, ambientSampleTick) {
+        if (!ambientMode || fillMode || inPip) return@LaunchedEffect
         val tv = textureView ?: return@LaunchedEffect
         while (isActive) {
-            val bmp = if (tv.isAvailable) runCatching { tv.getBitmap(16, 16) }.getOrNull() else null
+            val bmp = if (tv.isAvailable) runCatching { tv.getBitmap(24, 24) }.getOrNull() else null
             if (bmp != null) {
                 val sampled = withContext(Dispatchers.Default) {
                     try {
@@ -187,8 +236,12 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                 ambientBottom = sampled.bottom
                 ambientLeft = sampled.left
                 ambientRight = sampled.right
+                if (sampled.glowBitmap != null) {
+                    ambientBitmap = sampled.glowBitmap
+                }
             }
-            delay(320)
+            if (!playing) break
+            delay(280L)
         }
     }
 
@@ -235,6 +288,8 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
             val local=java.io.File(ctx.cacheDir,"ui-color-bars.mp4")
             if(!local.exists())withContext(Dispatchers.IO){ctx.assets.open("player_landscape.mp4").use{input->local.outputStream().use{input.copyTo(it)}}}
             player.setMediaItem(MediaItem.fromUri(android.net.Uri.fromFile(local)))
+            casEffect.level = if (casFailed) 0 else enhanceLevel
+            installVideoEnhance(player, if (casFailed) null else casEffect)
             status="";player.prepare();player.play()
             return@LaunchedEffect
         }
@@ -251,6 +306,8 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
             )
             p.note?.let { android.util.Log.i("IDJ", "hls: $it") }
             player.setPlaybackSpeed(speed)
+            casEffect.level = if (casFailed) 0 else enhanceLevel
+            installVideoEnhance(player, if (casFailed) null else casEffect)
             val resume = lib.progress(seriesId)
             if (resume != null && resume.episodeIndex == epIndex && resume.seconds > 3 && resume.fraction < 0.95f) player.seekTo((resume.seconds * 1000).toLong())
             player.prepare(); player.play()
@@ -416,22 +473,29 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
             bottomColor = ambientBottom,
             leftColor = ambientLeft,
             rightColor = ambientRight,
+            glowBitmap = ambientBitmap,
+            videoAspectRatio = videoAspectRatio,
             visible = ambientMode && !fillMode && !inPip,
         )
         AndroidView(
             factory = {
                 (android.view.LayoutInflater.from(it).inflate(app.iduanju.R.layout.player_texture_view, null) as PlayerView).apply {
                     useController = false
-                    setShutterBackgroundColor(android.graphics.Color.BLACK)
+                    setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                    setShutterBackgroundColor(android.graphics.Color.TRANSPARENT)
                     layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
                     this.player = player
                 }.also { pv ->
-                    textureView = pv.videoSurfaceView as? android.view.TextureView
+                    (pv.videoSurfaceView as? android.view.TextureView)?.let { tv ->
+                        tv.isOpaque = false
+                        textureView = tv
+                    }
                 }
             },
             update = { view ->
                 view.resizeMode = if (fillMode) AspectRatioFrameLayout.RESIZE_MODE_ZOOM else AspectRatioFrameLayout.RESIZE_MODE_FIT
                 val tv = view.videoSurfaceView as? android.view.TextureView
+                tv?.isOpaque = false
                 if (tv !== textureView) textureView = tv
                 if (app.iduanju.BuildConfig.DEBUG) {
                     // Inspect Media3's actual SurfaceView, not the Compose/PlayerView wrapper.
@@ -1084,6 +1148,7 @@ private data class AmbientEdgeColors(
     val bottom: Color = Color.Black,
     val left: Color = Color.Black,
     val right: Color = Color.Black,
+    val glowBitmap: androidx.compose.ui.graphics.ImageBitmap? = null,
 )
 
 private fun computeAmbientEdgeColors(bmp: android.graphics.Bitmap): AmbientEdgeColors {
@@ -1092,42 +1157,147 @@ private fun computeAmbientEdgeColors(bmp: android.graphics.Bitmap): AmbientEdgeC
     if (w <= 0 || h <= 0) return AmbientEdgeColors()
     val pixels = IntArray(w * h)
     bmp.getPixels(pixels, 0, w, 0, 0, w, h)
-    val stripY = (h / 6).coerceIn(1, 3)
-    val stripX = (w / 6).coerceIn(1, 3)
 
-    fun averageRegion(xStart: Int, xEnd: Int, yStart: Int, yEnd: Int): Color {
+    fun rowMaxLuma(y: Int): Int {
+        var maxL = 0
+        val rowOff = y * w
+        for (x in 0 until w) {
+            val px = pixels[rowOff + x]
+            val m = maxOf((px shr 16) and 0xFF, (px shr 8) and 0xFF, px and 0xFF)
+            if (m > maxL) maxL = m
+        }
+        return maxL
+    }
+
+    fun colMaxLuma(x: Int): Int {
+        var maxL = 0
+        for (y in 0 until h) {
+            val px = pixels[y * w + x]
+            val m = maxOf((px shr 16) and 0xFF, (px shr 8) and 0xFF, px and 0xFF)
+            if (m > maxL) maxL = m
+        }
+        return maxL
+    }
+
+    // Trim near-black rows/columns baked into re-encoded video frames
+    var activeTop = 0
+    while (activeTop < h / 3 && rowMaxLuma(activeTop) < 18) activeTop++
+    var activeBottom = h
+    while (activeBottom > h - h / 3 && rowMaxLuma(activeBottom - 1) < 18) activeBottom--
+    var activeLeft = 0
+    while (activeLeft < w / 3 && colMaxLuma(activeLeft) < 18) activeLeft++
+    var activeRight = w
+    while (activeRight > w - w / 3 && colMaxLuma(activeRight - 1) < 18) activeRight--
+
+    if (activeBottom - activeTop < 4) {
+        activeTop = 0
+        activeBottom = h
+    }
+    if (activeRight - activeLeft < 4) {
+        activeLeft = 0
+        activeRight = w
+    }
+    val activeW = (activeRight - activeLeft).coerceAtLeast(1)
+    val activeH = (activeBottom - activeTop).coerceAtLeast(1)
+    val stripY = (activeH / 3).coerceAtLeast(2).coerceAtMost(activeH)
+    val stripX = (activeW / 3).coerceAtLeast(2).coerceAtMost(activeW)
+
+    fun sampleRawRgb(xStart: Int, xEnd: Int, yStart: Int, yEnd: Int): IntArray {
         var rSum = 0L
         var gSum = 0L
         var bSum = 0L
-        var count = 0
+        var weightSum = 0L
+        var fallbackR = 0L
+        var fallbackG = 0L
+        var fallbackB = 0L
+        var fallbackCount = 0
         for (y in yStart until yEnd) {
             val rowOffset = y * w
             for (x in xStart until xEnd) {
                 val px = pixels[rowOffset + x]
-                rSum += (px shr 16) and 0xFF
-                gSum += (px shr 8) and 0xFF
-                bSum += px and 0xFF
-                count++
+                val r = (px shr 16) and 0xFF
+                val g = (px shr 8) and 0xFF
+                val b = px and 0xFF
+                fallbackR += r
+                fallbackG += g
+                fallbackB += b
+                fallbackCount++
+                val maxCh = maxOf(r, g, b)
+                val minCh = minOf(r, g, b)
+                if (maxCh < 14) continue
+                val satWeight = (maxCh - minCh) * 2
+                val wPx = (1 + maxCh + satWeight).toLong()
+                rSum += r * wPx
+                gSum += g * wPx
+                bSum += b * wPx
+                weightSum += wPx
             }
         }
-        if (count == 0) return Color.Black
-        val r = (rSum / count).toInt()
-        val g = (gSum / count).toInt()
-        val b = (bSum / count).toInt()
-        val hsv = FloatArray(3)
-        android.graphics.Color.RGBToHSV(r, g, b, hsv)
-        if (hsv[1] > 0.04f) {
-            hsv[1] = (hsv[1] * 1.25f).coerceIn(0f, 0.82f)
+        return if (weightSum > 0L) {
+            intArrayOf((rSum / weightSum).toInt(), (gSum / weightSum).toInt(), (bSum / weightSum).toInt())
+        } else if (fallbackCount > 0) {
+            intArrayOf((fallbackR / fallbackCount).toInt(), (fallbackG / fallbackCount).toInt(), (fallbackB / fallbackCount).toInt())
+        } else {
+            intArrayOf(0, 0, 0)
         }
-        hsv[2] = if (hsv[2] < 0.04f) 0f else hsv[2].coerceIn(0.10f, 0.72f)
-        return Color(android.graphics.Color.HSVToColor(hsv))
     }
 
+    val frameRgb = sampleRawRgb(activeLeft, activeRight, activeTop, activeBottom)
+
+    fun boostColorInt(r: Int, g: Int, b: Int): Int {
+        val hsv = FloatArray(3)
+        android.graphics.Color.RGBToHSV(r, g, b, hsv)
+        if (hsv[1] > 0.03f) {
+            hsv[1] = (hsv[1] * 1.38f).coerceIn(0.24f, 0.90f)
+        }
+        hsv[2] = if (hsv[2] < 0.02f) 0f else hsv[2].coerceIn(0.42f, 0.90f)
+        return android.graphics.Color.HSVToColor(hsv)
+    }
+
+    fun regionToAmbientColor(xStart: Int, xEnd: Int, yStart: Int, yEnd: Int): Color {
+        val raw = sampleRawRgb(xStart, xEnd, yStart, yEnd)
+        val edgeMax = maxOf(raw[0], raw[1], raw[2])
+        val frameBlend = if (edgeMax < 48) 0.55f else 0.30f
+        val r = (raw[0] * (1f - frameBlend) + frameRgb[0] * frameBlend).toInt().coerceIn(0, 255)
+        val g = (raw[1] * (1f - frameBlend) + frameRgb[1] * frameBlend).toInt().coerceIn(0, 255)
+        val b = (raw[2] * (1f - frameBlend) + frameRgb[2] * frameBlend).toInt().coerceIn(0, 255)
+        return Color(boostColorInt(r, g, b))
+    }
+
+    // Build a 16x16 multi-color vibrant glow bitmap from the trimmed active frame for API 31+ RenderEffect blur
+    val glowSize = 16
+    val glowPixels = IntArray(glowSize * glowSize)
+    for (gy in 0 until glowSize) {
+        val sy = (activeTop + (gy * activeH) / glowSize).coerceIn(activeTop, activeBottom - 1)
+        val rowOff = sy * w
+        for (gx in 0 until glowSize) {
+            val sx = (activeLeft + (gx * activeW) / glowSize).coerceIn(activeLeft, activeRight - 1)
+            val px = pixels[rowOff + sx]
+            val pr = (px shr 16) and 0xFF
+            val pg = (px shr 8) and 0xFF
+            val pb = px and 0xFF
+            val maxCh = maxOf(pr, pg, pb)
+            val r = if (maxCh < 22) (pr * 0.4f + frameRgb[0] * 0.6f).toInt() else pr
+            val g = if (maxCh < 22) (pg * 0.4f + frameRgb[1] * 0.6f).toInt() else pg
+            val b = if (maxCh < 22) (pb * 0.4f + frameRgb[2] * 0.6f).toInt() else pb
+            glowPixels[gy * glowSize + gx] = boostColorInt(r.coerceIn(0, 255), g.coerceIn(0, 255), b.coerceIn(0, 255))
+        }
+    }
+    val glowImg = runCatching {
+        android.graphics.Bitmap.createBitmap(
+            glowPixels,
+            glowSize,
+            glowSize,
+            android.graphics.Bitmap.Config.ARGB_8888,
+        ).asImageBitmap()
+    }.getOrNull()
+
     return AmbientEdgeColors(
-        top = averageRegion(0, w, 0, stripY),
-        bottom = averageRegion(0, w, h - stripY, h),
-        left = averageRegion(0, stripX, 0, h),
-        right = averageRegion(w - stripX, w, 0, h),
+        top = regionToAmbientColor(activeLeft, activeRight, activeTop, activeTop + stripY),
+        bottom = regionToAmbientColor(activeLeft, activeRight, activeBottom - stripY, activeBottom),
+        left = regionToAmbientColor(activeLeft, activeLeft + stripX, activeTop, activeBottom),
+        right = regionToAmbientColor(activeRight - stripX, activeRight, activeTop, activeBottom),
+        glowBitmap = glowImg,
     )
 }
 
@@ -1137,6 +1307,8 @@ private fun AmbientGlowLayer(
     bottomColor: Color,
     leftColor: Color,
     rightColor: Color,
+    glowBitmap: androidx.compose.ui.graphics.ImageBitmap? = null,
+    videoAspectRatio: Float = 0f,
     visible: Boolean = true,
     modifier: Modifier = Modifier,
 ) {
@@ -1146,61 +1318,115 @@ private fun AmbientGlowLayer(
         label = "ambientVisible",
     )
     if (layerAlpha <= 0.005f) return
-    val animTop by androidx.compose.animation.animateColorAsState(topColor, androidx.compose.animation.core.tween(650), label = "ambTop")
-    val animBottom by androidx.compose.animation.animateColorAsState(bottomColor, androidx.compose.animation.core.tween(650), label = "ambBottom")
-    val animLeft by androidx.compose.animation.animateColorAsState(leftColor, androidx.compose.animation.core.tween(650), label = "ambLeft")
-    val animRight by androidx.compose.animation.animateColorAsState(rightColor, androidx.compose.animation.core.tween(650), label = "ambRight")
+    val animTop by androidx.compose.animation.animateColorAsState(topColor, androidx.compose.animation.core.tween(600), label = "ambTop")
+    val animBottom by androidx.compose.animation.animateColorAsState(bottomColor, androidx.compose.animation.core.tween(600), label = "ambBottom")
+    val animLeft by androidx.compose.animation.animateColorAsState(leftColor, androidx.compose.animation.core.tween(600), label = "ambLeft")
+    val animRight by androidx.compose.animation.animateColorAsState(rightColor, androidx.compose.animation.core.tween(600), label = "ambRight")
 
-    androidx.compose.foundation.Canvas(modifier.fillMaxSize()) {
-        val w = size.width
-        val h = size.height
-        if (w <= 0f || h <= 0f) return@Canvas
-        val edgeAlpha = 0.42f * layerAlpha
-        drawRect(
-            brush = Brush.verticalGradient(
-                0f to animTop.copy(alpha = edgeAlpha),
-                0.38f to Color.Transparent,
-                startY = 0f,
-                endY = h,
-            ),
-        )
-        drawRect(
-            brush = Brush.verticalGradient(
-                0.62f to Color.Transparent,
-                1f to animBottom.copy(alpha = edgeAlpha),
-                startY = 0f,
-                endY = h,
-            ),
-        )
-        drawRect(
-            brush = Brush.horizontalGradient(
-                0f to animLeft.copy(alpha = edgeAlpha * 0.9f),
-                0.35f to Color.Transparent,
-                startX = 0f,
-                endX = w,
-            ),
-        )
-        drawRect(
-            brush = Brush.horizontalGradient(
-                0.65f to Color.Transparent,
-                1f to animRight.copy(alpha = edgeAlpha * 0.9f),
-                startX = 0f,
-                endX = w,
-            ),
-        )
-        drawRect(
-            brush = Brush.radialGradient(
-                colors = listOf(animTop.copy(alpha = edgeAlpha * 0.55f), Color.Transparent),
-                center = androidx.compose.ui.geometry.Offset(w * 0.5f, 0f),
-                radius = maxOf(w, h) * 0.58f,
-            ),
-        )
-        drawRect(
-            brush = Brush.radialGradient(
-                colors = listOf(animBottom.copy(alpha = edgeAlpha * 0.55f), Color.Transparent),
-                center = androidx.compose.ui.geometry.Offset(w * 0.5f, h),
-                radius = maxOf(w, h) * 0.58f,
-            ),
-        )
+    Box(modifier.fillMaxSize()) {
+        // Multi-color hardware RenderEffect blur glow on API 31+ (scaled around actual video rect + expanded by 48.dp)
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S && glowBitmap != null) {
+            androidx.compose.foundation.Canvas(
+                Modifier
+                    .fillMaxSize()
+                    .blur(
+                        radius = 48.dp,
+                        edgeTreatment = BlurredEdgeTreatment.Unbounded,
+                    )
+                    .graphicsLayer { alpha = 0.85f * layerAlpha },
+            ) {
+                val w = size.width
+                val h = size.height
+                if (w <= 0f || h <= 0f) return@Canvas
+                val expandPx = 48.dp.toPx()
+                val viewAspect = w / h
+                val ar = if (videoAspectRatio > 0.05f) videoAspectRatio else (16f / 9f)
+                val vidW: Float
+                val vidH: Float
+                if (ar > viewAspect) {
+                    vidW = w
+                    vidH = w / ar
+                } else {
+                    vidH = h
+                    vidW = h * ar
+                }
+                val dstW = (vidW + expandPx * 2f).coerceAtMost(w * 1.15f)
+                val dstH = (vidH + expandPx * 4f).coerceAtMost(h * 1.15f)
+                val dstLeft = (w - dstW) * 0.5f
+                val dstTop = (h - dstH) * 0.5f
+                // Full-screen soft ambient wash
+                drawImage(
+                    image = glowBitmap,
+                    dstOffset = androidx.compose.ui.unit.IntOffset(0, 0),
+                    dstSize = androidx.compose.ui.unit.IntSize(w.toInt().coerceAtLeast(1), h.toInt().coerceAtLeast(1)),
+                    alpha = 0.42f,
+                )
+                // Bright multi-color halo expanded directly around the video frame
+                drawImage(
+                    image = glowBitmap,
+                    dstOffset = androidx.compose.ui.unit.IntOffset(dstLeft.toInt(), dstTop.toInt()),
+                    dstSize = androidx.compose.ui.unit.IntSize(dstW.toInt().coerceAtLeast(1), dstH.toInt().coerceAtLeast(1)),
+                    alpha = 0.92f,
+                )
+            }
+        }
+
+        // Smooth edge-anchored gradient glow (supplements API 31+ and acts as full fallback on API < 31)
+        androidx.compose.foundation.Canvas(Modifier.fillMaxSize()) {
+            val w = size.width
+            val h = size.height
+            if (w <= 0f || h <= 0f) return@Canvas
+            val baseAlpha = (if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S && glowBitmap != null) 0.55f else 0.78f) * layerAlpha
+            drawRect(
+                brush = Brush.verticalGradient(
+                    0f to animTop.copy(alpha = baseAlpha * 0.52f),
+                    0.34f to animTop.copy(alpha = baseAlpha),
+                    0.55f to Color.Transparent,
+                    startY = 0f,
+                    endY = h,
+                ),
+            )
+            drawRect(
+                brush = Brush.verticalGradient(
+                    0.45f to Color.Transparent,
+                    0.66f to animBottom.copy(alpha = baseAlpha),
+                    1f to animBottom.copy(alpha = baseAlpha * 0.52f),
+                    startY = 0f,
+                    endY = h,
+                ),
+            )
+            drawRect(
+                brush = Brush.horizontalGradient(
+                    0f to animLeft.copy(alpha = baseAlpha * 0.45f),
+                    0.34f to animLeft.copy(alpha = baseAlpha * 0.85f),
+                    0.55f to Color.Transparent,
+                    startX = 0f,
+                    endX = w,
+                ),
+            )
+            drawRect(
+                brush = Brush.horizontalGradient(
+                    0.45f to Color.Transparent,
+                    0.66f to animRight.copy(alpha = baseAlpha * 0.85f),
+                    1f to animRight.copy(alpha = baseAlpha * 0.45f),
+                    startX = 0f,
+                    endX = w,
+                ),
+            )
+            drawRect(
+                brush = Brush.radialGradient(
+                    colors = listOf(animTop.copy(alpha = baseAlpha * 0.65f), Color.Transparent),
+                    center = androidx.compose.ui.geometry.Offset(w * 0.5f, h * 0.30f),
+                    radius = maxOf(w, h) * 0.65f,
+                ),
+            )
+            drawRect(
+                brush = Brush.radialGradient(
+                    colors = listOf(animBottom.copy(alpha = baseAlpha * 0.65f), Color.Transparent),
+                    center = androidx.compose.ui.geometry.Offset(w * 0.5f, h * 0.70f),
+                    radius = maxOf(w, h) * 0.65f,
+                ),
+            )
+        }
     }
 }
