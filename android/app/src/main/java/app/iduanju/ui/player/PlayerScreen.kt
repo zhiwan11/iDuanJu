@@ -46,6 +46,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.input.pointer.util.addPointerInputChange
 import androidx.compose.ui.platform.LocalContext
@@ -71,6 +72,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.graphicsLayer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -120,6 +122,21 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
     var sleepEndMs by remember { mutableLongStateOf(0L) }
     var locked by remember { mutableStateOf(false) }
     var autoNext by remember { mutableStateOf(true) }
+    // ── 播完连刷推荐: next-drama auto-continue (numeric catalogue series only; not for chapter queues / fixtures) ──
+    val nextDramaCapable = queue == null && !fixture && seriesId.isNotEmpty() && seriesId.all { it.isDigit() }
+    var autoContinue by remember { mutableStateOf(PlayerPrefs.getAutoContinueNextDrama(ctx)) }
+    var nextPick by remember { mutableStateOf<NextDramaPick?>(null) }
+    var nextPickLoading by remember { mutableStateOf(false) }
+    /** Bumped to (re-)pick: 换一部 or a retry when the final episode ended before a pick was ready. */
+    var nextPickNonce by remember { mutableIntStateOf(0) }
+    var endedAwaitingNext by remember { mutableStateOf(false) }
+    var countdownOn by remember { mutableStateOf(false) }
+    var countdownMs by remember { mutableLongStateOf(NEXT_DRAMA_COUNTDOWN_MS) }
+    var switchingDrama by remember { mutableStateOf(false) }
+    // ── Seek-bar thumbnail preview ──
+    val seekPreview = remember { SeekPreviewState() }
+    val seekExtractor = remember { SeekPreviewExtractor() }
+    DisposableEffect(seekExtractor) { onDispose { seekExtractor.release() } }
     var padDrawerOpen by remember { mutableStateOf(true) }
     val inPip by app.iduanju.PipHost.isInPip
     val activity = ctx as? android.app.Activity
@@ -235,9 +252,16 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                     seekHint = "本集已播完，定时暂停"
                     return
                 }
-                if (queue == null && state == Player.STATE_ENDED && autoNext) {
+                if (queue == null && state == Player.STATE_ENDED) {
                     val n = detail?.episodes?.size ?: 0
-                    if (epIndex + 1 < n) epIndex += 1
+                    if (epIndex + 1 < n) { if (autoNext) epIndex += 1 }
+                    // Final episode finished: 播完连刷推荐 countdown (shown as soon as a pick is ready).
+                    else if (n > 0 && nextDramaCapable && autoContinue) endedAwaitingNext = true
+                } else if (state != Player.STATE_ENDED && (countdownOn || endedAwaitingNext) && !switchingDrama) {
+                    // Replayed / sought back from the end: the user is still watching this drama.
+                    if (state == Player.STATE_READY || state == Player.STATE_BUFFERING) {
+                        countdownOn = false; endedAwaitingNext = false
+                    }
                 }
             }
             override fun onPlayerError(e: PlaybackException) {
@@ -430,7 +454,8 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
             return@LaunchedEffect
         }
         try {
-            val d = withContext(Dispatchers.IO) { app.iduanju.data.Catalog.detail(seriesId, web = false) }
+            // 播完连刷推荐 may have warmed this drama's detail while the previous one was on its last episodes.
+            val d = PlayerNextDrama.takeDetail(seriesId) ?: withContext(Dispatchers.IO) { app.iduanju.data.Catalog.detail(seriesId, web = false) }
             detail = d
             epIndex = d.episodes.indexOfFirst { it.ep == startEp }.coerceAtLeast(0)
         } catch (e: kotlinx.coroutines.CancellationException) { throw e }
@@ -445,17 +470,24 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
         previousEpisode=epIndex
         error = null; status = "取流中…"
         player.stop(); player.clearMediaItems()
+        seekExtractor.setSource(null)
         if(fixture) {
             val local=java.io.File(ctx.cacheDir,"ui-color-bars.mp4")
             if(!local.exists())withContext(Dispatchers.IO){ctx.assets.open("player_landscape.mp4").use{input->local.outputStream().use{input.copyTo(it)}}}
             player.setMediaItem(MediaItem.fromUri(android.net.Uri.fromFile(local)))
+            seekExtractor.setSource(local.absolutePath)
             syncEnhance()
             installVideoEnhance(player, if (enhanceFailed) null else enhanceEffect)
             status="";player.prepare();player.play()
             return@LaunchedEffect
         }
         try {
-            val p = EpisodeCache.get(ep) { status = it }.await()
+            // Episode 1 of a 播完连刷推荐 drama is usually already resolved; fall back to a fresh resolve on any failure.
+            val prepared = PlayerNextDrama.takePrepared(ep.vid)?.let { pre ->
+                try { pre.await() } catch (e: Exception) { kotlinx.coroutines.currentCoroutineContext().ensureActive(); null }
+            }
+            val p = prepared ?: EpisodeCache.get(ep) { status = it }.await()
+            seekExtractor.setSource(p.uri, p.headers, p.hls)
             quality = p.quality
             status = ""
             // plugin / 采集站 streams may need Referer/Origin/UA on every segment request
@@ -480,6 +512,71 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
             android.util.Log.w("IDJ", "Player media load failed", e)
             status = ""; error = "无法打开这条播放线路"
         }
+    }
+
+    // ── 播完连刷推荐 ────────────────────────────────────────────────────────────────────────────────────
+    /** Switch straight into episode 1 of [pick] through the series-switch navigation. */
+    fun playRecommended(pick: NextDramaPick) {
+        if (switchingDrama) return
+        switchingDrama = true
+        countdownOn = false; endedAwaitingNext = false
+        onSwitchSeries(pick.series.seriesId)
+    }
+    val nearFinal = detail?.let { d -> d.episodes.isNotEmpty() && epIndex >= d.episodes.size - 2 } == true
+    val onFinal = detail?.let { d -> d.episodes.isNotEmpty() && epIndex == d.episodes.size - 1 } == true
+    // Lazily pick on the last 1–2 episodes, then warm the pick's detail so the switch has no detail round-trip.
+    LaunchedEffect(nextDramaCapable, autoContinue, nearFinal, detail?.seriesId, nextPickNonce) {
+        val d = detail
+        if (!nextDramaCapable || !autoContinue || !nearFinal || d == null || nextPick != null) return@LaunchedEffect
+        nextPickLoading = true
+        val watched = lib.history.mapTo(HashSet()) { it.seriesId }
+        val pick = try { PlayerNextDrama.pickNextDrama(d, watched) }
+            catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (e: Exception) { android.util.Log.w("IDJ", "next drama pick failed", e); null }
+            finally { nextPickLoading = false }
+        nextPick = pick
+        if (pick == null) {
+            if (endedAwaitingNext || countdownOn) seekHint = "暂无更多推荐"
+            endedAwaitingNext = false; countdownOn = false
+            return@LaunchedEffect
+        }
+        PlayerNextDrama.prefetchDetail(pick.series.seriesId)
+    }
+    // On the final episode, resolve the pick's episode 1 too (≥ 8 s after this episode's own resolve, so the
+    // back-to-back player registrations are never soft-rejected).
+    LaunchedEffect(onFinal, nextPick?.series?.seriesId, autoContinue) {
+        val pick = nextPick
+        if (!onFinal || !autoContinue || pick == null || !IdjApp.instance.settings.prefetchEnabled) return@LaunchedEffect
+        delay(8_000)
+        PlayerNextDrama.prefetchDetail(pick.series.seriesId)?.let { PlayerNextDrama.prepareFirstEpisode(it) }
+    }
+    // Final episode ended: start the countdown once a pick is ready (retry the pick once if none is pending).
+    LaunchedEffect(endedAwaitingNext, nextPick, nextPickLoading) {
+        if (!endedAwaitingNext) return@LaunchedEffect
+        when {
+            nextPick != null -> { countdownMs = NEXT_DRAMA_COUNTDOWN_MS; countdownOn = true; endedAwaitingNext = false }
+            !nextPickLoading -> nextPickNonce++
+        }
+    }
+    // 3-second countdown, frame-clocked (stops with rendering); paused while a settings sheet is open.
+    val countdownPaused = panel != null
+    LaunchedEffect(countdownOn, nextPick, countdownPaused) {
+        val pick = nextPick
+        if (!countdownOn || pick == null || countdownPaused) return@LaunchedEffect
+        var last = withFrameMillis { it }
+        while (countdownMs > 0L) {
+            val now = withFrameMillis { it }
+            countdownMs = (countdownMs - (now - last)).coerceAtLeast(0L)
+            last = now
+        }
+        playRecommended(pick)
+    }
+    fun swapRecommendation() {
+        val cur = nextPick ?: return
+        PlayerNextDrama.skip(cur.series.seriesId)
+        countdownMs = NEXT_DRAMA_COUNTDOWN_MS
+        nextPick = null
+        nextPickNonce++
     }
 
     LaunchedEffect(fixture) {
@@ -515,7 +612,8 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
             delay(250)
         }
     }
-    LaunchedEffect(showChrome, playing, panel) { if (showChrome && playing && panel == null && !(app.iduanju.BuildConfig.DEBUG && app.iduanju.ui.UiEvidence.keepChrome)) { delay(4000); showChrome = false } }
+    val scrubbing = seekPreview.active
+    LaunchedEffect(showChrome, playing, panel, scrubbing) { if (showChrome && playing && panel == null && !scrubbing && !(app.iduanju.BuildConfig.DEBUG && app.iduanju.ui.UiEvidence.keepChrome)) { delay(4000); showChrome = false } }
     LaunchedEffect(seekHint) { if (seekHint != null) { delay(700); seekHint = null } }
     DisposableEffect(Unit) {
         onDispose {
@@ -757,6 +855,12 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
             cover = detail?.cover.orEmpty(), ep = previewEp, next = epDragDir > 0, armed = epArmed,
             modifier = Modifier.fillMaxSize().graphicsLayer { translationY = episodeDragY + if (epDragDir > 0) containerH else -containerH },
         )
+        // Final episode: the 播完连刷推荐 pick rides in below instead of a dead-end rubber band.
+        val dramaPreview = nextPick?.takeIf { epDragDir > 0 && previewEp == null && nextDramaCapable && autoContinue }
+        if (dramaPreview != null) NextDramaSwitchPreview(
+            pick = dramaPreview, armed = epArmed,
+            modifier = Modifier.fillMaxSize().graphicsLayer { translationY = episodeDragY + containerH },
+        )
         // official danmaku (红果 only), lanes under the top bar + tech strip, never into the bottom controls
         val epNow = detail?.episodes?.getOrNull(epIndex)
         if (!inPip && danmaku && epNow != null && seriesId.all { it.isDigit() }) {
@@ -814,8 +918,20 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                                 wantPrev && epIndex > 0 -> epIndex - 1
                                 else -> -1
                             }
+                            // Final episode + 播完连刷推荐 ready: swiping up past the threshold opens the recommended drama.
+                            val dramaPick = nextPick?.takeIf { commit && wantNext && n > 0 && epIndex + 1 >= n && nextDramaCapable && autoContinue }
                             episodeSettle = gestureScope.launch {
-                                if (target >= 0) {
+                                if (dramaPick != null) {
+                                    committing = true
+                                    try {
+                                        androidx.compose.animation.core.animate(off, -h,
+                                            animationSpec = androidx.compose.animation.core.tween(200)) { v, _ -> episodeDragY = v }
+                                        playRecommended(dramaPick)
+                                        // Navigation replaces this screen; only snap back if it somehow did not.
+                                        delay(800)
+                                        switchingDrama = false
+                                    } finally { episodeDragY = 0f; committing = false }
+                                } else if (target >= 0) {
                                     committing = true
                                     try {
                                         androidx.compose.animation.core.animate(off, if (off < 0f) -h else h,
@@ -873,7 +989,8 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                                 velocityTracker.addPointerInputChange(change)
                                 rawY += dy
                                 val n = detail?.episodes?.size ?: 0
-                                val atEdge = (rawY < 0f && epIndex + 1 >= n) || (rawY > 0f && epIndex <= 0)
+                                val nextDramaReady = nextDramaCapable && autoContinue && nextPick != null
+                                val atEdge = (rawY < 0f && epIndex + 1 >= n && !nextDramaReady) || (rawY > 0f && epIndex <= 0)
                                 episodeDragY = if (atEdge) rawY * 0.22f else rawY
                             }
                         }
@@ -1017,7 +1134,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
         // Centre transport: −10 s · play / pause · +10 s
         val mainSize = when { tablet -> 76.dp; landscape -> 64.dp; else -> 68.dp }
         val sideSize = if (tablet) 48.dp else 44.dp
-        androidx.compose.animation.AnimatedVisibility(!inPip && showChrome && ready && !centerSuppressed && !locked && panel == null, Modifier.align(Alignment.Center),
+        androidx.compose.animation.AnimatedVisibility(!inPip && showChrome && ready && !centerSuppressed && !locked && panel == null && !countdownOn, Modifier.align(Alignment.Center),
             enter = fadeIn(DS.panel()) + androidx.compose.animation.scaleIn(DS.panel(), initialScale = 0.92f),
             exit = fadeOut(DS.panel()) + androidx.compose.animation.scaleOut(DS.panel(), targetScale = 0.92f)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(if (tablet) 84.dp else 52.dp)) {
@@ -1070,6 +1187,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                         durProvider = { dur },
                         bufferedProvider = { buffered },
                         thick = tablet,
+                        preview = seekPreview,
                         modifier = Modifier.weight(1f),
                     ) { if (!locked) { player.seekTo(it); showChrome = true } }
                     // A tablet held in landscape has nothing to exit; only offer the toggle where it can act.
@@ -1105,6 +1223,32 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                 style = androidx.compose.ui.text.TextStyle(shadow = androidx.compose.ui.graphics.Shadow(Color.Black.copy(0.7f), blurRadius = 4f)),
                 modifier = Modifier.align(Alignment.TopStart).statusBarsPadding().padding(horizontal = if (wideHud) hudPad else 16.dp, vertical = 10.dp))
             EdgeProgressBar(posProvider = { pos }, durProvider = { dur }, modifier = Modifier.align(Alignment.BottomCenter))
+        }
+        // Floating seek-bar thumbnail above the thumb while scrubbing (portrait + landscape); draw-only, no touches.
+        if (!inPip) SeekPreviewOverlay(
+            state = seekPreview,
+            extractor = seekExtractor,
+            durationProvider = { dur },
+            coverUrl = curDetail?.cover.orEmpty(),
+            portraitVideo = isPortraitMedia,
+        )
+        // 播完连刷推荐 countdown card.
+        androidx.compose.animation.AnimatedVisibility(!inPip && countdownOn && !locked,
+            Modifier.align(Alignment.Center).padding(horizontal = 24.dp),
+            enter = fadeIn(DS.panel()) + androidx.compose.animation.scaleIn(DS.panel(), initialScale = 0.92f),
+            exit = fadeOut(DS.panel()) + androidx.compose.animation.scaleOut(DS.panel(), targetScale = 0.94f)) {
+            NextDramaCountdownCard(
+                pick = nextPick,
+                loading = nextPickLoading,
+                progressProvider = { 1f - countdownMs.toFloat() / NEXT_DRAMA_COUNTDOWN_MS },
+                secondsLeftProvider = { ((countdownMs + 999L) / 1000L).toInt() },
+                paused = countdownPaused,
+                onPlay = { nextPick?.let { playRecommended(it) } },
+                onSwap = { swapRecommendation() },
+                onCancel = { countdownOn = false; seekHint = "已取消连刷，上滑仍可播放推荐" },
+                // swallow taps on the card background so they never toggle the HUD underneath
+                modifier = Modifier.pointerInput(Unit) { detectTapGestures { } },
+            )
         }
         // Settings sheet: one style for 选集 / 倍速 / 画质 / 音轨字幕 / 更多. Tablets get a centred floating glass modal
         // over a light scrim; phones keep the sheet just above the console.
@@ -1198,6 +1342,14 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                                 }
                             },
                             onAutoNext = { autoNext = it },
+                            autoContinueNextDrama = autoContinue,
+                            showAutoContinue = queue == null && nextDramaCapable,
+                            onAutoContinue = { on ->
+                                autoContinue = on
+                                PlayerPrefs.setAutoContinueNextDrama(ctx, on)
+                                if (!on) { countdownOn = false; endedAwaitingNext = false }
+                                seekHint = if (on) "播完连刷推荐：已开启" else "播完连刷推荐：已关闭"
+                            },
                         )
                     }
                     else -> {
@@ -1453,6 +1605,7 @@ private fun PlayerTimeBar(
     durProvider: () -> Long,
     bufferedProvider: () -> Long,
     thick: Boolean,
+    preview: SeekPreviewState? = null,
     modifier: Modifier = Modifier,
     onSeek: (Long) -> Unit,
 ) {
@@ -1463,7 +1616,7 @@ private fun PlayerTimeBar(
     Row(modifier, verticalAlignment = Alignment.CenterVertically) {
         Text(fmt(pos), style = tStyle)
         Spacer(Modifier.width(10.dp))
-        Box(Modifier.weight(1f)) { ProgressBar(pos, dur, bufferedProvider(), thick = thick, onSeek = onSeek) }
+        Box(Modifier.weight(1f)) { ProgressBar(pos, dur, bufferedProvider(), thick = thick, preview = preview, onSeek = onSeek) }
         Spacer(Modifier.width(10.dp))
         Text(if (dur > 0) "−" + fmt(dur - pos) else "−0:00", style = tStyle)
     }
@@ -1482,8 +1635,11 @@ private fun EdgeProgressBar(posProvider: () -> Long, durProvider: () -> Long, mo
 
 /** spec `.ptrack`: 4 dp track, buffered white 30 %, 14 dp round knob; grows while dragging. Tap/drag to seek. */
 @Composable
-private fun ProgressBar(pos: Long, dur: Long, buffered: Long, thick: Boolean = false, onSeek: (Long) -> Unit) {
+private fun ProgressBar(pos: Long, dur: Long, buffered: Long, thick: Boolean = false, preview: SeekPreviewState? = null, onSeek: (Long) -> Unit) {
     var drag by remember { mutableStateOf<Float?>(null) }
+    val currentPos by rememberUpdatedState(pos)
+    // A recomposition-free exit if the bar leaves composition mid-drag (HUD hidden, rotation).
+    DisposableEffect(preview) { onDispose { preview?.end() } }
     val frac = drag ?: if (dur > 0) pos.toFloat() / dur else 0f
     val buf = if (dur > 0) buffered.toFloat() / dur else 0f
     val h by androidx.compose.animation.core.animateDpAsState(
@@ -1491,10 +1647,21 @@ private fun ProgressBar(pos: Long, dur: Long, buffered: Long, thick: Boolean = f
     val knob by androidx.compose.animation.core.animateDpAsState(
         when { drag != null -> if (thick) 22.dp else 20.dp; else -> if (thick) 16.dp else 14.dp }, DS.press(), label = "knob")
     BoxWithConstraints(Modifier.fillMaxWidth().height(if (thick) 32.dp else 28.dp)
+        .then(if (preview != null) Modifier.onGloballyPositioned { preview.onTrackPositioned(it) } else Modifier)
         .pointerInput(dur) { detectTapGestures { o -> if (dur > 0) onSeek((o.x / size.width * dur).toLong()) } }
         .pointerInput(dur) {
-            detectHorizontalDragGestures(onDragEnd = { drag?.let { if (dur > 0) onSeek((it * dur).toLong()) }; drag = null }) { ch, _ ->
-                drag = (ch.position.x / size.width).coerceIn(0f, 1f)
+            detectHorizontalDragGestures(
+                onDragStart = { o ->
+                    val f = (o.x / size.width).coerceIn(0f, 1f)
+                    drag = f
+                    if (dur > 0) preview?.begin(f, currentPos)
+                },
+                onDragEnd = { drag?.let { if (dur > 0) onSeek((it * dur).toLong()) }; drag = null; preview?.end() },
+                onDragCancel = { drag = null; preview?.end() },
+            ) { ch, _ ->
+                val f = (ch.position.x / size.width).coerceIn(0f, 1f)
+                drag = f
+                preview?.update(f)
             }
         }, contentAlignment = Alignment.CenterStart) {
         val w = maxWidth
@@ -1546,6 +1713,8 @@ private const val EPISODE_SWITCH_THRESHOLD = 0.14f
 private val EPISODE_SWITCH_MAX_DP = 105.dp
 private val EPISODE_FLICK_VELOCITY_DP = 750.dp
 private val EPISODE_FLICK_MIN_DISTANCE_DP = 36.dp
+/** 播完连刷推荐 countdown before the recommended drama starts. */
+private const val NEXT_DRAMA_COUNTDOWN_MS = 3_000L
 
 private enum class GestureHudKind { BRIGHTNESS, VOLUME }
 
@@ -1631,6 +1800,9 @@ private fun MoreSettingsPanel(
     onSdrToHdr: (Boolean) -> Unit,
     onSleep: (Int) -> Unit,
     onAutoNext: (Boolean) -> Unit,
+    autoContinueNextDrama: Boolean = false,
+    showAutoContinue: Boolean = false,
+    onAutoContinue: (Boolean) -> Unit = {},
 ) {
     val sleepSubtitle = when {
         sleepMode == -1 -> "定时：播完本集"
@@ -1712,6 +1884,17 @@ private fun MoreSettingsPanel(
             selected = autoNext,
             pc = pc,
             onSelect = onAutoNext,
+        )
+    }
+
+    if (showAutoContinue) {
+        Spacer(Modifier.height(10.dp))
+        MoreOptionRow(
+            label = "播完连刷推荐 (最后一集播完自动续播下一部)",
+            options = listOf("开启" to true, "关闭" to false),
+            selected = autoContinueNextDrama,
+            pc = pc,
+            onSelect = onAutoContinue,
         )
     }
 }

@@ -276,6 +276,9 @@ object PlayerPrefs {
         val clamped = level.coerceIn(0, 4)
         prefs(ctx).edit().putInt("ambient_level", clamped).putBoolean("ambient_mode", clamped > 0).apply()
     }
+    /** 播完连刷推荐: after the final episode, continue with a recommended drama. */
+    fun getAutoContinueNextDrama(ctx: Context): Boolean = prefs(ctx).getBoolean("auto_continue_next_drama", true)
+    fun setAutoContinueNextDrama(ctx: Context, on: Boolean) = prefs(ctx).edit().putBoolean("auto_continue_next_drama", on).apply()
     fun getAmbientMode(ctx: Context): Boolean = getAmbientLevel(ctx) > 0
     fun setAmbientMode(ctx: Context, on: Boolean) = setAmbientLevel(ctx, if (on) 2 else 0)
 }
