@@ -40,10 +40,12 @@ internal object MangaAiUpscaler {
     private const val MAX_OUTPUT = CORE * SCALE
     /** Largest side a single bitmap may have and still be drawn by the hardware renderer. */
     private const val MAX_BITMAP_SIDE = 8192
-    /** Network input budget per page: bounds both the run time and the 2× working bitmap (≤ 32 MB). */
-    private const val MAX_WORK_PIXELS = 2_000_000
-    /** Below this enlargement on screen the network cannot add detail the display could show. */
-    private const val MIN_GAIN_SCALE = 1.15
+    /**
+     * Network input budget per page: every ordinary page (≤ 2500 px sides, ≈ 3.2 MP) runs at its native resolution,
+     * because the network denoises compression blur and rebuilds line art even when the page is not enlarged on screen.
+     * Larger pages are fed at a reduced size. Bounds the run time and the 2× working bitmap (≤ 52 MB).
+     */
+    private const val MAX_WORK_PIXELS = 3_200_000
 
     class Preempted : Exception("yielded to the visible page")
 
@@ -77,8 +79,10 @@ internal object MangaAiUpscaler {
     private class Plan(val workWidth: Int, val workHeight: Int, val finalWidth: Int, val finalHeight: Int)
 
     /**
-     * Decides how much network work is worth doing for a page shown in a [displayWidth] × [displayHeight] box
-     * ([fillWidth] or [displayHeight] ≤ 0: the height follows the width). Returns the reason when it is not worth it.
+     * Decides the network input size and the size the result is kept at, for a page shown in a [displayWidth] ×
+     * [displayHeight] box ([fillWidth] or [displayHeight] ≤ 0: the height follows the width). Every normal page is
+     * processed, also when it is not enlarged on screen; only pages the network would have to shrink below both
+     * their source and their on-screen resolution are skipped, with the reason.
      */
     private fun plan(source: Bitmap, displayWidth: Int, displayHeight: Int, fillWidth: Boolean): Pair<Plan?, String?> {
         val width = source.width
@@ -87,14 +91,20 @@ internal object MangaAiUpscaler {
         if (displayWidth <= 0) return null to "版面未就绪"
         val shown = if (fillWidth || displayHeight <= 0) displayWidth.toDouble() / width
         else minOf(displayWidth.toDouble() / width, displayHeight.toDouble() / height)
-        if (shown < MIN_GAIN_SCALE) return null to "原图已清晰"
-        val work = minOf(1.0, sqrt(MAX_WORK_PIXELS / (width.toDouble() * height)))
-        val gain = minOf(shown, SCALE * work)
-        if (gain < MIN_GAIN_SCALE) return null to "图片过大"
-        val finalWidth = (width * gain).roundToInt()
-        val finalHeight = (height * gain).roundToInt()
-        if (maxOf(finalWidth, finalHeight) > MAX_BITMAP_SIDE) return null to "长图过长"
-        return Plan((width * work).roundToInt(), (height * work).roundToInt(), finalWidth, finalHeight) to null
+        // The 2× working canvas is drawn as the progressive preview, so it must stay within the renderer's limit.
+        val work = minOf(1.0, sqrt(MAX_WORK_PIXELS / (width.toDouble() * height)), MAX_BITMAP_SIDE / (SCALE * maxOf(width, height).toDouble()))
+        val workWidth = (width * work).roundToInt()
+        val workHeight = (height * work).roundToInt()
+        if (workWidth < 16 || workHeight < 16) return null to "长图过长"
+        val outScale = SCALE * work
+        if (outScale < 1.0 && outScale < shown) return null to if (maxOf(width, height) > 3 * minOf(width, height)) "长图过长" else "图片过大"
+        // Kept at the on-screen size, never below the source: a 2:1 (or gentler) resample of the network output
+        // is the cleanest 1:1 page, and enlarged pages stay crisp up to the full 2×.
+        val keep = minOf(outScale, maxOf(shown, 1.0))
+        val ratio = keep / outScale
+        val finalWidth = (workWidth * SCALE * ratio).roundToInt().coerceAtLeast(1)
+        val finalHeight = (workHeight * SCALE * ratio).roundToInt().coerceAtLeast(1)
+        return Plan(workWidth, workHeight, finalWidth, finalHeight) to null
     }
 
     suspend fun upscale(

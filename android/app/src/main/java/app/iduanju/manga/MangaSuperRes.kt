@@ -15,9 +15,13 @@ import coil.transform.Transformation
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
-/** Below this many rendered pixels per source pixel nothing is being reconstructed; only a light crispening pass runs. */
+/** From this many rendered pixels per source pixel on, the full strength applies. */
 private const val FULL_STRENGTH_SCALE = 1.5f
-private const val BASE_AMOUNT = 0.35f
+/**
+ * Strength at 1:1 and below. Online pages are often soft, re-compressed JPEGs served at screen width, so even
+ * unenlarged pages get a clearly visible ink/text reconstruction rather than a token crispening.
+ */
+private const val BASE_AMOUNT = 0.85f
 
 /** Strength for a page drawn at [displayScale] rendered pixels per source pixel ([baseline] applies at 1:1 and below). */
 internal fun mangaRestoreAmount(displayScale: Float, baseline: Float = BASE_AMOUNT): Float {
@@ -50,12 +54,16 @@ internal fun Modifier.mangaSuperRes(enabled: Boolean, displayScale: Float = 1f, 
 }
 
 /**
- * Edge-directed restoration (shock filter + controlled unsharp):
- *  1. pixels on an edge are pulled toward the extreme of the side they belong to — ink gets darker and
- *     thinner, paper next to a stroke gets cleaner — which steepens the soft ramp a bilinear upscale leaves;
- *  2. a source-scale unsharp adds back the lost micro contrast;
- *  3. the result may overshoot the local [min, max] by a small fraction of the local contrast only (no halos).
- * Flat areas and gentle gradients (local contrast < 3%) are left bit-exact.
+ * Two-scale edge-directed restoration (shock filter + band-limited unsharp), luma only:
+ *  - a fine ring at [radius] and a coarse ring at 2 × [radius] (one and two source pixels at 1:1) span the
+ *    2–4 px ramp a soft, compressed page has around every stroke, so its edges are actually reached;
+ *  - pixels on an edge are pulled toward the extreme of the side they belong to (ink darker and thinner,
+ *    paper next to a stroke cleaner), then fine and coarse unsharp add back the lost micro contrast;
+ *  - anti-ringing: the result stays inside the local [min, max] except for a little extra ink depth; it may
+ *    brighten above the local maximum by 2 % of the local contrast only, so no white halos appear;
+ *  - flat areas, paper texture and compression noise (local contrast < 3.5 %) are left bit-exact, and the fine
+ *    band is gated separately so blocky JPEG noise in mid-contrast areas is not amplified.
+ * The luma delta is applied equally to R, G and B and clamped to the gamut, so hues never shift.
  */
 private const val MANGA_RESTORE_SHADER = """
 uniform shader img;
@@ -73,48 +81,64 @@ half4 main(float2 pos) {
     if (base.a < 0.004) return half4(base);
     float3 rgb = base.rgb / base.a;
     float y = dot(rgb, LUMA);
+    float a = base.a;
     float r = radius;
-    float w = lumaAt(pos + float2(-r, 0.0), y, base.a);
-    float e = lumaAt(pos + float2(r, 0.0), y, base.a);
-    float n = lumaAt(pos + float2(0.0, -r), y, base.a);
-    float s = lumaAt(pos + float2(0.0, r), y, base.a);
-    float nw = lumaAt(pos + float2(-r, -r), y, base.a);
-    float ne = lumaAt(pos + float2(r, -r), y, base.a);
-    float sw = lumaAt(pos + float2(-r, r), y, base.a);
-    float se = lumaAt(pos + float2(r, r), y, base.a);
+    float q = radius * 2.0;
+    float w = lumaAt(pos + float2(-r, 0.0), y, a);
+    float e = lumaAt(pos + float2(r, 0.0), y, a);
+    float n = lumaAt(pos + float2(0.0, -r), y, a);
+    float s = lumaAt(pos + float2(0.0, r), y, a);
+    float nw = lumaAt(pos + float2(-r, -r), y, a);
+    float ne = lumaAt(pos + float2(r, -r), y, a);
+    float sw = lumaAt(pos + float2(-r, r), y, a);
+    float se = lumaAt(pos + float2(r, r), y, a);
+    float w2 = lumaAt(pos + float2(-q, 0.0), y, a);
+    float e2 = lumaAt(pos + float2(q, 0.0), y, a);
+    float n2 = lumaAt(pos + float2(0.0, -q), y, a);
+    float s2 = lumaAt(pos + float2(0.0, q), y, a);
+    float nw2 = lumaAt(pos + float2(-q, -q), y, a);
+    float ne2 = lumaAt(pos + float2(q, -q), y, a);
+    float sw2 = lumaAt(pos + float2(-q, q), y, a);
+    float se2 = lumaAt(pos + float2(q, q), y, a);
 
-    float lo = min(min(min(y, w), min(e, n)), min(min(s, nw), min(min(ne, sw), se)));
-    float hi = max(max(max(y, w), max(e, n)), max(max(s, nw), max(max(ne, sw), se)));
+    float lo1 = min(min(min(y, w), min(e, n)), min(min(s, nw), min(min(ne, sw), se)));
+    float hi1 = max(max(max(y, w), max(e, n)), max(max(s, nw), max(max(ne, sw), se)));
+    float lo = min(lo1, min(min(min(w2, e2), min(n2, s2)), min(min(nw2, ne2), min(sw2, se2))));
+    float hi = max(hi1, max(max(max(w2, e2), max(n2, s2)), max(max(nw2, ne2), max(sw2, se2))));
     float spread = hi - lo;
-    float gate = smoothstep(0.03, 0.18, spread) * amount;
+    float gate = smoothstep(0.035, 0.16, spread) * amount;
     if (gate <= 0.0) return half4(base);
 
-    float blur = (4.0 * y + 2.0 * (w + e + n + s) + nw + ne + sw + se) / 16.0;
-    float lap = blur - y;
+    float axes = w + e + n + s;
+    float diag = nw + ne + sw + se;
+    float blurFine = (4.0 * y + 2.0 * axes + diag) / 16.0;
+    float blurWide = (4.0 * y + 2.0 * axes + diag + 2.0 * (w2 + e2 + n2 + s2) + nw2 + ne2 + sw2 + se2) / 28.0;
+    float fineGate = smoothstep(0.03, 0.12, hi1 - lo1);
+
+    float lap = blurWide - y;
     float side = lap > 0.0 ? lo : hi;
-    float conf = clamp(abs(lap) / (spread * 0.25 + 0.0001), 0.0, 1.0);
-    float shocked = y + (side - y) * 0.6 * conf * gate;
-    float want = shocked + 0.9 * (y - blur) * gate;
-    float allow = 0.15 * spread;
-    want = clamp(want, lo - allow, hi + allow);
+    float conf = clamp(abs(lap) / (spread * 0.2 + 0.0001), 0.0, 1.0);
+    float shocked = y + (side - y) * 0.7 * conf * gate;
+    float want = shocked + (0.7 * fineGate * (y - blurFine) + 1.3 * (y - blurWide)) * gate;
+    want = clamp(want, lo - 0.10 * spread, hi + 0.02 * spread);
 
     float d = want - y;
     d = clamp(d, -min(rgb.r, min(rgb.g, rgb.b)), 1.0 - max(rgb.r, max(rgb.g, rgb.b)));
-    return half4((rgb + d) * base.a, base.a);
+    return half4((rgb + d) * a, a);
 }
 """
 
 /**
  * CPU equivalent of [MANGA_RESTORE_SHADER] for Android 12 and below (no runtime shaders). It runs once at
- * source resolution inside the image pipeline, so the page is decoded already restored.
+ * source resolution (fine ring 1 px, coarse ring 2 px) inside the image pipeline, so the page is decoded already restored.
  */
-internal class MangaRestoreTransformation(private val amount: Float = 0.7f) : Transformation {
-    override val cacheKey = "manga-restore-v2-$amount"
+internal class MangaRestoreTransformation(private val amount: Float = BASE_AMOUNT) : Transformation {
+    override val cacheKey = "manga-restore-v3-$amount"
 
     override suspend fun transform(input: Bitmap, size: Size): Bitmap {
         val w = input.width
         val h = input.height
-        if (w < 3 || h < 3) return input
+        if (w < 5 || h < 5) return input
         val src = IntArray(w * h)
         val bitmap = if (input.config == Bitmap.Config.ARGB_8888) input else input.copy(Bitmap.Config.ARGB_8888, false)
         bitmap.getPixels(src, 0, w, 0, 0, w, h)
@@ -124,26 +148,37 @@ internal class MangaRestoreTransformation(private val amount: Float = 0.7f) : Tr
             val up = (row - 1).coerceAtLeast(0) * w
             val mid = row * w
             val down = (row + 1).coerceAtMost(h - 1) * w
+            val up2 = (row - 2).coerceAtLeast(0) * w
+            val down2 = (row + 2).coerceAtMost(h - 1) * w
             for (col in 0 until w) {
                 val left = (col - 1).coerceAtLeast(0)
                 val right = (col + 1).coerceAtMost(w - 1)
+                val left2 = (col - 2).coerceAtLeast(0)
+                val right2 = (col + 2).coerceAtMost(w - 1)
                 val c = y[mid + col]
                 val wv = y[mid + left]; val ev = y[mid + right]; val nv = y[up + col]; val sv = y[down + col]
                 val nwv = y[up + left]; val nev = y[up + right]; val swv = y[down + left]; val sev = y[down + right]
-                val lo = minOf(minOf(c, wv, ev), minOf(nv, sv, nwv), minOf(nev, swv, sev))
-                val hi = maxOf(maxOf(c, wv, ev), maxOf(nv, sv, nwv), maxOf(nev, swv, sev))
-                val range = hi - lo
-                val t = ((range - 0.03f) / 0.15f).coerceIn(0f, 1f)
-                val gate = t * t * (3f - 2f * t) * amount
+                val w2 = y[mid + left2]; val e2 = y[mid + right2]; val n2 = y[up2 + col]; val s2 = y[down2 + col]
+                val nw2 = y[up2 + left2]; val ne2 = y[up2 + right2]; val sw2 = y[down2 + left2]; val se2 = y[down2 + right2]
+                val lo1 = minOf(minOf(c, wv, ev), minOf(nv, sv, nwv), minOf(nev, swv, sev))
+                val hi1 = maxOf(maxOf(c, wv, ev), maxOf(nv, sv, nwv), maxOf(nev, swv, sev))
+                val lo = minOf(lo1, minOf(w2, e2, n2), minOf(s2, nw2, ne2), minOf(sw2, se2))
+                val hi = maxOf(hi1, maxOf(w2, e2, n2), maxOf(s2, nw2, ne2), maxOf(sw2, se2))
+                val spread = hi - lo
+                val gate = smoothstep(0.035f, 0.16f, spread) * amount
                 val pixel = src[mid + col]
                 if (gate <= 0f) { out[mid + col] = pixel; continue }
-                val blur = (4f * c + 2f * (wv + ev + nv + sv) + nwv + nev + swv + sev) / 16f
-                val lap = blur - c
+                val axes = wv + ev + nv + sv
+                val diag = nwv + nev + swv + sev
+                val blurFine = (4f * c + 2f * axes + diag) / 16f
+                val blurWide = (4f * c + 2f * axes + diag + 2f * (w2 + e2 + n2 + s2) + nw2 + ne2 + sw2 + se2) / 28f
+                val fineGate = smoothstep(0.03f, 0.12f, hi1 - lo1)
+                val lap = blurWide - c
                 val side = if (lap > 0f) lo else hi
-                val conf = (abs(lap) / (range * 0.25f + 1e-4f)).coerceIn(0f, 1f)
-                val shocked = c + (side - c) * 0.6f * conf * gate
-                val allow = 0.15f * range
-                val target = (shocked + 0.9f * (c - blur) * gate).coerceIn(lo - allow, hi + allow)
+                val conf = (abs(lap) / (spread * 0.2f + 1e-4f)).coerceIn(0f, 1f)
+                val shocked = c + (side - c) * 0.7f * conf * gate
+                val target = (shocked + (0.7f * fineGate * (c - blurFine) + 1.3f * (c - blurWide)) * gate)
+                    .coerceIn(lo - 0.10f * spread, hi + 0.02f * spread)
                 val r = (pixel ushr 16 and 255) / 255f
                 val g = (pixel ushr 8 and 255) / 255f
                 val b = (pixel and 255) / 255f
@@ -157,6 +192,11 @@ internal class MangaRestoreTransformation(private val amount: Float = 0.7f) : Tr
         val result = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         result.setPixels(out, 0, w, 0, 0, w, h)
         return result
+    }
+
+    private fun smoothstep(edge0: Float, edge1: Float, x: Float): Float {
+        val t = ((x - edge0) / (edge1 - edge0)).coerceIn(0f, 1f)
+        return t * t * (3f - 2f * t)
     }
 
     private fun lumaOf(p: Int) = (0.299f * (p ushr 16 and 255) + 0.587f * (p ushr 8 and 255) + 0.114f * (p and 255)) / 255f
