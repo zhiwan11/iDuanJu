@@ -5,6 +5,7 @@ import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
 import android.content.Context
 import android.graphics.Bitmap
+import android.os.SystemClock
 import android.util.Log
 import android.util.LruCache
 import androidx.compose.runtime.getValue
@@ -25,22 +26,37 @@ import kotlin.math.abs
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
-/** Offline native 2× line-art restoration. One inference at a time, with priority for the visible page. */
+/**
+ * Offline native 2× line-art restoration. One inference at a time, with priority for the visible page.
+ * Every call ends in an explicit [Outcome] (never a silent null) so the reader can say why a page is not enhanced.
+ */
 internal object MangaAiUpscaler {
+    private const val TAG = "MangaSR"
     private const val SCALE = 2
     private const val PAD = 18
     private const val MAX_INPUT = 272
     private const val CORE = MAX_INPUT - 2 * PAD
     private const val OVERLAP = 24
     private const val MAX_OUTPUT = CORE * SCALE
-    private const val MAX_OUT_SIDE = 2600
+    /** Largest side a single bitmap may have and still be drawn by the hardware renderer. */
     private const val MAX_BITMAP_SIDE = 8192
-    private const val PAGE_MAX_WORK_PIXELS = 1080 * 1600
-    private const val STRIP_MAX_WORK_PIXELS = 1_300_000
+    /** Network input budget per page: bounds both the run time and the 2× working bitmap (≤ 32 MB). */
+    private const val MAX_WORK_PIXELS = 2_000_000
+    /** Below this enlargement on screen the network cannot add detail the display could show. */
+    private const val MIN_GAIN_SCALE = 1.15
 
     class Preempted : Exception("yielded to the visible page")
 
     data class Key(val url: String, val headers: Map<String, String>, val crop: Boolean, val half: Int, val webtoon: Boolean)
+
+    sealed interface Outcome {
+        data class Done(val bitmap: Bitmap) : Outcome
+        data class Skipped(val reason: String) : Outcome
+        data class Failed(val reason: String) : Outcome
+    }
+
+    /** [bitmap] is the 2× working canvas; its first [rows] rows are final. */
+    class Progress(val bitmap: Bitmap, val rows: Int, val fraction: Float)
 
     private val maxCacheBytes = (Runtime.getRuntime().maxMemory() / 5).coerceIn(48L shl 20, 192L shl 20).toInt()
     private val cache = object : LruCache<Key, Bitmap>(maxCacheBytes) {
@@ -58,26 +74,39 @@ internal object MangaAiUpscaler {
 
     fun getCached(key: Key): Bitmap? = cache.get(key)
 
-    private fun workSize(source: Bitmap, fillWidth: Boolean): Pair<Int, Int>? {
+    private class Plan(val workWidth: Int, val workHeight: Int, val finalWidth: Int, val finalHeight: Int)
+
+    /**
+     * Decides how much network work is worth doing for a page shown in a [displayWidth] × [displayHeight] box
+     * ([fillWidth] or [displayHeight] ≤ 0: the height follows the width). Returns the reason when it is not worth it.
+     */
+    private fun plan(source: Bitmap, displayWidth: Int, displayHeight: Int, fillWidth: Boolean): Pair<Plan?, String?> {
         val width = source.width
         val height = source.height
-        if (width < 16 || height < 16) return null
-        val longSide = maxOf(width, height)
-        val displaySide = if (fillWidth) width else longSide
-        val maxWork = if (fillWidth) STRIP_MAX_WORK_PIXELS else PAGE_MAX_WORK_PIXELS
-        val scale = minOf(
-            1.0,
-            MAX_OUT_SIDE.toDouble() / (displaySide.toDouble() * SCALE),
-            MAX_BITMAP_SIDE.toDouble() / (longSide.toDouble() * SCALE),
-            sqrt(maxWork / (width.toDouble() * height)),
-        )
-        if (scale <= 0.5) return null
-        return (width * scale).roundToInt() to (height * scale).roundToInt()
+        if (width < 16 || height < 16) return null to "图片过小"
+        if (displayWidth <= 0) return null to "版面未就绪"
+        val shown = if (fillWidth || displayHeight <= 0) displayWidth.toDouble() / width
+        else minOf(displayWidth.toDouble() / width, displayHeight.toDouble() / height)
+        if (shown < MIN_GAIN_SCALE) return null to "原图已清晰"
+        val work = minOf(1.0, sqrt(MAX_WORK_PIXELS / (width.toDouble() * height)))
+        val gain = minOf(shown, SCALE * work)
+        if (gain < MIN_GAIN_SCALE) return null to "图片过大"
+        val finalWidth = (width * gain).roundToInt()
+        val finalHeight = (height * gain).roundToInt()
+        if (maxOf(finalWidth, finalHeight) > MAX_BITMAP_SIDE) return null to "长图过长"
+        return Plan((width * work).roundToInt(), (height * work).roundToInt(), finalWidth, finalHeight) to null
     }
 
-    suspend fun upscale(context: Context, key: Key, source: Bitmap, foreground: () -> Boolean): Bitmap? {
-        getCached(key)?.let { return it }
-        val (width, height) = workSize(source, key.webtoon) ?: return null
+    suspend fun upscale(
+        context: Context, key: Key, source: Bitmap, displayWidth: Int, displayHeight: Int,
+        onProgress: (Progress) -> Unit, foreground: () -> Boolean,
+    ): Outcome {
+        getCached(key)?.let { return Outcome.Done(it) }
+        val (plan, reason) = plan(source, displayWidth, displayHeight, key.webtoon)
+        if (plan == null) {
+            Log.i(TAG, "skip ${source.width}x${source.height} shown in ${displayWidth}x$displayHeight: $reason")
+            return Outcome.Skipped(reason ?: "")
+        }
         return withContext(Dispatchers.Default) {
             var waiting = foreground()
             if (waiting) foregroundWaiting.incrementAndGet()
@@ -87,24 +116,29 @@ internal object MangaAiUpscaler {
                         foregroundWaiting.decrementAndGet()
                         waiting = false
                     }
-                    getCached(key) ?: try {
+                    getCached(key)?.let { return@withLock Outcome.Done(it) }
+                    try {
                         busy = true
-                        infer(context, source, width, height) { !foreground() && foregroundWaiting.get() > 0 }
-                            .also { cache.put(key, it) }
+                        val started = SystemClock.elapsedRealtime()
+                        val result = infer(context, source, plan, onProgress) { !foreground() && foregroundWaiting.get() > 0 }
+                        Log.i(TAG, "upscaled ${source.width}x${source.height} -> ${result.width}x${result.height} " +
+                            "(network input ${plan.workWidth}x${plan.workHeight}) in ${SystemClock.elapsedRealtime() - started} ms")
+                        cache.put(key, result)
+                        Outcome.Done(result)
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Preempted) {
                         throw e
-                    } catch (e: Exception) {
-                        Log.w("IDJ", "Manga AI upscale failed", e)
-                        null
                     } catch (e: OutOfMemoryError) {
                         cache.evictAll()
-                        Log.w("IDJ", "Not enough memory for manga AI upscale", e)
-                        null
+                        Log.w(TAG, "Not enough memory for AI upscale", e)
+                        Outcome.Failed("内存不足")
                     } catch (e: LinkageError) {
-                        Log.w("IDJ", "Manga AI runtime unavailable", e)
-                        null
+                        Log.w(TAG, "AI runtime unavailable", e)
+                        Outcome.Failed("运行库不可用")
+                    } catch (e: Exception) {
+                        Log.w(TAG, "AI upscale failed", e)
+                        Outcome.Failed("推理出错")
                     } finally {
                         busy = false
                     }
@@ -168,9 +202,11 @@ internal object MangaAiUpscaler {
         return outWidth
     }
 
-    private suspend fun infer(context: Context, source: Bitmap, width: Int, height: Int, shouldYield: () -> Boolean): Bitmap {
+    private suspend fun infer(context: Context, source: Bitmap, plan: Plan, onProgress: (Progress) -> Unit, shouldYield: () -> Boolean): Bitmap {
         if (shouldYield()) throw Preempted()
-        val work = Bitmap.createScaledBitmap(source, width, height, true)
+        val width = plan.workWidth
+        val height = plan.workHeight
+        val work = if (width == source.width && height == source.height) source else Bitmap.createScaledBitmap(source, width, height, true)
         val pixels = try {
             IntArray(width * height).also { work.getPixels(it, 0, width, 0, 0, width, height) }
         } finally {
@@ -182,7 +218,11 @@ internal object MangaAiUpscaler {
         val outWidth = width * SCALE
         val outHeight = height * SCALE
         val out = Bitmap.createBitmap(outWidth, outHeight, Bitmap.Config.ARGB_8888)
-        try {
+        val tiles = (columns.size * rows.size).toFloat()
+        var done = 0
+        var ready = 0
+        // The working canvas may already be on screen as a progressive preview, so it is never recycled here.
+        run {
             // The network's global channel statistics vary between tiles. Feather its luma in a rolling band.
             val band = FloatArray(outWidth * rows.maxOf { it.length * SCALE })
             val packed = IntArray(band.size)
@@ -194,6 +234,8 @@ internal object MangaAiUpscaler {
                     currentCoroutineContext().ensureActive()
                     if (shouldYield()) throw Preempted()
                     val tileStride = runTile(ort, pixels, width, height, xs, ys)
+                    done++
+                    onProgress(Progress(out, ready, done / tiles))
                     val plane = tileStride * ((inputSide(ys.length) - 2 * PAD) * SCALE)
                     val xStart = xs.start * SCALE
                     val tileWidth = xs.length * SCALE
@@ -221,15 +263,16 @@ internal object MangaAiUpscaler {
                     }
                 }
                 out.setPixels(packed, 0, outWidth, 0, yStart, outWidth, flushHeight)
+                ready = yStart + flushHeight
+                onProgress(Progress(out, ready, done / tiles))
                 val carry = (tileHeight - flushHeight) * outWidth
                 band.copyInto(band, 0, flushHeight * outWidth, tileHeight * outWidth)
                 band.fill(0f, carry)
             }
-        } catch (e: Throwable) {
-            out.recycle()
-            throw e
         }
-        return out
+        if (plan.finalWidth == outWidth && plan.finalHeight == outHeight) return out
+        // Resample once to the size it is shown at: crisp 1:1 drawing and a smaller cache footprint.
+        return Bitmap.createScaledBitmap(out, plan.finalWidth, plan.finalHeight, true)
     }
 
     private fun weight(index: Int, length: Int, start: Int, full: Int): Float {
