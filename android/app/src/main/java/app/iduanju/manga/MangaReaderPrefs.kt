@@ -78,8 +78,6 @@ object MangaReaderPrefs {
     var pageBg by mutableStateOf(MangaPageBg.of(s("pageBg")))
     var paperStyle by mutableStateOf(MangaPaperStyle.of(s("paperStyle")))
     var textureOpacity by mutableFloatStateOf(f("textureOpacity", 0.7f).coerceIn(0f, 1f))
-    /** 漫画超分：0 关闭 · 1 标准（即时 GPU 着色器）· 2 增强（离线 Real-ESRGAN 神经网络）. */
-    var superResLevel by mutableIntStateOf(i("superRes", 0).coerceIn(0, 2))
 
     // 沉浸氛围（雨天窗景 / 列车车窗 / 新年烟火 / 雪夜）+ 环境音效
     var atmosphere by mutableStateOf(MangaAtmosphere.entries.firstOrNull { it.name == s("atmosphere") } ?: MangaAtmosphere.OFF)
@@ -127,7 +125,6 @@ object MangaReaderPrefs {
     fun updatePageBg(v: MangaPageBg) { pageBg = v; put("pageBg", v.name) }
     fun updatePaperStyle(v: MangaPaperStyle) { paperStyle = v; put("paperStyle", v.name) }
     fun updateTextureOpacity(v: Float) { textureOpacity = v.coerceIn(0f, 1f); put("textureOpacity", textureOpacity) }
-    fun updateSuperResLevel(v: Int) { superResLevel = v.coerceIn(0, 2); put("superRes", superResLevel) }
     fun updateAtmosphere(v: MangaAtmosphere) { atmosphere = v; put("atmosphere", v.name) }
     fun updateAtmosphereSound(v: Boolean) { atmosphereSound = v; put("atmoSound", v) }
     fun updateAtmosphereVolume(v: Float) { atmosphereVolume = v.coerceIn(0f, 1f); put("atmoVolume", atmosphereVolume) }

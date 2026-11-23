@@ -92,7 +92,6 @@ dependencies {
     // AndroidLiquidGlass (Apache-2.0): liquid glass backdrop refraction & vibrancy for floating navigation
     implementation("io.github.kyant0:backdrop:1.0.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
     implementation("wang.harlon.quickjs:wrapper-android:3.2.3")
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
