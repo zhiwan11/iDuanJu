@@ -107,9 +107,28 @@ fun RootScreen(initialRoute: String? = null) {
     val searchDockState = remember { SearchDockState() }
     val back = nav.currentBackStackEntryAsState().value
     val route = back?.destination?.route ?: "home"
-    LaunchedEffect(route) {
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    val isDarkTheme = IdjThemeColors.dark
+    val isFullscreenRoute = route?.startsWith("player/") == true ||
+        route?.startsWith("manga-reader/") == true ||
+        route?.startsWith("tvbox-vod/") == true ||
+        route?.startsWith("tvbox-live/") == true
+    LaunchedEffect(route, isDarkTheme) {
         when (route) { "home" -> tab = 0; "tvbox" -> tab = 1; "category" -> tab = 2; "profile" -> tab = 3 }
         if (route != "search") searchDockState.isTyping = false
+        if (!isFullscreenRoute) {
+            val restoreBars = {
+                (ctx as? android.app.Activity)?.window?.let { w ->
+                    val ctl = androidx.core.view.WindowCompat.getInsetsController(w, w.decorView)
+                    ctl.show(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+                    ctl.isAppearanceLightStatusBars = !isDarkTheme
+                    ctl.isAppearanceLightNavigationBars = !isDarkTheme
+                }
+            }
+            restoreBars()
+            kotlinx.coroutines.delay(360L)
+            restoreBars()
+        }
     }
     val atRoot = route in setOf("home", "tvbox", "search", "category", "profile")
     /** Backdrop for the floating liquid-glass navigation bar: everything the NavHost draws. */
