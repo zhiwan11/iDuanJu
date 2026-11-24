@@ -19,10 +19,14 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
@@ -241,11 +245,37 @@ object DanmakuPrefs {
     }
 }
 
+private data class DanmakuPreviewSample(
+    val text: String,
+    val color: Color,
+    val phaseOffset: Double,
+)
+
+private val PREVIEW_SAMPLES = listOf(
+    DanmakuPreviewSample("前方高能！名场面来了", Color.White, 0.14),
+    DanmakuPreviewSample("这段演技太绝了", Color.White, 0.34),
+    DanmakuPreviewSample("彩色弹幕效果预览", Color(0xFFFFC857), 0.52),
+    DanmakuPreviewSample("节奏好紧凑根本停不下来", Color.White, 0.70),
+    DanmakuPreviewSample("字号与透明度实时预览", Color.White, 0.86),
+)
+
 /** Scrolling bullet-comment layer synced to the player clock (iOS DanmakuOverlay). Never intercepts touches. */
 @Composable
-fun DanmakuOverlay(player: Player, seriesId: String, vid: String, laneTop: Dp, bottomLimit: Dp, onStatus: (String) -> Unit) {
+fun DanmakuOverlay(
+    player: Player,
+    seriesId: String,
+    vid: String,
+    laneTop: Dp,
+    bottomLimit: Dp,
+    previewActive: Boolean = false,
+    onStatus: (String) -> Unit,
+) {
     var raw by remember(vid) { mutableStateOf<List<HGDanmaku>>(emptyList()) }
-    LaunchedEffect(vid) {
+    LaunchedEffect(seriesId, vid) {
+        if (vid.isEmpty() || !seriesId.all { it.isDigit() }) {
+            raw = emptyList()
+            return@LaunchedEffect
+        }
         onStatus("弹幕加载中…")
         val r = withContext(Dispatchers.IO) { DanmakuPrefs.client.fetch(seriesId, vid) }
         raw = r.items
@@ -285,6 +315,21 @@ fun DanmakuOverlay(player: Player, seriesId: String, vid: String, laneTop: Dp, b
         }
     }
 
+    val currentDuration by rememberUpdatedState(duration)
+    var previewPhase by remember { mutableDoubleStateOf(0.0) }
+    LaunchedEffect(previewActive) {
+        if (!previewActive) return@LaunchedEffect
+        var lastNs = System.nanoTime()
+        while (isActive) {
+            withFrameNanos {
+                val nowNs = System.nanoTime()
+                val dtSec = (nowNs - lastNs).coerceIn(0L, 100_000_000L) / 1_000_000_000.0
+                lastNs = nowNs
+                previewPhase = (previewPhase + dtSec / currentDuration) % 1.0
+            }
+        }
+    }
+
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val wPx = with(density) { maxWidth.toPx() }
         val laneH = fontSp * 1.55f
@@ -293,7 +338,7 @@ fun DanmakuOverlay(player: Player, seriesId: String, vid: String, laneTop: Dp, b
         val baseBottom = minOf(bottomLimit.value, maxHeight.value * 0.08f)
         val bottomReserve = if (avoidSubtitle) maxOf(subtitleGuard, baseBottom) else baseBottom
         val usableH = (availableH - bottomReserve).coerceAtLeast(laneH)
-        val maxRows = (usableH / laneH).toInt().coerceIn(1, 16)
+        val maxRows = (usableH / laneH).toInt().coerceIn(1, 40)
         val targetH = (availableH * areaFraction).coerceAtMost(usableH).coerceAtLeast(laneH)
         val rows = (targetH / laneH).toInt().coerceIn(1, maxRows)
 
@@ -301,13 +346,14 @@ fun DanmakuOverlay(player: Player, seriesId: String, vid: String, laneTop: Dp, b
         val placed = remember(prepared, maxWidth, rows, fontSp, duration) {
             DanmakuLayout.layout(prepared, rows, maxWidth.value, fontSp, duration, true)
         }
-        if (placed.isEmpty()) return@BoxWithConstraints
+        if (placed.isEmpty() && !previewActive) return@BoxWithConstraints
 
         val parsedColors = remember(placed) {
             placed.map { runCatching { Color(android.graphics.Color.parseColor(it.item.color)) }.getOrDefault(Color.White) }
         }
         val textLayouts = remember(placed, fontSp) { arrayOfNulls<TextLayoutResult>(placed.size) }
         val badgeLayouts = remember(placed, fontSp) { arrayOfNulls<TextLayoutResult>(placed.size) }
+        val previewLayouts = remember(fontSp, previewActive) { arrayOfNulls<TextLayoutResult>(PREVIEW_SAMPLES.size) }
 
         val normalStyle = remember(fontSp) { TextStyle(fontSize = fontSp.sp, fontWeight = FontWeight.SemiBold) }
         val boldStyle = remember(fontSp) { TextStyle(fontSize = fontSp.sp, fontWeight = FontWeight.Bold) }
@@ -315,16 +361,36 @@ fun DanmakuOverlay(player: Player, seriesId: String, vid: String, laneTop: Dp, b
         val textShadow = remember(opacity) { Shadow(Color.Black.copy(alpha = 0.85f * opacity), Offset(0f, 1f), 2.4f) }
         val badgeColor = remember(opacity) { Color(0xFFFFB347).copy(alpha = opacity) }
 
+        val areaLabel = DanmakuPrefs.AREA_LABELS[DanmakuPrefs.areaLevel.coerceIn(0, 4)]
+        val guideText = "弹幕显示区域 · $areaLabel"
+        val guideStyle = remember { TextStyle(fontSize = 11.sp, fontWeight = FontWeight.Medium) }
+        val guideLayout = remember(guideText, previewActive) {
+            if (previewActive) measurer.measure(guideText, guideStyle) else null
+        }
+        val dashEffect = remember(density) {
+            with(density) { PathEffect.dashPathEffect(floatArrayOf(6.dp.toPx(), 4.dp.toPx()), 0f) }
+        }
+
         Canvas(Modifier.fillMaxSize()) {
+            val laneTopPx = laneTop.toPx()
+            val laneHPx = laneH.dp.toPx()
+            val badgeGapPx = 4.dp.toPx()
+
+            if (previewActive) {
+                val areaHeightPx = rows * laneHPx
+                drawRect(
+                    color = Color.White.copy(alpha = 0.06f),
+                    topLeft = Offset(0f, laneTopPx),
+                    size = Size(size.width, areaHeightPx),
+                )
+            }
+
             var lo = 0
             var hi = placed.size
             while (lo < hi) {
                 val m = (lo + hi) / 2
                 if (placed[m].item.time < t - duration) lo = m + 1 else hi = m
             }
-            val laneTopPx = laneTop.toPx()
-            val laneHPx = laneH.dp.toPx()
-            val badgeGapPx = 4.dp.toPx()
             var i = lo
             while (i < placed.size) {
                 val idx = i
@@ -355,6 +421,68 @@ fun DanmakuOverlay(player: Player, seriesId: String, vid: String, laneTop: Dp, b
                         color = badgeColor,
                         topLeft = Offset(x + layout.size.width + badgeGapPx, y - b.size.height / 2f),
                         shadow = textShadow,
+                    )
+                }
+            }
+
+            if (previewActive) {
+                val previewLanes = intArrayOf(
+                    0,
+                    (rows / 4).coerceIn(0, rows - 1),
+                    (rows / 2).coerceIn(0, rows - 1),
+                    ((3 * rows) / 4).coerceIn(0, rows - 1),
+                    (rows - 1).coerceAtLeast(0),
+                )
+                PREVIEW_SAMPLES.forEachIndexed { idx, sample ->
+                    val layout = previewLayouts[idx] ?: measurer.measure(sample.text, normalStyle).also {
+                        previewLayouts[idx] = it
+                    }
+                    val progress = ((previewPhase + sample.phaseOffset) % 1.0).toFloat()
+                    val x = wPx - progress * (wPx + layout.size.width)
+                    val y = laneTopPx + laneHPx / 2f + previewLanes[idx] * laneHPx
+                    val baseColor = if (blockColor) Color.White else sample.color
+                    drawText(
+                        layout,
+                        color = baseColor.copy(alpha = opacity),
+                        topLeft = Offset(x, y - layout.size.height / 2f),
+                        shadow = textShadow,
+                    )
+                }
+
+                val areaBottomPx = laneTopPx + rows * laneHPx
+                drawLine(
+                    color = Color.White.copy(alpha = 0.45f),
+                    start = Offset(0f, areaBottomPx),
+                    end = Offset(size.width, areaBottomPx),
+                    strokeWidth = 1.2.dp.toPx(),
+                    pathEffect = dashEffect,
+                )
+                guideLayout?.let { label ->
+                    val padH = 10.dp.toPx()
+                    val padV = 4.dp.toPx()
+                    val pillW = label.size.width + padH * 2f
+                    val pillH = label.size.height + padV * 2f
+                    val pillX = (size.width - pillW) / 2f
+                    val maxPillY = (size.height - pillH - 4.dp.toPx()).coerceAtLeast(laneTopPx + 2.dp.toPx())
+                    val pillY = (areaBottomPx - pillH / 2f).coerceIn(laneTopPx + 2.dp.toPx(), maxPillY)
+                    val radius = CornerRadius(pillH / 2f, pillH / 2f)
+                    drawRoundRect(
+                        color = Color(0xFF14161B).copy(alpha = 0.78f),
+                        topLeft = Offset(pillX, pillY),
+                        size = Size(pillW, pillH),
+                        cornerRadius = radius,
+                    )
+                    drawRoundRect(
+                        color = Color.White.copy(alpha = 0.35f),
+                        topLeft = Offset(pillX, pillY),
+                        size = Size(pillW, pillH),
+                        cornerRadius = radius,
+                        style = Stroke(width = 0.8.dp.toPx()),
+                    )
+                    drawText(
+                        label,
+                        color = Color.White.copy(alpha = 0.92f),
+                        topLeft = Offset(pillX + padH, pillY + padV),
                     )
                 }
             }

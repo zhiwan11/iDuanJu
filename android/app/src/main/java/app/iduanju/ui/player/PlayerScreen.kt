@@ -866,9 +866,17 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
         )
         // official danmaku (红果 only), lanes under the top bar + tech strip, never into the bottom controls
         val epNow = detail?.episodes?.getOrNull(epIndex)
-        if (!inPip && danmaku && epNow != null && seriesId.all { it.isDigit() }) {
+        val previewDanmaku = panel == "danmaku"
+        if (!inPip && (previewDanmaku || (danmaku && epNow != null && seriesId.all { it.isDigit() }))) {
             val topInset = with(androidx.compose.ui.platform.LocalDensity.current) { androidx.compose.foundation.layout.WindowInsets.statusBars.getTop(this).toDp() }
-            DanmakuOverlay(player, seriesId, epNow.vid, laneTop = topInset + (if (metrics.isTablet) 64.dp else 44.dp) + 34.dp, bottomLimit = 220.dp) { android.util.Log.i("IDJ", "danmaku: $it") }
+            DanmakuOverlay(
+                player = player,
+                seriesId = seriesId,
+                vid = epNow?.vid.orEmpty(),
+                laneTop = if (landscape) 10.dp else topInset + 12.dp,
+                bottomLimit = 220.dp,
+                previewActive = previewDanmaku,
+            ) { android.util.Log.i("IDJ", "danmaku: $it") }
         }
         // gesture layer: tap = chrome, double-tap sides = ±10s, long-press = 2x, vertical swipe = 亮度 (left) /
         // 音量 (right) / follow-finger prev/next episode (centre), horizontal drag = scrub.
@@ -1079,7 +1087,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
         }
         Box(Modifier.fillMaxWidth().height(if (wideHud) 120.dp else 110.dp).graphicsLayer { alpha = if (locked) 0f else chromeA }
             .background(Brush.verticalGradient(listOf(Color.Black.copy(0.55f), Color.Black.copy(0.18f), Color.Transparent))))
-        Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(if (wideHud) 170.dp else 200.dp).graphicsLayer { alpha = if (locked) 0f else chromeA }
+        Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(if (wideHud) 170.dp else 200.dp).graphicsLayer { alpha = if (locked || panel == "danmaku") 0f else chromeA }
             .background(Brush.verticalGradient(0f to Color.Transparent, 0.45f to Color.Black.copy(0.18f), 1f to Color.Black.copy(0.58f))))
 
         // Top bar
@@ -1154,7 +1162,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
         }
 
         // Bottom console: overlays the video, never reserves space in its viewport.
-        if (!inPip && !locked && (showChrome || panel != null)) Column(Modifier.align(Alignment.BottomCenter).navigationBarsPadding()
+        if (!inPip && !locked && (showChrome || panel != null) && panel != "danmaku") Column(Modifier.align(Alignment.BottomCenter).navigationBarsPadding()
             .padding(horizontal = hudPad).padding(bottom = if (wideHud) 16.dp else 6.dp)
             .then(if (wideHud) Modifier.widthIn(max = 860.dp) else Modifier).fillMaxWidth()
             .graphicsLayer { alpha = chromeA }) {
@@ -1254,29 +1262,59 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
             )
         }
         // Settings sheet: one style for 选集 / 倍速 / 画质 / 音轨字幕 / 更多. Tablets get a centred floating glass modal
-        // over a light scrim; phones keep the sheet just above the console.
-        val centeredSheet = tablet
-        if (!inPip && panel != null) Box(Modifier.fillMaxSize().then(if (centeredSheet) Modifier.background(Color.Black.copy(0.30f)) else Modifier)
+        // over a light scrim; phones keep the sheet just above the console. Danmaku settings stay compact, non-scrimmed,
+        // and translucent so live danmaku & video preview remain clearly visible while adjusting sliders.
+        val lastPanel = remember { arrayOfNulls<String>(1) }
+        if (panel != null) lastPanel[0] = panel
+        val shown = lastPanel[0]
+        val danmakuSheet = shown == "danmaku"
+        val centeredSheet = tablet && !danmakuSheet
+        val danmakuSideSheet = danmakuSheet && landscape
+        val sheetScrim = when {
+            panel == "danmaku" -> Color.Transparent
+            tablet -> Color.Black.copy(0.30f)
+            else -> Color.Transparent
+        }
+        if (!inPip && panel != null) Box(Modifier.fillMaxSize().background(sheetScrim)
             .pointerInput(Unit) { detectTapGestures { panel = null } })
         androidx.compose.animation.AnimatedVisibility(!inPip && panel != null,
-            if (centeredSheet) Modifier.align(Alignment.Center).navigationBarsPadding().padding(24.dp)
-            else Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(horizontal = 12.dp).padding(bottom = if (landscape) 16.dp else 78.dp),
-            enter = if (centeredSheet) fadeIn(DS.panel()) + androidx.compose.animation.scaleIn(DS.panel(), initialScale = 0.94f)
-                else fadeIn(DS.panel()) + androidx.compose.animation.slideInVertically(DS.panel()) { it / 6 },
-            exit = if (centeredSheet) fadeOut(DS.panel()) + androidx.compose.animation.scaleOut(DS.panel(), targetScale = 0.94f)
-                else fadeOut(DS.panel()) + androidx.compose.animation.slideOutVertically(DS.panel()) { it / 6 }) {
-            val last = remember { arrayOfNulls<String>(1) }
-            if (panel != null) last[0] = panel
-            val shown = last[0]
+            when {
+                centeredSheet -> Modifier.align(Alignment.Center).navigationBarsPadding().padding(24.dp)
+                danmakuSideSheet -> Modifier.align(Alignment.CenterEnd).navigationBarsPadding().padding(horizontal = 16.dp, vertical = 14.dp)
+                else -> Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(horizontal = 12.dp)
+                    .padding(bottom = if (landscape || danmakuSheet) 16.dp else 78.dp)
+            },
+            enter = when {
+                centeredSheet -> fadeIn(DS.panel()) + androidx.compose.animation.scaleIn(DS.panel(), initialScale = 0.94f)
+                danmakuSideSheet -> fadeIn(DS.panel()) + androidx.compose.animation.slideInHorizontally(DS.panel()) { it / 4 }
+                else -> fadeIn(DS.panel()) + androidx.compose.animation.slideInVertically(DS.panel()) { it / 6 }
+            },
+            exit = when {
+                centeredSheet -> fadeOut(DS.panel()) + androidx.compose.animation.scaleOut(DS.panel(), targetScale = 0.94f)
+                danmakuSideSheet -> fadeOut(DS.panel()) + androidx.compose.animation.slideOutHorizontally(DS.panel()) { it / 4 }
+                else -> fadeOut(DS.panel()) + androidx.compose.animation.slideOutVertically(DS.panel()) { it / 6 }
+            }) {
             val sheetShape = RoundedCornerShape(28.dp)
             val liquidGlass = GlassStylePref.style == GlassStyle.LIQUID
-            Column(Modifier.widthIn(max = if (centeredSheet) 540.dp else 520.dp).fillMaxWidth()
-                .heightIn(max = (metrics.heightDp * if (centeredSheet) 0.80f else 0.74f).dp)
+            val sheetMaxW = when {
+                centeredSheet -> 540.dp
+                danmakuSideSheet -> if (tablet) 380.dp else 336.dp
+                else -> 520.dp
+            }
+            val sheetMaxH = when {
+                centeredSheet -> metrics.heightDp * 0.80f
+                danmakuSideSheet -> metrics.heightDp * 0.86f
+                danmakuSheet -> metrics.heightDp * 0.46f
+                else -> metrics.heightDp * 0.74f
+            }
+            Column(Modifier.widthIn(max = sheetMaxW).fillMaxWidth()
+                .heightIn(max = sheetMaxH.dp)
                 // LIQUID: sheer dark glass (0.52 → ~19 % fill + specular rim) plus a 30 % smoke layer so the settings
                 // text stays legible over bright video; FROSTED keeps its dense high-readability fill.
+                // Danmaku settings stay extra translucent (0.68f fallback) so live danmaku remain visible behind it.
                 .glassSurface(sheetShape, dark = true, base = Color(0xFF1C1E24), shadowRadius = 20.dp,
-                    fallbackAlpha = if (liquidGlass) 0.52f else 0.92f,
-                    activeOverlay = if (liquidGlass) Color.Black.copy(alpha = 0.30f) else Color.Transparent)
+                    fallbackAlpha = if (danmakuSheet) (if (liquidGlass) 0.44f else 0.68f) else (if (liquidGlass) 0.52f else 0.92f),
+                    activeOverlay = if (liquidGlass) Color.Black.copy(alpha = if (danmakuSheet) 0.18f else 0.30f) else Color.Transparent)
                 .pointerInput(Unit) { detectTapGestures { } }
                 .verticalScroll(rememberScrollState())
                 .padding(start = if (centeredSheet) 20.dp else 16.dp, end = if (centeredSheet) 20.dp else 16.dp,
