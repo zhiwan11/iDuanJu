@@ -460,7 +460,7 @@ private fun PosterHero(board: String, picks: List<HGSeries>, index: Int, setInde
                 val s = picks[i]
                 Row(Modifier.fillMaxSize().testTag("home.hero.page.$i").graphicsLayer { alpha = 1f - kotlin.math.abs(pager.getOffsetDistanceInPages(i)).coerceIn(0f, 1f) * 1.6f }
                     .pressClick(0.98f, label = "home.hero.page.$i") { onOpen(s.seriesId) }.padding(14.dp), verticalAlignment = Alignment.Top) {
-                    PosterArt(s.cover, Modifier.size(posterWidth, posterWidth * 4 / 3), badge = HomeFmt.progress(s)?.let { DS.spaced(it) })
+                    PosterArt(s.cover, Modifier.size(posterWidth, posterWidth * 4 / 3).expressivePress(0.97f), badge = HomeFmt.progress(s)?.let { DS.spaced(it) })
                     Spacer(Modifier.width(14.dp))
                     Column(Modifier.weight(1f).fillMaxHeight().padding(top = 3.dp, bottom = 1.dp)) {
                         Text(kicker(i), Modifier.testTag("home.hero.kicker.$i"), color = Color(0xFFF2B55C), style = kickerStyle, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -600,7 +600,9 @@ private fun homeShelfMeta(s: HGSeries): String {
 @Composable
 fun HomePosterCard(s: HGSeries, onOpen: (String) -> Unit) {
     val c = IdjThemeColors
-    Column(Modifier.clickable { onOpen(s.seriesId) }) {
+    val src = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+    // Tactile card: poster + caption dip together on the expressive spring.
+    Column(Modifier.expressivePress(0.97f, src).clickable(src, null) { onOpen(s.seriesId) }) {
         Box(Modifier.fillMaxWidth().aspectRatio(3f / 4f).clip(RoundedCornerShape(10.dp)).background(c.elevated).border(0.6.dp, c.text.copy(0.12f), RoundedCornerShape(10.dp))) {
             AsyncImage(s.cover, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
             HomeFmt.progress(s)?.let { HomeBadge(it, Modifier.align(Alignment.BottomEnd).padding(5.dp)) }

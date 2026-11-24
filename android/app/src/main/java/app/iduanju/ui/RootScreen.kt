@@ -1,5 +1,15 @@
 package app.iduanju.ui
 
+import androidx.activity.OnBackPressedDispatcher
+import androidx.activity.OnBackPressedDispatcherOwner
+import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
+import androidx.activity.compose.PredictiveBackHandler
+import androidx.compose.animation.AnimatedContentScope
+import androidx.compose.animation.AnimatedContentTransitionScope
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.SizeTransform
+import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.spring
@@ -23,10 +33,9 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.layout.layout
 import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.selected
@@ -42,6 +51,12 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.lerp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.LifecycleRegistry
+import androidx.navigation.NamedNavArgument
+import androidx.navigation.NavBackStackEntry
+import androidx.navigation.NavGraphBuilder
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -53,6 +68,8 @@ import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import app.iduanju.ui.category.CategoryScreen
 import app.iduanju.ui.components.ExpressiveMotion
+import app.iduanju.ui.components.ExpressiveNav
+import app.iduanju.ui.components.expressivePress
 import app.iduanju.ui.components.GlassNavigationRail
 import app.iduanju.ui.components.GlassStyle
 import app.iduanju.ui.components.GlassStylePref
@@ -68,6 +85,12 @@ import app.iduanju.ui.player.PlayerScreen
 import app.iduanju.ui.profile.ProfileScreen
 import app.iduanju.ui.search.SearchScreen
 import app.iduanju.ui.theme.IdjThemeColors
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 
 /** Lets deep rows (继续观看 · 全部) open a route without threading callbacks through every page. */
@@ -97,6 +120,110 @@ fun RootScreen(initialRoute: String? = null) {
     }
     val cfg = androidx.compose.ui.platform.LocalConfiguration.current
 
+    // ---- Native predictive back ----
+    // NavHost listens on a private child dispatcher, so its built-in seekable transition (which keeps BOTH the top
+    // and the previous entry composed) only runs when we forward the system gesture to it. Our handler sits on the
+    // real activity dispatcher *below* every screen's own BackHandler (player / search / readers win first, since
+    // destinations get the real dispatcher back), records progress, edge and touch Y, and drives the card physics
+    // drawn by [PredictiveBackScene].
+    val predictiveBack = remember { PredictiveBackState() }
+    val realBackOwner = LocalOnBackPressedDispatcherOwner.current
+    // activity-compose 1.9.3's PredictiveBackHandler reads this (ui.platform) local, so it is the one to provide.
+    @Suppress("DEPRECATION") val lifecycleLocal = androidx.compose.ui.platform.LocalLifecycleOwner
+    val hostLifecycleOwner = lifecycleLocal.current
+    val navBackOwner = remember(hostLifecycleOwner) { ChildBackDispatcherOwner(hostLifecycleOwner) }
+    val predictiveBackHost = remember(realBackOwner) { PredictiveBackHost(predictiveBack, realBackOwner) }
+    val handlerLifecycleOwner = remember { AlwaysResumedLifecycleOwner() }
+    val backScope = rememberCoroutineScope()
+    val settle = remember { arrayOfNulls<Job>(1) }
+    val canPop = back != null && nav.previousBackStackEntry != null
+    val child = navBackOwner.onBackPressedDispatcher
+
+    // Registered with an always-resumed owner so it is never re-added on top of the screens' own handlers after
+    // the activity restarts (lifecycle-bound callbacks re-register in observer order on every ON_START).
+    androidx.compose.runtime.CompositionLocalProvider(lifecycleLocal provides handlerLifecycleOwner) {
+        PredictiveBackHandler(enabled = canPop) { events ->
+            val pb = predictiveBack
+            if (pb.committing) {
+                // The previous swipe is already popping this route: swallow this one.
+                events.collect { }
+                return@PredictiveBackHandler
+            }
+            // A new swipe while the previous one is still springing home: finish that revert right away.
+            settle[0]?.cancel()
+            settle[0] = null
+            if (pb.isPredictingBack) {
+                child.dispatchOnBackCancelled()
+                pb.reset()
+            }
+            val token = ++pb.gestureToken
+            val topRoute = nav.currentBackStackEntry?.destination?.route.orEmpty()
+            // SurfaceView-based players (TVBox) cannot be transformed by a graphics layer: plain pop on release.
+            val cardPhysics = !topRoute.startsWith("tvbox/vod/") && !topRoute.startsWith("tvbox/live/")
+            var started = false
+            try {
+                events.collect { e ->
+                    if (!cardPhysics) return@collect
+                    if (!started) {
+                        started = true
+                        pb.topEntryId = nav.currentBackStackEntry?.id
+                        pb.previousEntryId = nav.previousBackStackEntry?.id
+                        pb.backSwipeEdge = e.swipeEdge
+                        pb.backStartTouchY = e.touchY
+                        pb.backTouchY = e.touchY
+                        pb.backProgress = 0f
+                        pb.commitProgress = 0f
+                        // Must be set before NavHost seeks, so its transitions resolve to the neutral pair.
+                        pb.isPredictingBack = true
+                        pb.neutralTransitions = true
+                        child.dispatchOnBackStarted(e)
+                    }
+                    pb.backProgress = e.progress
+                    pb.backTouchY = e.touchY
+                    pb.backSwipeEdge = e.swipeEdge
+                    child.dispatchOnBackProgressed(e)
+                }
+                if (!started) {
+                    // Button / 3-button back (or no gesture preview): regular directional pop transition.
+                    child.onBackPressed()
+                    return@PredictiveBackHandler
+                }
+                // Released: the card finishes leaving while the previous page settles to 1.0, then the route pops
+                // underneath an already invisible card: no flicker, no snap back.
+                pb.committing = true
+                withContext(NonCancellable) {
+                    animate(0f, 1f, animationSpec = ExpressiveMotion.effects()) { v, _ -> pb.commitProgress = v }
+                    val dismissed = pb.topEntryId
+                    pb.dismissedEntryId = dismissed
+                    child.onBackPressed()
+                    pb.awaitSettleFrames()
+                    pb.reset()
+                    // Safety net: if nothing popped (should not happen), never leave the page hidden.
+                    backScope.launch {
+                        delay(900)
+                        if (dismissed != null && nav.currentBackStackEntry?.id == dismissed) pb.dismissedEntryId = null
+                    }
+                }
+            } catch (e: CancellationException) {
+                if (started && !pb.committing) {
+                    // The handler's own coroutine is cancelled: spring home from a separate scope, then let
+                    // NavHost un-seek (the back stack is untouched).
+                    settle[0] = backScope.launch {
+                        try {
+                            animate(pb.backProgress, 0f, animationSpec = ExpressiveMotion.spatialDefault()) { v, _ -> pb.backProgress = v }
+                        } finally {
+                            if (pb.gestureToken == token && pb.isPredictingBack) {
+                                child.dispatchOnBackCancelled()
+                                backScope.launch { pb.resetAfterFrames(token) }
+                            }
+                        }
+                    }
+                }
+                throw e
+            }
+        }
+    }
+
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val metrics = remember(maxWidth, maxHeight, cfg.smallestScreenWidthDp) {
             LayoutMetrics(
@@ -113,6 +240,7 @@ fun RootScreen(initialRoute: String? = null) {
             "我的" to { on -> Icon(Icons.Filled.Person, null, Modifier.size(20.dp), tint = if (on) IdjThemeColors.text else IdjThemeColors.secondary) },
         )
         val tabRoutes = listOf("home", "tvbox", "category", "profile")
+        val tabShiftPx = with(LocalDensity.current) { 24.dp.roundToPx() }
         /**
          * "home" is the graph's start destination. A non-inclusive `popUpTo(home) { saveState = true }` maps the
          * popped stack (e.g. [search]) onto home's own id, so `navigate("home") { restoreState = true }` restored
@@ -181,28 +309,38 @@ fun RootScreen(initialRoute: String? = null) {
                     )
                 }
                 // NavHost content is drawn INSIDE layerBackdrop(backdrop): never hand it the root backdrop (feedback loop).
-                androidx.compose.runtime.CompositionLocalProvider(LocalRootBackdrop provides null) {
+                androidx.compose.runtime.CompositionLocalProvider(
+                    LocalRootBackdrop provides null,
+                    LocalOnBackPressedDispatcherOwner provides navBackOwner,
+                    LocalPredictiveBackHost provides predictiveBackHost,
+                ) {
                 NavHost(
                     nav,
                     startDestination = "home",
                     modifier = Modifier.weight(1f).fillMaxHeight().then(if (showChromeNav) Modifier.layerBackdrop(backdrop) else Modifier),
-                    // Expressive page switch: crisp alpha (effects spring) + a subtle 0.985 -> 1 spatial spring settle.
+                    // Directional depth: push slides the new page in from +10 % over a receding page, pop reverses
+                    // it, and root tab switches glide 24 dp in the tab-index direction (same axis as the dock
+                    // swipe). While a predictive back gesture runs NavHost only holds both pages composed; the card
+                    // physics are drawn by PredictiveBackScene.
                     enterTransition = {
-                        androidx.compose.animation.fadeIn(ExpressiveMotion.effects()) +
-                            androidx.compose.animation.scaleIn(ExpressiveMotion.spatialDefault(), initialScale = 0.985f)
+                        if (predictiveBack.neutralTransitions) EnterTransition.None
+                        else tabDirection(initialState, targetState)?.let { ExpressiveNav.tabEnter(it, tabShiftPx) } ?: ExpressiveNav.pushEnter()
                     },
-                    exitTransition = { androidx.compose.animation.fadeOut(ExpressiveMotion.effects()) },
+                    exitTransition = {
+                        if (predictiveBack.neutralTransitions) ExitTransition.None
+                        else tabDirection(initialState, targetState)?.let { ExpressiveNav.tabExit(it, tabShiftPx) } ?: ExpressiveNav.pushExit()
+                    },
                     popEnterTransition = {
-                        androidx.compose.animation.fadeIn(ExpressiveMotion.effects()) +
-                            androidx.compose.animation.scaleIn(ExpressiveMotion.spatialDefault(), initialScale = 0.985f)
+                        if (predictiveBack.neutralTransitions) EnterTransition.None
+                        else tabDirection(initialState, targetState)?.let { ExpressiveNav.tabEnter(it, tabShiftPx) } ?: ExpressiveNav.popEnter()
                     },
                     popExitTransition = {
-                        androidx.compose.animation.fadeOut(ExpressiveMotion.effects()) +
-                            androidx.compose.animation.scaleOut(ExpressiveMotion.spatialDefault(), targetScale = 0.985f)
+                        if (predictiveBack.neutralTransitions) ExitTransition.None
+                        else tabDirection(initialState, targetState)?.let { ExpressiveNav.tabExit(it, tabShiftPx) } ?: ExpressiveNav.popExit()
                     },
                 ) {
-                composable("home") { HomeScreen(onOpenDetail = { nav.navigate("detail/$it") }, onSearch = { nav.navigate("search") }, onPlay = { nav.navigate("player/$it/0") }, onOpenManga = { nav.navigate("manga/" + android.net.Uri.encode(it)) }, onImmersiveChanged = { novelImmersive = it }) }
-                composable("tvbox") {
+                screen("home") { HomeScreen(onOpenDetail = { nav.navigate("detail/$it") }, onSearch = { nav.navigate("search") }, onPlay = { nav.navigate("player/$it/0") }, onOpenManga = { nav.navigate("manga/" + android.net.Uri.encode(it)) }, onImmersiveChanged = { novelImmersive = it }) }
+                screen("tvbox") {
                     app.iduanju.tvbox.TVBoxHubScreen(
                         onOpenConfig = { nav.navigate("tvbox/config") },
                         onOpenVodPlayer = { siteKey, sid, title, cover, ep ->
@@ -215,7 +353,7 @@ fun RootScreen(initialRoute: String? = null) {
                         },
                     )
                 }
-                composable("tvbox/config") {
+                screen("tvbox/config") {
                     app.iduanju.tvbox.TVBoxConfigScreen(
                         onBack = { nav.popBackStack() },
                         onOpenLive = { repoId, liveId ->
@@ -223,7 +361,7 @@ fun RootScreen(initialRoute: String? = null) {
                         },
                     )
                 }
-                composable(
+                screen(
                     "tvbox/vod/{siteKey}/{sid}/{ep}?title={title}&cover={cover}",
                     arguments = listOf(
                         navArgument("siteKey") { type = NavType.StringType },
@@ -250,7 +388,7 @@ fun RootScreen(initialRoute: String? = null) {
                         },
                     )
                 }
-                composable(
+                screen(
                     "tvbox/live/{repoId}/{liveId}/{chIdx}",
                     arguments = listOf(
                         navArgument("repoId") { type = NavType.StringType },
@@ -266,22 +404,22 @@ fun RootScreen(initialRoute: String? = null) {
                         onBack = { nav.popBackStack() },
                     )
                 }
-                composable("search") {
+                screen("search") {
                     SearchScreen(
                         onOpenDetail = { nav.navigate("detail/$it") },
                         dockState = searchDockState,
                     )
                 }
-                composable("category") { CategoryScreen(onOpenDetail = { nav.navigate("detail/$it") }) }
-                composable("library/{kind}") { e -> app.iduanju.ui.library.LibraryListScreen(e.arguments!!.getString("kind")!!, onBack = { nav.popBackStack() }, onOpenDetail = { nav.navigate("detail/$it") }) }
-                composable("profile") { ProfileScreen(onOpenDetail = { nav.navigate("detail/$it") }) }
-                composable("hongguo-login") { app.iduanju.ui.profile.HongguoLoginScreen(onBack = { nav.popBackStack() }) }
-                composable("sources") { app.iduanju.ui.profile.SourcesScreen(onBack = { nav.popBackStack() }) }
-                composable("plugins") { app.iduanju.ui.profile.PluginsScreen(onBack = { nav.popBackStack() }) }
-                composable("novel") { app.iduanju.novel.NovelScreen(onBack = { nav.popBackStack() }) }
-                composable("licenses") { app.iduanju.ui.profile.LicensesScreen(onBack = { nav.popBackStack() }) }
-                composable("actorRank") { app.iduanju.ui.profile.ActorRankScreen(onBack = { nav.popBackStack() }) }
-                composable("actor/{id}?name={name}&avatar={avatar}&role={role}&intro={intro}",
+                screen("category") { CategoryScreen(onOpenDetail = { nav.navigate("detail/$it") }) }
+                screen("library/{kind}") { e -> app.iduanju.ui.library.LibraryListScreen(e.arguments!!.getString("kind")!!, onBack = { nav.popBackStack() }, onOpenDetail = { nav.navigate("detail/$it") }) }
+                screen("profile") { ProfileScreen(onOpenDetail = { nav.navigate("detail/$it") }) }
+                screen("hongguo-login") { app.iduanju.ui.profile.HongguoLoginScreen(onBack = { nav.popBackStack() }) }
+                screen("sources") { app.iduanju.ui.profile.SourcesScreen(onBack = { nav.popBackStack() }) }
+                screen("plugins") { app.iduanju.ui.profile.PluginsScreen(onBack = { nav.popBackStack() }) }
+                screen("novel") { app.iduanju.novel.NovelScreen(onBack = { nav.popBackStack() }) }
+                screen("licenses") { app.iduanju.ui.profile.LicensesScreen(onBack = { nav.popBackStack() }) }
+                screen("actorRank") { app.iduanju.ui.profile.ActorRankScreen(onBack = { nav.popBackStack() }) }
+                screen("actor/{id}?name={name}&avatar={avatar}&role={role}&intro={intro}",
                     arguments = listOf("name", "avatar", "role", "intro").map { navArgument(it) { defaultValue = "" } }) { entry ->
                     val args = requireNotNull(entry.arguments)
                     val actor = app.iduanju.core.hongguo.HGCelebrity(requireNotNull(args.getString("id")),
@@ -289,9 +427,9 @@ fun RootScreen(initialRoute: String? = null) {
                         args.getString("role").orEmpty(), args.getString("intro").orEmpty())
                     app.iduanju.ui.profile.ActorProfileScreen(actor, onBack = { nav.popBackStack() }, onOpen = { nav.navigate("detail/$it") })
                 }
-                composable("actorSearch/{name}") { e -> SearchScreen(onOpenDetail = { nav.navigate("detail/$it") }, initialQuery = e.arguments!!.getString("name")!!) }
-                composable("board/{genre}/{sub}") { e -> app.iduanju.ui.category.BoardScreen(app.iduanju.ui.home.BoardSpec(app.iduanju.core.hongguo.HGRankGenre.valueOf(e.arguments!!.getString("genre")!!), app.iduanju.core.hongguo.HGRankSub.valueOf(e.arguments!!.getString("sub")!!)), onBack = { nav.popBackStack() }, onOpenDetail = { nav.navigate("detail/$it") }) }
-                composable("detail/{sid}", arguments = listOf(navArgument("sid") { type = NavType.StringType })) { e ->
+                screen("actorSearch/{name}") { e -> SearchScreen(onOpenDetail = { nav.navigate("detail/$it") }, initialQuery = e.arguments!!.getString("name")!!) }
+                screen("board/{genre}/{sub}") { e -> app.iduanju.ui.category.BoardScreen(app.iduanju.ui.home.BoardSpec(app.iduanju.core.hongguo.HGRankGenre.valueOf(e.arguments!!.getString("genre")!!), app.iduanju.core.hongguo.HGRankSub.valueOf(e.arguments!!.getString("sub")!!)), onBack = { nav.popBackStack() }, onOpenDetail = { nav.navigate("detail/$it") }) }
+                screen("detail/{sid}", arguments = listOf(navArgument("sid") { type = NavType.StringType })) { e ->
                     val sid = e.arguments!!.getString("sid")!!
                     DetailScreen(
                         seriesId = sid,
@@ -300,20 +438,20 @@ fun RootScreen(initialRoute: String? = null) {
                         onOpenSeries = { nav.navigate("detail/$it") },
                     )
                 }
-                composable("manga/{id}") { e -> app.iduanju.manga.MangaDetailScreen(e.arguments!!.getString("id")!!, onBack = { nav.popBackStack() },
+                screen("manga/{id}") { e -> app.iduanju.manga.MangaDetailScreen(e.arguments!!.getString("id")!!, onBack = { nav.popBackStack() },
                         onRead = { id, i, p -> nav.navigate("mangaRead/" + android.net.Uri.encode(id) + "/$i/$p") }) }
-                composable("mangaRead/{id}/{i}/{p}", arguments = listOf(navArgument("i") { type = NavType.IntType }, navArgument("p") { type = NavType.IntType })) { e ->
+                screen("mangaRead/{id}/{i}/{p}", arguments = listOf(navArgument("i") { type = NavType.IntType }, navArgument("p") { type = NavType.IntType })) { e ->
                     app.iduanju.manga.MangaReaderScreen(e.arguments!!.getString("id")!!, e.arguments!!.getInt("i"), e.arguments!!.getInt("p"), onBack = { nav.popBackStack() }) }
-                composable(
+                screen(
                     "player/{sid}/{ep}",
                     arguments = listOf(
                         navArgument("sid") { type = NavType.StringType },
                         navArgument("ep") { type = NavType.IntType },
                     ),
-                    enterTransition = { androidx.compose.animation.fadeIn(androidx.compose.animation.core.tween(180)) },
-                    exitTransition = { androidx.compose.animation.fadeOut(androidx.compose.animation.core.tween(160)) },
-                    popEnterTransition = { androidx.compose.animation.fadeIn(androidx.compose.animation.core.tween(180)) },
-                    popExitTransition = { androidx.compose.animation.fadeOut(androidx.compose.animation.core.tween(160)) },
+                    enterTransition = { if (predictiveBack.neutralTransitions) EnterTransition.None else androidx.compose.animation.fadeIn(androidx.compose.animation.core.tween(180)) },
+                    exitTransition = { if (predictiveBack.neutralTransitions) ExitTransition.None else androidx.compose.animation.fadeOut(androidx.compose.animation.core.tween(160)) },
+                    popEnterTransition = { if (predictiveBack.neutralTransitions) EnterTransition.None else androidx.compose.animation.fadeIn(androidx.compose.animation.core.tween(180)) },
+                    popExitTransition = { if (predictiveBack.neutralTransitions) ExitTransition.None else androidx.compose.animation.fadeOut(androidx.compose.animation.core.tween(160)) },
                 ) { e ->
                     PlayerScreen(
                         seriesId = e.arguments!!.getString("sid")!!,
@@ -362,7 +500,7 @@ private val DockPillShape = RoundedCornerShape(percent = 50)
  * sliding glass indicator pill, haptic ticks on slot boundaries, and morphing search dock.
  *
  * Expressive touches: the indicator follows the finger on [ExpressiveMotion.spatialFast] with a subtle jelly
- * stretch, and a high-contrast label bubble floats above the hovered tab while scrubbing (or briefly after a tap).
+ * stretch, and every tab dips with a crisp tactile press scale.
  */
 @Composable
 private fun SwipeableGlassTabBar(
@@ -418,22 +556,6 @@ private fun SwipeableGlassTabBar(
     )
     // Jelly: the pill stretches horizontally (and slims a touch) while it lags behind its target.
     val stretch = (kotlin.math.abs(indicatorTarget - indicatorFraction) * 0.22f).coerceAtMost(0.16f)
-
-    // Floating label bubble: visible while scrubbing, or for a short beat after a tap / long-press.
-    var peekIdx by remember { mutableIntStateOf(-1) }
-    var peekTick by remember { mutableIntStateOf(0) }
-    LaunchedEffect(peekTick) {
-        if (peekTick > 0) {
-            kotlinx.coroutines.delay(900)
-            peekIdx = -1
-        }
-    }
-    val bubbleIdx = if (isDragging) hoveredIdx else peekIdx
-    val bubbleVisible = bubbleIdx >= 0 && !searchSelected && morph < 0.05f
-    var bubbleLabelIdx by remember { mutableIntStateOf(selected) }
-    if (bubbleIdx >= 0) bubbleLabelIdx = bubbleIdx
-    val bubbleX by animateFloatAsState(bubbleLabelIdx.toFloat(), ExpressiveMotion.spatialFast(), label = "dockBubbleX")
-    val bubbleShow by animateFloatAsState(if (bubbleVisible) 1f else 0f, ExpressiveMotion.spatialFast(), label = "dockBubble")
 
     Box(modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
         BoxWithConstraints(
@@ -547,20 +669,10 @@ private fun SwipeableGlassTabBar(
                                         Modifier
                                             .weight(1f)
                                             .height(48.dp)
+                                            .expressivePress(0.92f, enabled = !isDragging)
                                             .clip(DockPillShape)
                                             .pointerInput(i) {
-                                                detectTapGestures(
-                                                    onLongPress = {
-                                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                                        peekIdx = i
-                                                        peekTick++
-                                                    },
-                                                    onTap = {
-                                                        peekIdx = i
-                                                        peekTick++
-                                                        latestOnSelect(i)
-                                                    },
-                                                )
+                                                detectTapGestures(onTap = { latestOnSelect(i) })
                                             }
                                             .semantics {
                                                 role = androidx.compose.ui.semantics.Role.Tab
@@ -658,41 +770,175 @@ private fun SwipeableGlassTabBar(
                     }
                 }
             }
+        }
+    }
+}
 
-            // Label bubble above the hovered tab: tracks its slot centre on spatialFast, pops with scale + alpha.
-            if (bubbleShow > 0.01f && items.isNotEmpty()) {
-                val count = items.size
-                val slotW = (expandedW - 10.dp) / count
-                val bubbleLabel = items.getOrNull(bubbleLabelIdx.coerceIn(0, count - 1))?.first.orEmpty()
-                Box(
-                    Modifier
-                        .align(Alignment.TopStart)
-                        .layout { measurable, constraints ->
-                            val p = measurable.measure(constraints.copy(minWidth = 0, minHeight = 0))
-                            val cx = (5.dp + slotW * (bubbleX + 0.5f)).roundToPx()
-                            layout(0, 0) { p.placeRelative(cx - p.width / 2, -p.height - 8.dp.roundToPx()) }
-                        }
-                        .graphicsLayer {
-                            val k = bubbleShow
-                            alpha = k.coerceIn(0f, 1f)
-                            scaleX = 0.7f + 0.3f * k
-                            scaleY = 0.7f + 0.3f * k
-                            translationY = (1f - k) * 6.dp.toPx()
-                            transformOrigin = TransformOrigin(0.5f, 1f)
-                        }
-                        .clip(DockPillShape)
-                        .background(if (c.dark) Color(0xFFF4F2EC) else Color(0xFF181817))
-                        .padding(horizontal = 14.dp, vertical = 6.dp),
-                ) {
-                    Text(
-                        bubbleLabel,
-                        color = if (c.dark) Color(0xFF181817) else Color.White,
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 1,
-                    )
+// MARK: navigation motion + native predictive back
+
+/** Order of the root destinations along the dock (search sits right of the tabs). */
+private val RootTabOrder = mapOf("home" to 0, "tvbox" to 1, "category" to 2, "profile" to 3, "search" to 4)
+
+/** +1 / -1 when both ends are root tabs (a tab switch, even when it is technically a pop), else null (push / pop). */
+private fun tabDirection(from: NavBackStackEntry, to: NavBackStackEntry): Int? {
+    val a = RootTabOrder[from.destination.route] ?: return null
+    val b = RootTabOrder[to.destination.route] ?: return null
+    return if (b >= a) 1 else -1
+}
+
+/**
+ * Live state of an in-flight system back swipe on the navigation stack.
+ *
+ * [backProgress] 0..1 (springs back below 0 slightly on cancel), [backSwipeEdge] is [androidx.activity.BackEventCompat.EDGE_LEFT]
+ * or `EDGE_RIGHT`, [backTouchY] the finger's live Y, [isPredictingBack] true while both pages are shown.
+ */
+@Stable
+internal class PredictiveBackState {
+    var backProgress by mutableFloatStateOf(0f)
+    var backSwipeEdge by mutableIntStateOf(androidx.activity.BackEventCompat.EDGE_LEFT)
+    var backTouchY by mutableFloatStateOf(0f)
+    var backStartTouchY by mutableFloatStateOf(0f)
+    var isPredictingBack by mutableStateOf(false)
+    /** 0..1 exit of the released card before the route pops underneath it. */
+    var commitProgress by mutableFloatStateOf(0f)
+    /** NavHost transitions resolve to None while set: the pages are only held, never animated by NavHost. */
+    var neutralTransitions by mutableStateOf(false)
+    var committing by mutableStateOf(false)
+    var topEntryId by mutableStateOf<String?>(null)
+    var previousEntryId by mutableStateOf<String?>(null)
+    /** The entry a committed swipe popped: stays invisible until NavHost disposes it. */
+    var dismissedEntryId by mutableStateOf<String?>(null)
+    var gestureToken = 0
+
+    fun reset() {
+        isPredictingBack = false
+        neutralTransitions = false
+        committing = false
+        backProgress = 0f
+        commitProgress = 0f
+        topEntryId = null
+        previousEntryId = null
+    }
+
+    /** NavHost pops / un-seeks a frame or two after the dispatch; keep the neutral transitions until it has. */
+    suspend fun awaitSettleFrames() = repeat(4) { androidx.compose.runtime.withFrameNanos { } }
+
+    suspend fun resetAfterFrames(token: Int) {
+        awaitSettleFrames()
+        if (gestureToken == token) reset()
+    }
+}
+
+internal class PredictiveBackHost(val state: PredictiveBackState, val realOwner: OnBackPressedDispatcherOwner?)
+
+internal val LocalPredictiveBackHost = androidx.compose.runtime.staticCompositionLocalOf<PredictiveBackHost?> { null }
+
+/** NavHost's private dispatcher: only receives the gestures RootScreen forwards to it. */
+private class ChildBackDispatcherOwner(private val host: LifecycleOwner) : OnBackPressedDispatcherOwner {
+    override val onBackPressedDispatcher = OnBackPressedDispatcher()
+    override val lifecycle: Lifecycle get() = host.lifecycle
+}
+
+/** Keeps RootScreen's back callback registered once, at the bottom of the activity's callback stack. */
+private class AlwaysResumedLifecycleOwner : LifecycleOwner {
+    private val registry = LifecycleRegistry(this).apply { currentState = Lifecycle.State.RESUMED }
+    override val lifecycle: Lifecycle get() = registry
+}
+
+/** [composable] whose content is wrapped in [PredictiveBackScene]. */
+private fun NavGraphBuilder.screen(
+    route: String,
+    arguments: List<NamedNavArgument> = emptyList(),
+    enterTransition: (AnimatedContentTransitionScope<NavBackStackEntry>.() -> EnterTransition?)? = null,
+    exitTransition: (AnimatedContentTransitionScope<NavBackStackEntry>.() -> ExitTransition?)? = null,
+    popEnterTransition: (AnimatedContentTransitionScope<NavBackStackEntry>.() -> EnterTransition?)? = enterTransition,
+    popExitTransition: (AnimatedContentTransitionScope<NavBackStackEntry>.() -> ExitTransition?)? = exitTransition,
+    sizeTransform: (AnimatedContentTransitionScope<NavBackStackEntry>.() -> SizeTransform?)? = null,
+    content: @Composable AnimatedContentScope.(NavBackStackEntry) -> Unit,
+) = composable(
+    route = route,
+    arguments = arguments,
+    enterTransition = enterTransition,
+    exitTransition = exitTransition,
+    popEnterTransition = popEnterTransition,
+    popExitTransition = popExitTransition,
+    sizeTransform = sizeTransform,
+) { entry ->
+    val scope = this
+    PredictiveBackScene(entry) { scope.content(entry) }
+}
+
+/**
+ * One destination of the stack. During a predictive back swipe the top page becomes a shrinking, rounded, shadowed
+ * card (1.0 -> 0.88, 0 -> 32 dp corners, 28 dp drift away from the swipe edge, a subtle tilt following the finger)
+ * while the previous page underneath rises 0.95 -> 1.0 and its 22 % scrim lifts. Everything is read in the layer /
+ * draw phase, so a swipe never recomposes the pages. The screen gets the real activity dispatcher back, so its own
+ * BackHandlers (open panels, players, readers) take precedence over the stack pop.
+ */
+@Composable
+private fun PredictiveBackScene(entry: NavBackStackEntry, content: @Composable () -> Unit) {
+    val host = LocalPredictiveBackHost.current
+    if (host == null) { content(); return }
+    val pb = host.state
+    val id = entry.id
+    val bg = IdjThemeColors.bg
+    Box(
+        Modifier
+            .fillMaxSize()
+            .graphicsLayer {
+                val dismissed = pb.dismissedEntryId == id
+                val isTop = dismissed || (pb.isPredictingBack && pb.topEntryId == id)
+                val isPrev = !dismissed && pb.isPredictingBack && pb.previousEntryId == id
+                if (dismissed && !pb.committing) {
+                    alpha = 0f
+                } else if (isTop) {
+                    val p = pb.backProgress
+                    val pc = p.coerceIn(0f, 1f)
+                    val k = pb.commitProgress.coerceIn(0f, 1f)
+                    val dir = if (pb.backSwipeEdge == androidx.activity.BackEventCompat.EDGE_LEFT) 1f else -1f
+                    val s = 1f - p * 0.12f - k * 0.06f
+                    scaleX = s
+                    scaleY = s
+                    translationX = dir * (p * 28.dp.toPx() + k * 40.dp.toPx())
+                    // Vertical follow: the card leans toward the finger, capped at (height / 20 - 8 dp).
+                    val maxShift = (size.height / 20f - 8.dp.toPx()).coerceAtLeast(0f)
+                    val follow = ((pb.backTouchY - pb.backStartTouchY) * 0.16f).coerceIn(-maxShift, maxShift) *
+                        (pc * 4f).coerceAtMost(1f)
+                    translationY = follow
+                    if (maxShift > 0f) rotationX = -(follow / maxShift) * 1.6f
+                    cameraDistance = 14f * density
+                    alpha = 1f - k
+                    shape = RoundedCornerShape((pc * 32f + k * 4f).dp)
+                    clip = pc > 0.001f || k > 0f
+                    shadowElevation = (pc / 0.3f).coerceAtMost(1f) * 18.dp.toPx() * (1f - k)
+                    ambientShadowColor = Color.Black
+                    spotShadowColor = Color.Black
+                } else if (isPrev) {
+                    val pc = pb.backProgress.coerceIn(0f, 1f)
+                    val k = pb.commitProgress.coerceIn(0f, 1f)
+                    val s = 0.95f + pc * 0.05f
+                    val settled = s + (1f - s) * k
+                    scaleX = settled
+                    scaleY = settled
                 }
             }
+            .drawWithContent {
+                val isTop = pb.dismissedEntryId == id || (pb.isPredictingBack && pb.topEntryId == id)
+                val isPrev = pb.dismissedEntryId != id && pb.isPredictingBack && pb.previousEntryId == id
+                // Pages are transparent over the window ground: the floating card carries its own page colour.
+                if (isTop) drawRect(bg)
+                drawContent()
+                if (isPrev) {
+                    val scrim = (1f - pb.backProgress.coerceIn(0f, 1f)) * 0.22f * (1f - pb.commitProgress.coerceIn(0f, 1f))
+                    if (scrim > 0.001f) drawRect(Color.Black.copy(alpha = scrim))
+                }
+            },
+    ) {
+        val owner = host.realOwner
+        if (owner != null) {
+            androidx.compose.runtime.CompositionLocalProvider(LocalOnBackPressedDispatcherOwner provides owner) { content() }
+        } else {
+            content()
         }
     }
 }

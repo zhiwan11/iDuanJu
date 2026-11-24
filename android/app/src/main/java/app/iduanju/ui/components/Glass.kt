@@ -267,7 +267,7 @@ fun Modifier.glassSurface(
 }
 
 /**
- * `极简质感` surface: solid warm paper (#F2F0E8) / charcoal (#242321) fill, a crisp hairline and a soft low shadow —
+ * `极简质感` surface: crisp white (#FFFFFF) / raised charcoal (#20201F) fill, a delicate 0.5 dp hairline and a soft low shadow —
  * no backdrop sampling, blur or haze. Forced-dark chrome over video stays 96 % opaque.
  */
 private fun Modifier.expressiveSurface(shape: CornerBasedShape, dark: Boolean, shadowRadius: Dp, activeOverlay: Color): Modifier {
@@ -277,7 +277,7 @@ private fun Modifier.expressiveSurface(shape: CornerBasedShape, dark: Boolean, s
         .clip(shape)
         .background(ExpressivePalette.surface(dark).copy(alpha = if (dark) 0.96f else 1f))
         .then(if (activeOverlay.alpha > 0f) Modifier.background(activeOverlay) else Modifier)
-        .border(0.8.dp, ExpressivePalette.hairline(dark), shape)
+        .border(0.5.dp, ExpressivePalette.hairline(dark), shape)
 }
 
 /**
@@ -319,17 +319,17 @@ fun Modifier.glassPill(
     val liquid = GlassStylePref.style == GlassStyle.LIQUID
     if (GlassStylePref.style == GlassStyle.EXPRESSIVE) {
         val fill = when {
-            selected && neutralSelected -> if (dark) Color(0xFF3A3936) else Color(0xFFE6E3DA)
+            selected && neutralSelected -> if (dark) Color(0xFF2E2E2C) else Color(0xFFEFEEEA)
             selected -> accent.copy(alpha = if (dark) 0.20f else 0.12f)
-            dark -> Color(0xFF2A2927).copy(alpha = 0.94f)
-            else -> Color(0xFF181817).copy(alpha = 0.04f)
+            dark -> Color(0xFF20201F).copy(alpha = 0.94f)
+            else -> Color(0xFF151515).copy(alpha = 0.04f)
         }
         val line = when {
             selected && !neutralSelected -> accent.copy(alpha = 0.50f)
             selected -> Color.Transparent
             else -> ExpressivePalette.hairline(dark)
         }
-        return this.clip(shape).background(fill).border(0.8.dp, line, shape)
+        return this.clip(shape).background(fill).border(0.5.dp, line, shape)
     }
     return if (liquid) {
         val k = liquidFillScale(GlassStylePref.strength)

@@ -22,12 +22,18 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.foundation.border
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import app.iduanju.ui.components.ExpressivePalette
+import app.iduanju.ui.components.GlassStyle
+import app.iduanju.ui.components.GlassStylePref
+import app.iduanju.ui.components.expressivePress
 import app.iduanju.ui.theme.IdjThemeColors
 
 /** Shared building blocks for 我的 / 片源管理 / 插件 — iOS grouped rows (ProfileView.link, SourcesView.group). */
@@ -56,7 +62,18 @@ internal fun Group(title: String? = null, footer: String? = null, rows: @Composa
     val c = IdjThemeColors
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         title?.let { Text(it, color = c.secondary, fontSize = 13.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(start = 4.dp)) }
-        Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(c.surface), content = rows)
+        if (GlassStylePref.style == GlassStyle.EXPRESSIVE) {
+            // `极简质感`: crisp elevated editorial card — 20 dp corners, white / charcoal fill, 0.5 dp hairline.
+            val shape = RoundedCornerShape(20.dp)
+            val sh = ExpressivePalette.shadow(c.dark)
+            Column(
+                Modifier.fillMaxWidth().shadow(if (c.dark) 4.dp else 8.dp, shape, ambientColor = sh, spotColor = sh)
+                    .clip(shape).background(ExpressivePalette.surface(c.dark)).border(0.5.dp, ExpressivePalette.hairline(c.dark), shape),
+                content = rows,
+            )
+        } else {
+            Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(c.surface), content = rows)
+        }
         footer?.let { Text(it, color = c.secondary, fontSize = 12.sp, lineHeight = 17.sp, modifier = Modifier.padding(horizontal = 4.dp)) }
     }
 }
@@ -68,7 +85,7 @@ internal fun RowDivider() = HorizontalDivider(Modifier.padding(start = 52.dp), t
 @Composable
 internal fun LinkRow(title: String, icon: ImageVector?, trailing: String? = null, sub: String? = null, tint: Color? = null, onClick: () -> Unit) {
     val c = IdjThemeColors
-    Row(Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(Modifier.fillMaxWidth().expressivePress(0.97f).clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
         if (icon != null) { Icon(icon, null, tint = tint ?: c.text, modifier = Modifier.size(22.dp)); Spacer(Modifier.width(14.dp)) }
         Column(Modifier.weight(1f)) {
             Text(title, color = tint ?: c.text, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)

@@ -27,6 +27,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBackIos
 import androidx.compose.material.icons.automirrored.filled.Chat
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.filled.VolumeDown
 import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
@@ -1365,6 +1366,14 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                                 if (!on) { countdownOn = false; endedAwaitingNext = false }
                                 seekHint = if (on) "播完连刷推荐：已开启" else "播完连刷推荐：已关闭"
                             },
+                            onOpenDanmaku = { panel = "danmaku" },
+                        )
+                    }
+                    "danmaku" -> {
+                        DanmakuSettingsSheet(
+                            pc = pc,
+                            onDismiss = { panel = null },
+                            onReset = { seekHint = "弹幕设置已重置" },
                         )
                     }
                     else -> {
@@ -1819,6 +1828,7 @@ private fun MoreSettingsPanel(
     autoContinueNextDrama: Boolean = false,
     showAutoContinue: Boolean = false,
     onAutoContinue: (Boolean) -> Unit = {},
+    onOpenDanmaku: () -> Unit = {},
 ) {
     val sleepSubtitle = when {
         sleepMode == -1 -> "定时：播完本集"
@@ -1830,6 +1840,26 @@ private fun MoreSettingsPanel(
     }
     ExpressiveSheetHeader("更多设置", onClose = onClose, subtitle = sleepSubtitle, dark = true)
     Spacer(Modifier.height(14.dp))
+
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .height(46.dp)
+            .clip(RoundedCornerShape(14.dp))
+            .background(Color.White.copy(0.08f))
+            .border(0.8.dp, Color.White.copy(0.10f), RoundedCornerShape(14.dp))
+            .pressClick(0.98f, onClick = onOpenDanmaku)
+            .padding(horizontal = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(Icons.Filled.Subtitles, null, tint = Color.White.copy(0.86f), modifier = Modifier.size(18.dp))
+        Spacer(Modifier.width(10.dp))
+        Text("弹幕设置", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f))
+        Text(DanmakuPrefs.summary(), color = Color.White.copy(0.55f), fontSize = 12.sp)
+        Spacer(Modifier.width(4.dp))
+        Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = Color.White.copy(0.55f), modifier = Modifier.size(18.dp))
+    }
+    Spacer(Modifier.height(12.dp))
 
     MoreOptionRow(
         label = "画面比例",

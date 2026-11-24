@@ -172,7 +172,7 @@ fun DetailScreen(seriesId: String, onBack: () -> Unit, onPlay: (String, Int) -> 
                         if (meta.isNotEmpty()) Text(meta, color = c.secondary, fontSize = 13.sp)
                         // Single primary Play + Favorite CTA for tablet landscape (not duplicated in right column).
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                            PillButton(playTitle, Modifier.weight(1f), icon = Icons.Filled.PlayArrow, tone = PillTone.Play, enabled = dd.episodes.isNotEmpty()) { onPlay(seriesId, startEp) }
+                            PillButton(playTitle, Modifier.weight(1f), icon = Icons.Filled.PlayArrow, tone = PillTone.Play, enabled = dd.episodes.isNotEmpty(), pressScale = 0.95f) { onPlay(seriesId, startEp) }
                             Heart(seriesId, dd, 48.dp)
                         }
                     }
@@ -273,6 +273,7 @@ fun DetailScreen(seriesId: String, onBack: () -> Unit, onPlay: (String, Int) -> 
                     // over the hero: dark glass + white glyph; pinned / tablet: theme glass
                     GlassIconButton(
                         Icons.AutoMirrored.Rounded.ArrowBackIos, "返回",
+                        modifier = Modifier.expressivePress(0.95f),
                         backdrop = pageBackdrop, size = 36.dp, iconSize = 18.dp,
                         dark = if (onHero) true else c.dark, fallbackAlpha = if (onHero) 0.30f else 0.70f,
                         onClick = onBack,
@@ -283,7 +284,7 @@ fun DetailScreen(seriesId: String, onBack: () -> Unit, onPlay: (String, Int) -> 
         AnimatedVisibility(!isTabletLayout && d?.episodes?.isNotEmpty() == true && actionsOut, Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(horizontal = 16.dp).padding(bottom = 4.dp),
             enter = slideInVertically(DS.panel()) { it } + fadeIn(), exit = slideOutVertically(DS.panel()) { it } + fadeOut()) {
             Row(Modifier.fillMaxWidth().glassSurface(RoundedCornerShape(32.dp), backdrop = pageBackdrop, shadowRadius = 20.dp).padding(8.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                PillButton(playTitle, Modifier.weight(1f), icon = Icons.Filled.PlayArrow, tone = PillTone.Play) { onPlay(seriesId, startEp) }
+                PillButton(playTitle, Modifier.weight(1f), icon = Icons.Filled.PlayArrow, tone = PillTone.Play, pressScale = 0.95f) { onPlay(seriesId, startEp) }
                 d?.let { Heart(seriesId, it, 48.dp) }
             }
         }
@@ -334,7 +335,7 @@ private fun Heart(sid: String, d: HGSeriesDetail, size: androidx.compose.ui.unit
     val lib = IdjApp.instance.library
     val fav = lib.isFavorite(sid)
     val s by animateFloatAsState(if (fav) 1f else 0.9f, DS.press(), label = "heart")
-    Box(Modifier.size(size).clip(CircleShape).background(c.glass).border(1.dp, c.hairline, CircleShape)
+    Box(Modifier.size(size).expressivePress(0.95f).clip(CircleShape).background(c.glass).border(1.dp, c.hairline, CircleShape)
         .pressClick(label = if (fav) "取消收藏" else "收藏") { lib.toggleFavorite(sid, d.title, d.cover) }, contentAlignment = Alignment.Center) {
         Icon(if (fav) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder, null, Modifier.size(22.dp).scale(s / 0.95f), tint = if (fav) c.accent else c.text)
     }
@@ -543,6 +544,7 @@ private fun TabletPortraitHero(
                         tone = PillTone.Play,
                         height = 50.dp,
                         enabled = d.episodes.isNotEmpty(),
+                        pressScale = 0.95f,
                     ) { onPlay(sid, startEp) }
                     Heart(sid, d, 50.dp)
                 }
@@ -580,7 +582,7 @@ private fun DetailBody(
     if (showActions) {
         Row(Modifier.padding(horizontal = 20.dp).padding(top = 16.dp).onGloballyPositioned { onActions(it.boundsInRoot().bottom) },
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            PillButton(playTitle, Modifier.weight(1f), icon = Icons.Filled.PlayArrow, tone = PillTone.Play, height = 50.dp, enabled = d.episodes.isNotEmpty()) { onPlay(sid, startEp) }
+            PillButton(playTitle, Modifier.weight(1f), icon = Icons.Filled.PlayArrow, tone = PillTone.Play, height = 50.dp, enabled = d.episodes.isNotEmpty(), pressScale = 0.95f) { onPlay(sid, startEp) }
             Heart(sid, d, 50.dp)
         }
     }
@@ -662,6 +664,7 @@ private fun EpisodeSection(
                                 Modifier
                                     .weight(1f)
                                     .height(44.dp)
+                                    .expressivePress(0.95f)
                                     .clip(RoundedCornerShape(12.dp))
                                     .background(if (cur) c.accentSoft else c.glass)
                                     .then(if (cur) Modifier.border(1.dp, c.accentLine, RoundedCornerShape(12.dp)) else Modifier)

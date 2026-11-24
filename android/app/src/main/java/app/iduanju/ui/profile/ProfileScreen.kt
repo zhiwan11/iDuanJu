@@ -25,6 +25,7 @@ import app.iduanju.ui.LocalNavigate
 import app.iduanju.ui.components.ExpressiveSlider
 import app.iduanju.ui.components.ExpressiveStatusPill
 import app.iduanju.ui.components.LocalLayoutMetrics
+import app.iduanju.ui.components.expressivePress
 import app.iduanju.ui.theme.IdjThemeColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -68,7 +69,7 @@ fun ProfileScreen(onOpenDetail: (String) -> Unit = {}) {
                 favs.chunked(3).forEach { row ->
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         row.forEach { (sid, v) ->
-                            Column(Modifier.weight(1f).clickable { onOpenDetail(sid) }, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Column(Modifier.weight(1f).expressivePress(0.97f).clickable { onOpenDetail(sid) }, verticalArrangement = Arrangement.spacedBy(6.dp)) {
                                 Box(Modifier.fillMaxWidth().aspectRatio(0.75f).clip(RoundedCornerShape(10.dp)).background(c.elevated)) {
                                     coil.compose.AsyncImage(v.second, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
                                 }
@@ -87,7 +88,7 @@ fun ProfileScreen(onOpenDetail: (String) -> Unit = {}) {
                     LinkRow("登录红果账号", ProfileIcons.key, sub = "使用红果 App 扫码登录，看剧进度同步到红果", trailing = "去登录") { go("hongguo-login") }
                 } else {
                     Row(
-                        Modifier.fillMaxWidth().clickable { confirmLogout = true }.padding(horizontal = 14.dp, vertical = 14.dp),
+                        Modifier.fillMaxWidth().expressivePress(0.97f).clickable { confirmLogout = true }.padding(horizontal = 14.dp, vertical = 14.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Box(
@@ -133,6 +134,7 @@ fun ProfileScreen(onOpenDetail: (String) -> Unit = {}) {
                         selected = app.iduanju.ui.components.GlassStylePref.style,
                         label = { it.label },
                         onSelect = { app.iduanju.ui.components.GlassStylePref.update(it) },
+                        modifier = Modifier.expressivePress(0.97f),
                     )
                     if (app.iduanju.ui.components.GlassStylePref.style == app.iduanju.ui.components.GlassStyle.LIQUID) {
                         val strength = app.iduanju.ui.components.GlassStylePref.strength

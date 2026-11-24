@@ -1,6 +1,10 @@
 package app.iduanju.ui.components
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.SpringSpec
 import androidx.compose.animation.core.animateFloatAsState
@@ -74,6 +78,45 @@ object ExpressiveMotion {
     fun <T> spatialDefault(): SpringSpec<T> = spring(dampingRatio = 0.78f, stiffness = 320f)
     fun <T> spatialSlow(): SpringSpec<T> = spring(dampingRatio = 0.82f, stiffness = 240f)
     fun <T> effects(): SpringSpec<T> = spring(dampingRatio = 1.0f, stiffness = 900f)
+    /** Slower overshoot-free fade for the page that recedes underneath (reads as a dim, not a cut). */
+    fun <T> recede(): SpringSpec<T> = spring(dampingRatio = 1.0f, stiffness = 420f)
+}
+
+/**
+ * Directional depth-push navigation transitions.
+ *
+ * - push: the new page slides in from +10 % width and scales 0.96 -> 1 with a crisp fade, while the old page recedes
+ *   (1 -> 0.96, -4 % drift, dimming fade);
+ * - pop: the top page slides back out to +10 % and scales to 0.95 while fading, the previous page rises 0.96 -> 1;
+ * - tab switch: a subtle ±24 dp glide in the tab-index direction on [ExpressiveMotion.spatialFast].
+ */
+object ExpressiveNav {
+    fun pushEnter(): EnterTransition =
+        slideInHorizontally(ExpressiveMotion.spatialDefault()) { it / 10 } +
+            scaleIn(ExpressiveMotion.spatialDefault(), initialScale = 0.96f) +
+            fadeIn(ExpressiveMotion.effects())
+
+    fun pushExit(): ExitTransition =
+        slideOutHorizontally(ExpressiveMotion.spatialDefault()) { -it / 25 } +
+            scaleOut(ExpressiveMotion.spatialDefault(), targetScale = 0.96f) +
+            fadeOut(ExpressiveMotion.recede())
+
+    fun popEnter(): EnterTransition =
+        slideInHorizontally(ExpressiveMotion.spatialDefault()) { -it / 25 } +
+            scaleIn(ExpressiveMotion.spatialDefault(), initialScale = 0.96f) +
+            fadeIn(ExpressiveMotion.effects())
+
+    fun popExit(): ExitTransition =
+        slideOutHorizontally(ExpressiveMotion.spatialDefault()) { it / 10 } +
+            scaleOut(ExpressiveMotion.spatialDefault(), targetScale = 0.95f) +
+            fadeOut(ExpressiveMotion.effects())
+
+    /** [direction] +1 when moving to a tab on the right, -1 to the left; [shiftPx] is 24 dp in px. */
+    fun tabEnter(direction: Int, shiftPx: Int): EnterTransition =
+        slideInHorizontally(ExpressiveMotion.spatialFast()) { direction * shiftPx } + fadeIn(ExpressiveMotion.effects())
+
+    fun tabExit(direction: Int, shiftPx: Int): ExitTransition =
+        slideOutHorizontally(ExpressiveMotion.spatialFast()) { -direction * shiftPx } + fadeOut(ExpressiveMotion.effects())
 }
 
 /**
