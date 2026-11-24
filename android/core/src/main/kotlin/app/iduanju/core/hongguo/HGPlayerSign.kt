@@ -178,7 +178,9 @@ object HGPlayerSign {
     }
 
     // helios
-    fun helios(khronos: UInt, random: UInt): String {
+    fun helios(khronos: UInt, random: UInt): String = helios(khronos, random, channelID)
+
+    internal fun helios(khronos: UInt, random: UInt, license: String): String {
         val ascii = hexStr(md5(le32(random) + appID.toByteArray())).toByteArray()
         val words = (0 until 4).map { rdLE64(ascii, it * 8) }
         val table = ArrayList<ULong>(); table.add(words[0])
@@ -192,7 +194,7 @@ object HGPlayerSign {
             table.add(x8)
             b0 = x8; b8 = queue.removeFirst()
         }
-        val text = "$khronos-$channelID-$appID".toByteArray()
+        val text = "$khronos-$license-$appID".toByteArray()
         val fill = (16 - (text.size % 16)).toByte()
         val size = ((text.size + 1 + 15) / 16) * 16
         val padded = ByteArray(size) { fill }; for (i in text.indices) padded[i] = text[i]
@@ -276,8 +278,12 @@ object HGPlayerSign {
         return s.toUIntArray()
     }
 
-    fun branch0F13(qs: ByteArray, bm: ByteArray, ts: ByteArray, khronos: UInt, ivV0: UInt): ByteArray {
-        val ivV1 = b0IV[minOf(ivV0.toInt(), b0IV.size - 1)]
+    fun branch0F13(qs: ByteArray, bm: ByteArray, ts: ByteArray, khronos: UInt, ivV0: UInt): ByteArray =
+        branch0F13(qs, bm, ts, khronos, b0IV[minOf(ivV0.toInt(), b0IV.size - 1)], b0Rounds[ivV0.toInt()], 0u)
+
+    internal fun branch0F13(
+        qs: ByteArray, bm: ByteArray, ts: ByteArray, khronos: UInt, ivV1: UInt, rounds: UIntArray, digestMask: UInt,
+    ): ByteArray {
         val countV1 = (ivV1 + khronos + 1u) and 255u
         val countV2 = ivV1 + khronos
         val tt = UIntArray(b0TT.size) { ror32(b0TT[it], countV1) }
@@ -288,11 +294,12 @@ object HGPlayerSign {
         val data = qs + bm + ts + pad + hexBytes("00000000000001a0")
         val di = expandWords(data)
         val ini = UIntArray(b0Init.size) { ror32(b0Init[it], countV2 and 31u) }
-        val d = mixRounds(ini, b0Rounds[ivV0.toInt()], di, tt, ivV1)
+        val d = mixRounds(ini, rounds, di, tt, ivV1)
         val ret = ByteArray(32)
         for (i in 0 until 8) be32(d[i] + ini[i]).copyInto(ret, i * 4)
         for (i in 0 until 16) ret[i] = (ret.u(i) xor ret.u(16 + i)).toByte()
-        return ret.copyOfRange(0, 16) + le32(sumMD5(ret.copyOfRange(0, 16)))
+        val folded = ret.copyOfRange(0, 16)
+        return folded + le32(sumMD5(folded) or digestMask)
     }
 
     fun md5V3Step(kind: UInt, a: UInt, b: UInt, c: UInt, d: UInt, m: UInt, sh: UInt, k: UInt): UInt {

@@ -5,12 +5,15 @@ import app.iduanju.core.util.GoURL
 import app.iduanju.core.util.J
 import app.iduanju.core.util.ProviderException
 import app.iduanju.core.util.u
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import org.json.JSONObject
 import java.io.File
+import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Proxy
 import java.security.MessageDigest
@@ -63,6 +66,8 @@ class HongguoClient(
         const val URL_RANK_CELL = "https://api5-normal-sinfonlinec.fqnovel.com/reading/bookapi/bookmall/cell/change/v:version/?"
         internal const val URL_PLAN = "https://api5-normal-sinfonlineb.fqnovel.com/reading/bookapi/plan/v?"
         private const val URL_VIDEO_MODEL = "https://api5-normal-sinfonlineb.fqnovel.com/novel/player/video_model/v1/"
+        private const val URL_PRELOAD = "https://reading.snssdk.com/novel/player/multi_video_model/preload/v1"
+        private const val MODEL_LIMIT = 2 * 1024 * 1024L
         private const val VIDEO_MODEL_UA =
             "com.phoenix.read/73532 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)"
         private const val PURE_HOST = "api5-normal-sinfonlinea.fqnovel.com"
@@ -566,6 +571,20 @@ class HongguoClient(
         for (attempt in 0 until 3) {
             val identity = purePlayerIds()
             try {
+                val preload = resolvePreload(vid, identity)
+                if (preload.streams.isNotEmpty()) {
+                    lastPureRoute = if (hasPureOverride()) "override-preload-v5" else "registered-preload-v5"
+                    return preload
+                }
+                System.err.println("[HG] resolvePreload: ${preload.err}")
+            } catch (e: IOException) {
+                System.err.println("[HG] resolvePreload transport: ${e.javaClass.simpleName}")
+            } catch (e: ProviderException) {
+                System.err.println("[HG] resolvePreload: ${e.message}")
+            } catch (_: PlayerEmptyBody) {
+                System.err.println("[HG] resolvePreload HTTP 200 empty bytes=0")
+            }
+            try {
                 for (level in listOf(3, 4)) {
                     var result: HGResolvedVideo? = null
                     try { result = resolvePure(vid, level, identity) }
@@ -586,6 +605,47 @@ class HongguoClient(
             }
         }
         throw ProviderException.upstream("没有可用播放流")
+    }
+
+    private fun resolvePreload(vid: String, identity: HGOneShotDevice.Identity): HGResolvedVideo {
+        val values = linkedMapOf(
+            "aid" to "8662", "app_name" to "novelread", "version_code" to "74532", "version_name" to "7.4.5.32",
+            "update_version_code" to "74532", "manifest_version_code" to "74532", "os" to "android", "ssmix" to "a",
+            "channel" to "update_64", "device_platform" to "android", "device_type" to "25053RT47C", "device_brand" to "Redmi",
+            "os_version" to "16", "os_api" to "36", "ac" to "wifi", "language" to "zh", "host_abi" to "arm64-v8a",
+            "iid" to identity.iid, "cdid" to identity.cdid, "device_id" to identity.did,
+        )
+        val payload = JSONObject()
+            .put("biz_param", JSONObject("""{"detail_page_version":0,"device_level":2,"disable_digg_stat":false,"disable_video_relate_book":false,"need_all_video_definition":true,"need_mp4_align":false,"use_os_player":false,"use_server_dns":false,"video_platform":1024}"""))
+            .put("mixed_video_id_map", JSONObject(mapOf("1004" to listOf(vid))))
+            .put("dr_scene", "preload")
+        val compressed = ByteArrayOutputStream()
+        GZIPOutputStream(compressed).use { it.write(payload.toString().toByteArray()) }
+        val body = compressed.toByteArray()
+        val (query, headers) = HGPlaybackV5.sign(values, body, nowMs())
+        val request = Request.Builder().url("$URL_PRELOAD?$query")
+            .post(body.toRequestBody("application/json; charset=utf-8".toMediaType()))
+            .header("User-Agent", System.getProperty("http.agent", "okhttp/4.12.0"))
+            .header("Accept", "application/json").header("Content-Encoding", "gzip")
+            .apply { headers.forEach { (name, value) -> header(name, value) } }.build()
+        val root = playerHttp.newCall(request).execute().use { readPlaybackModel(it, "preload") }
+        val data = J.dict(root.opt("data"))
+        val entries = data.optJSONObject("1004") ?: data
+        val model = videoModelJSON(entries.optJSONObject(vid)?.opt("video_model"))
+            ?: throw ProviderException.upstream("preload 缺少请求的分集")
+        return materialize(model, vid)
+    }
+
+    private fun readPlaybackModel(response: Response, route: String): JSONObject {
+        if (!response.isSuccessful) throw ProviderException.upstream("$route HTTP ${response.code}")
+        val source = response.body?.source() ?: throw PlayerEmptyBody()
+        if (source.request(MODEL_LIMIT + 1)) throw ProviderException.upstream("$route 响应过大")
+        val text = source.readUtf8()
+        if (text.isBlank()) throw PlayerEmptyBody()
+        val root = J.parse(text)
+        val code = root.opt("Code") ?: root.opt("code") ?: J.dict(root.opt("BaseResp")).opt("StatusCode")
+        if (code != null && J.str(code) != "0") throw ProviderException.upstream("$route code=${J.str(code)}")
+        return root
     }
 
     /** Pure video_model level 3 then 4; an empty body means the device is rejected, so stop there. (result, softRejected) */
@@ -876,18 +936,38 @@ class HongguoClient(
     }
 
     fun materialize(vm: JSONObject, vid: String): HGResolvedVideo {
-        if (hasInlineList(vm)) return parseVideoModel(vm, vid, keySeed(vm))
-        // fallback_api path omitted for M1 brevity when inline list present; still handle empty
-        return parseVideoModel(vm, vid, keySeed(vm))
-    }
-
-    private fun hasInlineList(vm: JSONObject): Boolean {
-        val vl = vm.opt("video_list")
-        return when (vl) {
-            is JSONObject -> vl.length() > 0
-            is org.json.JSONArray -> vl.length() > 0
-            else -> false
+        val seed = keySeed(vm)
+        val inline = parseVideoModel(vm, vid, seed)
+        if (inline.streams.isNotEmpty()) return inline
+        val raw = vm.opt("fallback_api")
+        val address = when (raw) {
+            is org.json.JSONArray -> raw.optString(0)
+            else -> videoModelJSON(raw)?.optString("fallback_api") ?: J.str(raw)
         }
+        val endpoint = address.toHttpUrlOrNull()?.takeIf {
+            it.isHttps && it.username.isEmpty() && it.password.isEmpty()
+        } ?: return inline
+        val transport = playerHttp.newBuilder().followRedirects(false).build()
+        for (codec in listOf("1", "3")) {
+            val url = endpoint.newBuilder().setQueryParameter("codec_type", codec).build()
+            val request = Request.Builder().url(url).header("Accept", "application/json").build()
+            val result = try {
+                transport.newCall(request).execute().use { response ->
+                    val root = readPlaybackModel(response, "fallback_api")
+                    val model = root.optJSONObject("video_info")?.optJSONObject("data") ?: return@use null
+                    if (!model.has("video_duration")) model.put("video_duration", inline.duration)
+                    if (!model.has("url_expire")) model.put("url_expire", inline.expiresAt)
+                    parseVideoModel(model, vid, keySeed(model) ?: seed)
+                }
+            } catch (_: IOException) { null }
+            catch (_: ProviderException) { null }
+            catch (_: PlayerEmptyBody) { null }
+            if (result != null && result.streams.isNotEmpty()) {
+                System.err.println("[HG] fallback_api ok codec_type=$codec streams=${result.streams.size}")
+                return result
+            }
+        }
+        return inline
     }
 
     private fun keySeed(vm: JSONObject): ByteArray? {
@@ -908,8 +988,10 @@ class HongguoClient(
         for (v in entries) {
             val meta = J.dict(v.opt("video_meta")); val enc = J.dict(v.opt("encrypt_info"))
             val codec = J.firstNonEmpty(J.str(meta.opt("codec_type")), J.str(v.opt("codec_type"))).lowercase()
-            if (codec == "bytevc2" || J.str(v.opt("gear_des_key")).lowercase().contains("bytevc2")) { vc2++; continue }
-            val primary = mediaURL(v.opt("main_url"), keySeed) ?: mediaURL(v.opt("backup_url"), keySeed) ?: continue
+            val codecLabels = listOf(codec, J.str(v.opt("codec_type")).lowercase(), J.str(v.opt("gear_des_key")).lowercase())
+            if (codecLabels.any { it.contains("bytevc2") || Regex("(^|[^a-z0-9])bvc2([^a-z0-9]|$)").containsMatchIn(it) }) { vc2++; continue }
+            val primary = listOf(v.opt("main_url"), v.opt("play_url"), v.opt("backup_url"), v.opt("backup_url_1"))
+                .firstNotNullOfOrNull { mediaURL(it, keySeed) } ?: continue
             var key = ""
             val spade = J.firstNonEmpty(J.str(enc.opt("spade_a")), J.str(v.opt("spade_a")))
             if (spade.isNotEmpty() || J.bool(enc.opt("encrypt")) || J.str(enc.opt("encryption_method")) == "cenc-aes-ctr") {
