@@ -83,8 +83,11 @@ class SearchDockState(initialQuery: String = "") {
     }
 }
 
-/** Global glass material, switchable live from 我的 → 外观. */
-enum class GlassStyle(val label: String) { LIQUID("液态玻璃"), FROSTED("毛玻璃") }
+/**
+ * Global surface material, switchable live from 我的 → 外观. [EXPRESSIVE] (`极简质感`) swaps the glass for crisp
+ * warm paper / charcoal surfaces with hairlines and solid ink pills (no blur, no lens).
+ */
+enum class GlassStyle(val label: String) { LIQUID("液态玻璃"), FROSTED("毛玻璃"), EXPRESSIVE("极简质感") }
 
 /** Reactive, SharedPreferences-backed holder for the app-wide [GlassStyle] (default [GlassStyle.LIQUID]). */
 object GlassStylePref {
@@ -169,6 +172,7 @@ fun Modifier.glassSurface(
     fallbackAlpha: Float = 0.90f,
     highlightAlpha: Float = 0.50f,
 ): Modifier {
+    if (GlassStylePref.style == GlassStyle.EXPRESSIVE) return expressiveSurface(shape, dark, shadowRadius, activeOverlay)
     val frosted = GlassStylePref.style == GlassStyle.FROSTED
     val s = GlassStylePref.strength
     val p = remember(dark) { GlassPalette(dark) }
@@ -263,6 +267,20 @@ fun Modifier.glassSurface(
 }
 
 /**
+ * `极简质感` surface: solid warm paper (#F2F0E8) / charcoal (#242321) fill, a crisp hairline and a soft low shadow —
+ * no backdrop sampling, blur or haze. Forced-dark chrome over video stays 96 % opaque.
+ */
+private fun Modifier.expressiveSurface(shape: CornerBasedShape, dark: Boolean, shadowRadius: Dp, activeOverlay: Color): Modifier {
+    val shadow = ExpressivePalette.shadow(dark)
+    return this
+        .shadow(shadowRadius * 0.55f, shape, ambientColor = shadow, spotColor = shadow)
+        .clip(shape)
+        .background(ExpressivePalette.surface(dark).copy(alpha = if (dark) 0.96f else 1f))
+        .then(if (activeOverlay.alpha > 0f) Modifier.background(activeOverlay) else Modifier)
+        .border(0.8.dp, ExpressivePalette.hairline(dark), shape)
+}
+
+/**
  * Top->bottom specular rim of a Liquid Glass capsule. With [accent] the rim glows in that colour (selected chips).
  * Light mode fades into a faint dark hairline so a white rim still reads on a light page.
  */
@@ -287,6 +305,8 @@ fun liquidSheenBrush(dark: Boolean, strong: Boolean = false): Brush = Brush.vert
  * - LIQUID: sheer glass fill + specular sheen + 0.8 dp top->bottom specular rim; [selected] adds an accent tint and a
  *   glowing accent rim, or with [neutralSelected] a bright white glass thumb (segmented control / tab pill).
  * - FROSTED: high-readability frosted fill + 0.7 dp matte hairline (accent-tinted when [selected]).
+ * - EXPRESSIVE: flat paper / charcoal chip with a crisp hairline; [neutralSelected] is a soft stone pill,
+ *   [selected] an accent-tinted pill with an accent hairline.
  */
 @Composable
 fun Modifier.glassPill(
@@ -297,6 +317,20 @@ fun Modifier.glassPill(
     neutralSelected: Boolean = false,
 ): Modifier {
     val liquid = GlassStylePref.style == GlassStyle.LIQUID
+    if (GlassStylePref.style == GlassStyle.EXPRESSIVE) {
+        val fill = when {
+            selected && neutralSelected -> if (dark) Color(0xFF3A3936) else Color(0xFFE6E3DA)
+            selected -> accent.copy(alpha = if (dark) 0.20f else 0.12f)
+            dark -> Color(0xFF2A2927).copy(alpha = 0.94f)
+            else -> Color(0xFF181817).copy(alpha = 0.04f)
+        }
+        val line = when {
+            selected && !neutralSelected -> accent.copy(alpha = 0.50f)
+            selected -> Color.Transparent
+            else -> ExpressivePalette.hairline(dark)
+        }
+        return this.clip(shape).background(fill).border(0.8.dp, line, shape)
+    }
     return if (liquid) {
         val k = liquidFillScale(GlassStylePref.strength)
         val fill = when {
@@ -450,7 +484,7 @@ fun GlassTabBar(
                                         .then(
                                             when {
                                                 // glossy refractive liquid pill: white sheen + specular rim gradient
-                                                on && liquid -> Modifier.glassPill(PillShape, selected = true, neutralSelected = true)
+                                                on && (liquid || GlassStylePref.style == GlassStyle.EXPRESSIVE) -> Modifier.glassPill(PillShape, selected = true, neutralSelected = true)
                                                 on -> Modifier.clip(PillShape).background(if (c.dark) Color.White.copy(alpha = 0.14f) else Color.Black.copy(alpha = 0.08f))
                                                 else -> Modifier.clip(PillShape)
                                             },
@@ -619,7 +653,7 @@ fun GlassNavigationRail(
                                 .matchParentSize()
                                 .graphicsLayer { scaleX = 0.6f + 0.4f * pill; alpha = pill }
                                 .then(
-                                    if (liquid) Modifier.glassPill(PillShape, selected = true, neutralSelected = true)
+                                    if (liquid || GlassStylePref.style == GlassStyle.EXPRESSIVE) Modifier.glassPill(PillShape, selected = true, neutralSelected = true)
                                     else Modifier.clip(PillShape).background(c.text.copy(alpha = if (c.dark) 0.16f else 0.10f)),
                                 ),
                         )

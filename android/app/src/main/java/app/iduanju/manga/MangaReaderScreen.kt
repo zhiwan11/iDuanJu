@@ -675,9 +675,10 @@ private fun PanelSwitch(label: String, checked: Boolean, sub: String? = null, en
 private fun PanelSlider(label: String, value: Float, valueText: String, range: ClosedFloatingPointRange<Float> = 0f..1f, steps: Int = 0, onChange: (Float) -> Unit) {
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Text(label, color = Color.White, fontSize = 14.sp, modifier = Modifier.width(72.dp))
-        Slider(value, onChange, Modifier.weight(1f), valueRange = range, steps = steps,
-            colors = SliderDefaults.colors(thumbColor = Color.White, activeTrackColor = IdjThemeColors.accent, inactiveTrackColor = Color.White.copy(0.18f)))
-        Text(valueText, color = HudDim, fontSize = 12.sp, modifier = Modifier.width(44.dp).padding(start = 6.dp))
+        // Shared Expressive thick-pill slider (ink-on-charcoal: the reader HUD is always dark).
+        app.iduanju.ui.components.ExpressiveSlider(value, onChange, Modifier.weight(1f).padding(vertical = 4.dp),
+            valueRange = range, steps = steps, dark = true)
+        Text(valueText, color = HudDim, fontSize = 12.sp, modifier = Modifier.width(44.dp).padding(start = 8.dp))
     }
 }
 

@@ -126,12 +126,80 @@ private val Light = IdjColors(
     ambientCool = listOf(Color(0x26286DEF), Color(0x0D286DEF)),
 )
 
+/**
+ * `极简质感` (GlassStyle.EXPRESSIVE) light palette: warm paper ground, stone surfaces, crisp ink text and a muted clay
+ * accent.
+ */
+private val ExpressiveLight = Light.copy(
+    bg = Color(0xFFFAF9F5),
+    surface = Color(0xFFF2F0E8),
+    elevated = Color(0xFFE9E6DD),
+    text = Color(0xFF181817),
+    secondary = Color(0xFF6B6A64),
+    accent = Color(0xFFB85A3A),
+    accentWarm = Color(0xFFB7791F),
+    tertiary = Color(0xAD6B6A64),
+    glass = Color(0x0A181817),
+    glassBorder = Color(0xFFE6E3DA),
+    hairline = Color(0xFFE6E3DA),
+    accentSoft = Color(0x1AB85A3A),
+    accentLine = Color(0x66B85A3A),
+    onAccent = Color(0xFFFFFFFF),
+    card = Color(0xFFF2F0E8),
+    cardBorder = Color(0xFFE6E3DA),
+    thumb = Color(0xFFFFFEFB),
+    bar = Color(0xF5F2F0E8),
+    sheet = Color(0xFFFAF9F5),
+    rail = Color(0x08181817),
+    pin = Color(0xCCFAF9F5),
+    dim = Color(0x57181817),
+    shadowSoft = Color(0x0D181817),
+    shadowThumb = Color(0x17181817),
+    barShadow = Color(0x1A181817),
+    ambientWarm = listOf(Color(0x1FB85A3A), Color(0x0AB85A3A)),
+    ambientCool = listOf(Color(0x14181817), Color(0x06181817)),
+)
+
+/** `极简质感` dark palette: warm deep charcoal ground and surfaces with soft bone-white ink. */
+private val ExpressiveDark = Dark.copy(
+    bg = Color(0xFF181817),
+    surface = Color(0xFF242321),
+    elevated = Color(0xFF2E2D2A),
+    text = Color(0xFFF4F2EC),
+    secondary = Color(0xFFA9A69D),
+    accent = Color(0xFFE08A69),
+    accentWarm = Color(0xFFE5B266),
+    tertiary = Color(0x9EA9A69D),
+    glass = Color(0x0FF4F2EC),
+    glassBorder = Color(0xFF353431),
+    hairline = Color(0xFF353431),
+    accentSoft = Color(0x29E08A69),
+    accentLine = Color(0x6BE08A69),
+    onAccent = Color(0xFF1E100A),
+    card = Color(0xFF242321),
+    cardBorder = Color(0xFF353431),
+    thumb = Color(0xFF3A3936),
+    bar = Color(0xF0242321),
+    sheet = Color(0xFF242321),
+    rail = Color(0x09F4F2EC),
+    pin = Color(0xCC181817),
+    ambientWarm = listOf(Color(0x4C8A5A44), Color(0x24503A30)),
+    ambientCool = listOf(Color(0x2C5A5852), Color(0x14383632)),
+)
+
+private val expressiveActive: Boolean
+    get() = app.iduanju.ui.components.GlassStylePref.style == app.iduanju.ui.components.GlassStyle.EXPRESSIVE
+
 val LocalIdjColors = staticCompositionLocalOf { Dark }
 
 /** The player, image viewer and readers stay dark: wrap them in `IdjTheme(dark = true)`. */
 @Composable
 fun IdjTheme(dark: Boolean = isSystemInDarkTheme(), content: @Composable () -> Unit) {
-    val colors = if (dark) Dark else Light
+    val colors = when {
+        expressiveActive -> if (dark) ExpressiveDark else ExpressiveLight
+        dark -> Dark
+        else -> Light
+    }
     val scheme = if (dark) darkColorScheme(
         primary = colors.accent, onPrimary = colors.onAccent, background = colors.bg,
         surface = colors.surface, onBackground = colors.text, onSurface = colors.text,
@@ -149,5 +217,8 @@ fun IdjTheme(dark: Boolean = isSystemInDarkTheme(), content: @Composable () -> U
 val IdjThemeColors: IdjColors
     @Composable get() = LocalIdjColors.current
 
-/** The player always renders on black with the dark palette (spec `.pl`), whatever the app theme is. */
-val IdjDarkColors: IdjColors get() = Dark
+/**
+ * The player always renders on black with the dark palette (spec `.pl`), whatever the app theme is; under
+ * `极简质感` its chrome uses the warm charcoal variant.
+ */
+val IdjDarkColors: IdjColors get() = if (expressiveActive) ExpressiveDark else Dark

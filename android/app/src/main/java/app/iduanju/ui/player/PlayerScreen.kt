@@ -68,6 +68,8 @@ import app.iduanju.ui.theme.IdjDarkColors
 import app.iduanju.ui.theme.IdjColors
 import app.iduanju.ui.components.DS
 import app.iduanju.ui.components.pressClick
+import app.iduanju.ui.components.ExpressiveSheetHeader
+import app.iduanju.ui.components.ExpressiveStepSlider
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.graphicsLayer
 import kotlinx.coroutines.Dispatchers
@@ -1265,7 +1267,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
             val last = remember { arrayOfNulls<String>(1) }
             if (panel != null) last[0] = panel
             val shown = last[0]
-            val sheetShape = RoundedCornerShape(if (centeredSheet) 28.dp else 24.dp)
+            val sheetShape = RoundedCornerShape(28.dp)
             val liquidGlass = GlassStylePref.style == GlassStyle.LIQUID
             Column(Modifier.widthIn(max = if (centeredSheet) 540.dp else 520.dp).fillMaxWidth()
                 .heightIn(max = (metrics.heightDp * if (centeredSheet) 0.80f else 0.74f).dp)
@@ -1282,19 +1284,31 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                     "episodes" -> curDetail?.let { d -> EpisodesPanel(d, epIndex, pc, onPick = { selectEpisode(it); panel = null },
                         onSeason = { id -> panel = null; onSwitchSeries(id) }) }
                     "speed" -> {
-                        PanelTitle("倍速", "长按画面临时 2× · 自动记住偏好")
-                        Spacer(Modifier.height(8.dp))
-                        listOf(0.75f, 1f, 1.25f, 1.5f, 2f, 3f).forEach { s ->
-                            PanelRow(if (s == 1f) "1.0× 正常速度" else "${s}×".replace(".0×", "×"), "", s == speed, pc) {
-                                speed = s
-                                PlayerPrefs.setSpeed(ctx, s)
-                                player.setPlaybackSpeed(s)
-                                panel = null
-                            }
-                        }
+                        ExpressiveSheetHeader("倍速", onClose = { panel = null }, subtitle = "长按画面临时 2× · 自动记住偏好", dark = true)
+                        Spacer(Modifier.height(16.dp))
+                        val speeds = listOf(0.75f, 1f, 1.25f, 1.5f, 2f, 3f)
+                        val speedIdx = speeds.indices.minByOrNull { kotlin.math.abs(speeds[it] - speed) } ?: 1
+                        Text(if (speed == 1f) "1.0× 正常速度" else "${speed}×".replace(".0×", "×"), color = Color.White,
+                            fontSize = 20.sp, fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                        ExpressiveStepSlider(
+                            steps = speeds.size,
+                            selected = speedIdx,
+                            labels = speeds.map { "${it}×".replace(".0×", "×") },
+                            dark = true,
+                            onSelect = { i ->
+                                val s = speeds[i]
+                                if (s != speed) {
+                                    speed = s
+                                    PlayerPrefs.setSpeed(ctx, s)
+                                    player.setPlaybackSpeed(s)
+                                }
+                            },
+                        )
+                        Spacer(Modifier.height(6.dp))
                     }
                     "quality" -> {
-                        PanelTitle("画质", null)
+                        ExpressiveSheetHeader("画质", onClose = { panel = null }, dark = true)
                         Spacer(Modifier.height(8.dp))
                         val q = quality ?: tags.res ?: "自动"
                         PanelRow(q, player.videoFormat?.let { "${it.width}×${it.height}" } ?: "", true, pc) { panel = null }
@@ -1313,6 +1327,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                             autoNext = autoNext,
                             showAutoNext = queue == null,
                             pc = pc,
+                            onClose = { panel = null },
                             onFillMode = { fill ->
                                 fillMode = fill
                                 PlayerPrefs.setFillMode(ctx, fill)
@@ -1353,7 +1368,7 @@ fun PlayerScreen(seriesId: String, startEp: Int, onBack: () -> Unit, queue: Vide
                         )
                     }
                     else -> {
-                        PanelTitle("音轨字幕", null)
+                        ExpressiveSheetHeader("音轨字幕", onClose = { panel = null }, dark = true)
                         Text("音轨", color = Color.White.copy(0.55f), fontSize = 12.sp, modifier = Modifier.padding(start = 2.dp, top = 14.dp, bottom = 8.dp))
                         PanelRow(tags.audio ?: "默认音轨", "", true, pc) { panel = null }
                         Text("字幕", color = Color.White.copy(0.55f), fontSize = 12.sp, modifier = Modifier.padding(start = 2.dp, top = 14.dp, bottom = 8.dp))
@@ -1794,6 +1809,7 @@ private fun MoreSettingsPanel(
     autoNext: Boolean,
     showAutoNext: Boolean,
     pc: IdjColors,
+    onClose: () -> Unit,
     onFillMode: (Boolean) -> Unit,
     onAmbientLevel: (Int) -> Unit,
     onEnhance: (Int) -> Unit,
@@ -1812,8 +1828,8 @@ private fun MoreSettingsPanel(
         }
         else -> null
     }
-    PanelTitle("更多设置", sleepSubtitle)
-    Spacer(Modifier.height(10.dp))
+    ExpressiveSheetHeader("更多设置", onClose = onClose, subtitle = sleepSubtitle, dark = true)
+    Spacer(Modifier.height(14.dp))
 
     MoreOptionRow(
         label = "画面比例",
@@ -1824,20 +1840,28 @@ private fun MoreSettingsPanel(
     )
     Spacer(Modifier.height(10.dp))
 
+    // 氛围模式: 5-step tactile pill slider. While native HDR / SDR→HDR is on it is dimmed and locked at 关闭; taps
+    // still reach [onAmbientLevel] so the caller can explain the lock (it never changes the level in that state).
     val hdrLocked = nativeHdrRange != null || sdrToHdr
-    MoreOptionRow(
-        label = when {
+    Text(
+        when {
             nativeHdrRange != null -> "氛围模式 (原生 $nativeHdrRange 已锁定关闭)"
             sdrToHdr -> "氛围模式 (SDR 转 HDR 开启时已锁定关闭)"
             else -> "氛围模式"
         },
-        options = listOf("关闭" to 0, "柔和" to 1, "平衡" to 2, "鲜艳" to 3, "极致" to 4),
-        selected = if (hdrLocked) 0 else ambientLevel,
-        enabled = !hdrLocked,
-        pc = pc,
-        onSelect = onAmbientLevel,
+        color = Color.White.copy(if (!hdrLocked) 0.60f else 0.38f), fontSize = 12.sp, fontWeight = FontWeight.Medium,
     )
-    Spacer(Modifier.height(10.dp))
+    Spacer(Modifier.height(8.dp))
+    ExpressiveStepSlider(
+        steps = 5,
+        selected = if (hdrLocked) 0 else ambientLevel.coerceIn(0, 4),
+        labels = listOf("关闭", "柔和", "平衡", "鲜艳", "极致"),
+        enabled = !hdrLocked,
+        onDisabledClick = { onAmbientLevel(1) },
+        dark = true,
+        onSelect = { if (it != ambientLevel) onAmbientLevel(it) },
+    )
+    Spacer(Modifier.height(12.dp))
 
     MoreOptionRow(
         label = "AI 超分辨率 (EWA-Lanczos4)",

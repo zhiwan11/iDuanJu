@@ -6,6 +6,7 @@ import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -23,7 +24,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.layout.layout
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
@@ -45,6 +52,7 @@ import com.kyant.backdrop.Backdrop
 import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import app.iduanju.ui.category.CategoryScreen
+import app.iduanju.ui.components.ExpressiveMotion
 import app.iduanju.ui.components.GlassNavigationRail
 import app.iduanju.ui.components.GlassStyle
 import app.iduanju.ui.components.GlassStylePref
@@ -178,6 +186,20 @@ fun RootScreen(initialRoute: String? = null) {
                     nav,
                     startDestination = "home",
                     modifier = Modifier.weight(1f).fillMaxHeight().then(if (showChromeNav) Modifier.layerBackdrop(backdrop) else Modifier),
+                    // Expressive page switch: crisp alpha (effects spring) + a subtle 0.985 -> 1 spatial spring settle.
+                    enterTransition = {
+                        androidx.compose.animation.fadeIn(ExpressiveMotion.effects()) +
+                            androidx.compose.animation.scaleIn(ExpressiveMotion.spatialDefault(), initialScale = 0.985f)
+                    },
+                    exitTransition = { androidx.compose.animation.fadeOut(ExpressiveMotion.effects()) },
+                    popEnterTransition = {
+                        androidx.compose.animation.fadeIn(ExpressiveMotion.effects()) +
+                            androidx.compose.animation.scaleIn(ExpressiveMotion.spatialDefault(), initialScale = 0.985f)
+                    },
+                    popExitTransition = {
+                        androidx.compose.animation.fadeOut(ExpressiveMotion.effects()) +
+                            androidx.compose.animation.scaleOut(ExpressiveMotion.spatialDefault(), targetScale = 0.985f)
+                    },
                 ) {
                 composable("home") { HomeScreen(onOpenDetail = { nav.navigate("detail/$it") }, onSearch = { nav.navigate("search") }, onPlay = { nav.navigate("player/$it/0") }, onOpenManga = { nav.navigate("manga/" + android.net.Uri.encode(it)) }, onImmersiveChanged = { novelImmersive = it }) }
                 composable("tvbox") {
@@ -309,10 +331,10 @@ fun RootScreen(initialRoute: String? = null) {
         if (showChromeNav && !metrics.useRail) androidx.compose.animation.AnimatedVisibility(
             visible = !(route == "search" && searchDockState.isTyping),
             modifier = Modifier.align(Alignment.BottomCenter),
-            enter = androidx.compose.animation.fadeIn(androidx.compose.animation.core.tween(180)) +
-                androidx.compose.animation.slideInVertically(androidx.compose.animation.core.tween(220)) { it / 2 },
-            exit = androidx.compose.animation.fadeOut(androidx.compose.animation.core.tween(140)) +
-                androidx.compose.animation.slideOutVertically(androidx.compose.animation.core.tween(180)) { it / 2 },
+            enter = androidx.compose.animation.fadeIn(ExpressiveMotion.effects()) +
+                androidx.compose.animation.slideInVertically(ExpressiveMotion.spatialDefault()) { it / 2 },
+            exit = androidx.compose.animation.fadeOut(ExpressiveMotion.effects()) +
+                androidx.compose.animation.slideOutVertically(ExpressiveMotion.spatialFast()) { it / 2 },
         ) {
             SwipeableGlassTabBar(
                 selected = tab,
@@ -338,6 +360,9 @@ private val DockPillShape = RoundedCornerShape(percent = 50)
 /**
  * Floating bottom Liquid Glass dock with horizontal finger-slide tab scrubbing,
  * sliding glass indicator pill, haptic ticks on slot boundaries, and morphing search dock.
+ *
+ * Expressive touches: the indicator follows the finger on [ExpressiveMotion.spatialFast] with a subtle jelly
+ * stretch, and a high-contrast label bubble floats above the hovered tab while scrubbing (or briefly after a tap).
  */
 @Composable
 private fun SwipeableGlassTabBar(
@@ -354,6 +379,7 @@ private fun SwipeableGlassTabBar(
 ) {
     val c = IdjThemeColors
     val liquid = GlassStylePref.style == GlassStyle.LIQUID
+    val expressive = GlassStylePref.style == GlassStyle.EXPRESSIVE
     val focusManager = LocalFocusManager.current
     val haptic = LocalHapticFeedback.current
     val hasSearch = onSearch != null && searchIcon != null
@@ -379,16 +405,35 @@ private fun SwipeableGlassTabBar(
     }
 
     val activeTab = if (isDragging) hoveredIdx else selected
+    val indicatorTarget = if (isDragging) dragFraction else selected.toFloat()
     val indicatorFraction by animateFloatAsState(
-        targetValue = if (isDragging) dragFraction else selected.toFloat(),
-        animationSpec = if (isDragging) snap() else spring(dampingRatio = 0.78f, stiffness = 420f),
+        targetValue = indicatorTarget,
+        animationSpec = ExpressiveMotion.spatialFast(),
         label = "dockIndicator",
     )
     val indicatorScale by animateFloatAsState(
         targetValue = if (isDragging) 1.04f else 1f,
-        animationSpec = spring(dampingRatio = 0.72f, stiffness = 480f),
+        animationSpec = ExpressiveMotion.spatialFast(),
         label = "dockIndicatorScale",
     )
+    // Jelly: the pill stretches horizontally (and slims a touch) while it lags behind its target.
+    val stretch = (kotlin.math.abs(indicatorTarget - indicatorFraction) * 0.22f).coerceAtMost(0.16f)
+
+    // Floating label bubble: visible while scrubbing, or for a short beat after a tap / long-press.
+    var peekIdx by remember { mutableIntStateOf(-1) }
+    var peekTick by remember { mutableIntStateOf(0) }
+    LaunchedEffect(peekTick) {
+        if (peekTick > 0) {
+            kotlinx.coroutines.delay(900)
+            peekIdx = -1
+        }
+    }
+    val bubbleIdx = if (isDragging) hoveredIdx else peekIdx
+    val bubbleVisible = bubbleIdx >= 0 && !searchSelected && morph < 0.05f
+    var bubbleLabelIdx by remember { mutableIntStateOf(selected) }
+    if (bubbleIdx >= 0) bubbleLabelIdx = bubbleIdx
+    val bubbleX by animateFloatAsState(bubbleLabelIdx.toFloat(), ExpressiveMotion.spatialFast(), label = "dockBubbleX")
+    val bubbleShow by animateFloatAsState(if (bubbleVisible) 1f else 0f, ExpressiveMotion.spatialFast(), label = "dockBubble")
 
     Box(modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
         BoxWithConstraints(
@@ -447,11 +492,11 @@ private fun SwipeableGlassTabBar(
                                         .width(slotWidth)
                                         .height(48.dp)
                                         .graphicsLayer {
-                                            scaleX = indicatorScale
-                                            scaleY = indicatorScale
+                                            scaleX = indicatorScale * (1f + stretch)
+                                            scaleY = indicatorScale * (1f - stretch * 0.35f)
                                         }
                                         .then(
-                                            if (liquid) Modifier.glassPill(DockPillShape, selected = true, neutralSelected = true)
+                                            if (liquid || expressive) Modifier.glassPill(DockPillShape, selected = true, neutralSelected = true)
                                             else Modifier.clip(DockPillShape).background(if (c.dark) Color.White.copy(alpha = 0.14f) else Color.Black.copy(alpha = 0.08f)),
                                         ),
                                 )
@@ -503,7 +548,25 @@ private fun SwipeableGlassTabBar(
                                             .weight(1f)
                                             .height(48.dp)
                                             .clip(DockPillShape)
-                                            .clickable { latestOnSelect(i) },
+                                            .pointerInput(i) {
+                                                detectTapGestures(
+                                                    onLongPress = {
+                                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                        peekIdx = i
+                                                        peekTick++
+                                                    },
+                                                    onTap = {
+                                                        peekIdx = i
+                                                        peekTick++
+                                                        latestOnSelect(i)
+                                                    },
+                                                )
+                                            }
+                                            .semantics {
+                                                role = androidx.compose.ui.semantics.Role.Tab
+                                                this.selected = on
+                                                onClick(label) { latestOnSelect(i); true }
+                                            },
                                         contentAlignment = Alignment.Center,
                                     ) {
                                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -593,6 +656,41 @@ private fun SwipeableGlassTabBar(
                             }
                         }
                     }
+                }
+            }
+
+            // Label bubble above the hovered tab: tracks its slot centre on spatialFast, pops with scale + alpha.
+            if (bubbleShow > 0.01f && items.isNotEmpty()) {
+                val count = items.size
+                val slotW = (expandedW - 10.dp) / count
+                val bubbleLabel = items.getOrNull(bubbleLabelIdx.coerceIn(0, count - 1))?.first.orEmpty()
+                Box(
+                    Modifier
+                        .align(Alignment.TopStart)
+                        .layout { measurable, constraints ->
+                            val p = measurable.measure(constraints.copy(minWidth = 0, minHeight = 0))
+                            val cx = (5.dp + slotW * (bubbleX + 0.5f)).roundToPx()
+                            layout(0, 0) { p.placeRelative(cx - p.width / 2, -p.height - 8.dp.roundToPx()) }
+                        }
+                        .graphicsLayer {
+                            val k = bubbleShow
+                            alpha = k.coerceIn(0f, 1f)
+                            scaleX = 0.7f + 0.3f * k
+                            scaleY = 0.7f + 0.3f * k
+                            translationY = (1f - k) * 6.dp.toPx()
+                            transformOrigin = TransformOrigin(0.5f, 1f)
+                        }
+                        .clip(DockPillShape)
+                        .background(if (c.dark) Color(0xFFF4F2EC) else Color(0xFF181817))
+                        .padding(horizontal = 14.dp, vertical = 6.dp),
+                ) {
+                    Text(
+                        bubbleLabel,
+                        color = if (c.dark) Color(0xFF181817) else Color.White,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                    )
                 }
             }
         }
